@@ -12,11 +12,16 @@ concurrency:
 
 jobs:
   build-test:
-    name: capi=${{ matrix.capi }}-codec=${{ matrix.codec || 'all' }}
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }}-capi=${{ matrix.capi }}-codec=${{ matrix.codec || 'all' }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: ${{ !( startsWith(github.ref, 'refs/heads/master') || startsWith(github.ref, 'refs/tags/') ) }}
       matrix:
+        os:
+          - macos-14  # arm64
+          - macos-13  # x86_64
+          - windows-latest
+          - ubuntu-latest
         capi:
           - true
           - false
