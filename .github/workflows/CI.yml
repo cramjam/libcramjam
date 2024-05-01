@@ -15,7 +15,7 @@ jobs:
     name: ${{ matrix.os }}-capi=${{ matrix.capi }}-codec=${{ matrix.codec || 'all' }}
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: ${{ !( startsWith(github.ref, 'refs/heads/master') || startsWith(github.ref, 'refs/tags/') ) }}
+      fail-fast: false #${{ !( startsWith(github.ref, 'refs/heads/master') || startsWith(github.ref, 'refs/tags/') ) }}
       matrix:
         os:
           - macos-14  # arm64
