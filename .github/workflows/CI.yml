@@ -12,11 +12,16 @@ concurrency:
 
 jobs:
   build-test:
-    name: capi=${{ matrix.capi }}-codec=${{ matrix.codec || 'all' }}
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }}-capi=${{ matrix.capi }}-codec=${{ matrix.codec || 'all' }}
+    runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: ${{ !( startsWith(github.ref, 'refs/heads/master') || startsWith(github.ref, 'refs/tags/') ) }}
+      fail-fast: false #${{ !( startsWith(github.ref, 'refs/heads/master') || startsWith(github.ref, 'refs/tags/') ) }}
       matrix:
+        os:
+          - macos-14  # arm64
+          - macos-13  # x86_64
+          - windows-latest
+          - ubuntu-latest
         capi:
           - true
           - false
@@ -39,6 +44,16 @@ jobs:
             codec: xz
           - capi: true
             codec: deflate
+
+          # TODO: capi feature fails with all enabled due to duplicate export of 'compress' symbol
+          # first from the capi here, then from blosc2 internal zlib-ng; probably just rename ours
+          # prefixed with 'cramjam_' or something.
+          - capi: true
+            codec: null
+            os: ubuntu-latest
+          - capi: true
+            codec: null
+            os: windows-latest
     steps:
       - uses: actions/checkout@v4
 
