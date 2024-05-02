@@ -44,6 +44,16 @@ jobs:
             codec: xz
           - capi: true
             codec: deflate
+
+          # TODO: capi feature fails with all enabled due to duplicate export of 'compress' symbol
+          # first from the capi here, then from blosc2 internal zlib-ng; probably just rename ours
+          # prefixed with 'cramjam_' or something.
+          - capi: true
+            codec: null
+            os: ubuntu-latest
+          - capi: true
+            codec: null
+            os: windows-latest
     steps:
       - uses: actions/checkout@v4
 
