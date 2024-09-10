@@ -14,10 +14,14 @@ snappy            = ["dep:snap"]
 lz4               = ["dep:lz4"]
 bzip2             = ["dep:bzip2"]
 brotli            = ["dep:brotli"]
-xz                = ["dep:xz2"]
 zstd              = ["dep:zstd"]
 gzip              = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2"]
 deflate           = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2"]
+
+xz                = ["xz-static"]
+xz-static         = ["dep:xz2", "xz2/static"]  # builds from vendored source of xz
+xz-shared         = ["dep:xz2"]  # _maybe_ uses system xz; probes for it but falls back to building static lib
+
 blosc2            = ["blosc2-static"]
 blosc2-static     = ["dep:blosc2-rs", "blosc2-rs/static"]
 blosc2-shared     = ["dep:blosc2-rs", "blosc2-rs/shared"]
@@ -34,7 +38,7 @@ libdeflater    = { version = "^1", optional = true }
 libdeflate-sys = { version = "<1.20.0", optional = true }  # TODO: requires gcc>=4.9 not available on Python's CI wheel builds
 blosc2-rs      = { version = "0.2.5+2.14.3", optional = true, default-features = false }
 zstd           = { version = "^0.13", optional = true }
-xz2            = { version = "0.1.7", features = ["static"], optional = true }
+xz2            = { version = "0.1.7", optional = true }
 
 [build-dependencies]
 cbindgen = "^0.24"
