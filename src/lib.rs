@@ -1,4 +1,8 @@
-#[cfg(feature = "blosc2")]
+#[cfg(any(
+    feature = "blosc2",
+    feature = "blosc2-static",
+    feature = "blosc2-shared"
+))]
 pub mod blosc2;
 #[cfg(feature = "brotli")]
 pub mod brotli;
@@ -6,15 +10,19 @@ pub mod brotli;
 pub mod bzip2;
 #[cfg(feature = "capi")]
 mod capi;
-#[cfg(feature = "deflate")]
+#[cfg(any(
+    feature = "deflate",
+    feature = "deflate-static",
+    feature = "deflate-shared"
+))]
 pub mod deflate;
-#[cfg(feature = "gzip")]
+#[cfg(any(feature = "gzip", feature = "gzip-static", feature = "gzip-shared"))]
 pub mod gzip;
 #[cfg(feature = "lz4")]
 pub mod lz4;
 #[cfg(feature = "snappy")]
 pub mod snappy;
-#[cfg(feature = "xz")]
+#[cfg(any(feature = "xz", feature = "xz-static", feature = "xz-shared"))]
 pub mod xz;
 #[cfg(feature = "zstd")]
 pub mod zstd;
