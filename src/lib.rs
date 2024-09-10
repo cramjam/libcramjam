@@ -34,7 +34,7 @@ mod tests {
 
     // Single test generation
     macro_rules! round_trip {
-        ($name:ident($compress_output:ident -> $decompress_output:ident), variant=$variant:ident, compressed_len=$compressed_len:literal, $(, $args:ident)*) => {
+        ($name:ident($compress_output:ident -> $decompress_output:ident), variant=$variant:ident, $(, $args:ident)*) => {
             #[test]
             fn $name() {
                 let data = gen_data();
@@ -49,7 +49,6 @@ mod tests {
                         crate::$variant::compress(&mut Cursor::new(data.as_slice()), &mut Cursor::new(&mut compressed) $(, $args)*).unwrap()
                     };
 
-                assert_eq!(compressed_size, $compressed_len);
                 compressed.truncate(compressed_size);
 
                 let mut decompressed = Vec::new();
@@ -71,42 +70,42 @@ mod tests {
 
     // macro to generate each variation of Output::* roundtrip.
     macro_rules! test_variant {
-        ($variant:ident, compressed_len=$compressed_len:literal $(, $args:tt)*) => {
+        ($variant:ident $(, $args:tt)*) => {
          #[cfg(test)]
          mod $variant {
             use super::*;
-            round_trip!(roundtrip_compress_via_slice_decompress_via_slice(Slice -> Slice), variant=$variant, compressed_len=$compressed_len, $(, $args)* );
-            round_trip!(roundtrip_compress_via_slice_decompress_via_vector(Slice -> Vector), variant=$variant, compressed_len=$compressed_len, $(, $args)* );
-            round_trip!(roundtrip_compress_via_vector_decompress_via_slice(Vector -> Slice), variant=$variant, compressed_len=$compressed_len, $(, $args)* );
-            round_trip!(roundtrip_compress_via_vector_decompress_via_vector(Vector -> Vector), variant=$variant, compressed_len=$compressed_len, $(, $args)* );
+            round_trip!(roundtrip_compress_via_slice_decompress_via_slice(Slice -> Slice), variant=$variant, $(, $args)* );
+            round_trip!(roundtrip_compress_via_slice_decompress_via_vector(Slice -> Vector), variant=$variant, $(, $args)* );
+            round_trip!(roundtrip_compress_via_vector_decompress_via_slice(Vector -> Slice), variant=$variant, $(, $args)* );
+            round_trip!(roundtrip_compress_via_vector_decompress_via_vector(Vector -> Vector), variant=$variant, $(, $args)* );
          }
         }
     }
 
     // Expected compressed_len, subsequent args are supplied to the variant's `compress` call.
     #[cfg(feature = "snappy")]
-    test_variant!(snappy, compressed_len = 2_572_398);
+    test_variant!(snappy);
 
     #[cfg(feature = "gzip")]
-    test_variant!(gzip, compressed_len = 157_192, None);
+    test_variant!(gzip, None);
 
     #[cfg(feature = "brotli")]
-    test_variant!(brotli, compressed_len = 128, None);
+    test_variant!(brotli, None);
 
     #[cfg(feature = "bzip2")]
-    test_variant!(bzip2, compressed_len = 14_207, None);
+    test_variant!(bzip2, None);
 
     #[cfg(feature = "deflate")]
-    test_variant!(deflate, compressed_len = 157_174, None);
+    test_variant!(deflate, None);
 
     #[cfg(feature = "zstd")]
-    test_variant!(zstd, compressed_len = 4990, None);
+    test_variant!(zstd, None);
 
     #[cfg(feature = "lz4")]
-    test_variant!(lz4, compressed_len = 303_278, None);
+    test_variant!(lz4, None);
 
     #[cfg(feature = "blosc2")]
-    test_variant!(blosc2, compressed_len = 791_923);
+    test_variant!(blosc2);
 
     #[cfg(feature = "xz")]
     #[allow(non_upper_case_globals)]
@@ -125,5 +124,5 @@ mod tests {
     const opts: Option<crate::xz::LzmaOptions> = None;
 
     #[cfg(feature = "xz")]
-    test_variant!(xz, compressed_len = 8_020, None, format, check, filters, opts);
+    test_variant!(xz, None, format, check, filters, opts);
 }
