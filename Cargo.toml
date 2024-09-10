@@ -15,8 +15,14 @@ lz4               = ["dep:lz4"]
 bzip2             = ["dep:bzip2"]
 brotli            = ["dep:brotli"]
 zstd              = ["dep:zstd"]
-gzip              = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2"]
-deflate           = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2"]
+
+gzip              = ["gzip-static"]
+gzip-static       = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2"]
+gzip-shared       = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2", "libdeflate-sys/dynamic"]
+
+deflate           = ["deflate-static"]
+deflate-static    = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2"]
+deflate-shared    = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2", "libdeflate-sys/dynamic"]
 
 xz                = ["xz-static"]
 xz-static         = ["dep:xz2", "xz2/static"]  # builds from vendored source of xz
