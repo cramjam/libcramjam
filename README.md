@@ -16,12 +16,18 @@ Features:
 - `bzip2`
 - `brotli`
 - `xz`
+  - `xz-static`
+  - `xz-shared`
 - `zstd`
 - `gzip`
+  - `gzip-static`
+  - `gzip-shared`
 - `deflate`
+  - `deflate-static`
+  - `deflate-shared`
 - `blosc2`
-- `blosc2-shared`
-- `blosc2-static`
+  - `blosc2-shared`
+  - `blosc2-static`
 - `capi`: Build a C-ABI library. Compatible with [`cargo-c`](https://github.com/lu-zero/cargo-c)
 
 
