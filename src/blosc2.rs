@@ -15,7 +15,7 @@ where
     let mut schunk = blosc2::schunk::SChunk::new(
         blosc2::schunk::Storage::default()
             .set_contiguous(true)
-            .set_cparams(CParams::default())
+            .set_cparams(CParams::default().set_typesize::<u8>())
             .set_dparams(Default::default()),
     );
     let mut rdr = BufReader::new(rdr);
@@ -73,8 +73,9 @@ mod tests {
 
     #[test]
     fn test_compress() {
+        let _guard = blosc2::Blosc2Guard::new();
         let mut compressed = vec![];
         let data = b"bytes";
-        assert!(compress(Cursor::new(data), &mut compressed).is_ok());
+        compress(Cursor::new(data), &mut compressed).unwrap();
     }
 }
