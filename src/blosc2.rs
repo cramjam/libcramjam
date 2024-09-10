@@ -15,8 +15,8 @@ where
     let mut schunk = blosc2::schunk::SChunk::new(
         blosc2::schunk::Storage::default()
             .set_contiguous(true)
-            .set_cparams(&mut CParams::default())
-            .set_dparams(&mut Default::default()),
+            .set_cparams(CParams::default())
+            .set_dparams(Default::default()),
     );
     let mut rdr = BufReader::new(rdr);
 
