@@ -1,4 +1,4 @@
-//! snappy de/compression interface
+//! blosc2 de/compression interface
 
 use ::blosc2::CParams;
 pub use blosc2;
