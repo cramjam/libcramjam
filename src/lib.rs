@@ -18,6 +18,8 @@ mod capi;
 pub mod deflate;
 #[cfg(any(feature = "gzip", feature = "gzip-static", feature = "gzip-shared"))]
 pub mod gzip;
+#[cfg(feature = "igzip")]
+pub mod igzip;
 #[cfg(feature = "lz4")]
 pub mod lz4;
 #[cfg(feature = "snappy")]
@@ -57,6 +59,7 @@ mod tests {
                         crate::$variant::compress(&mut Cursor::new(data.as_slice()), &mut Cursor::new(&mut compressed) $(, $args)*).unwrap()
                     };
 
+                println!("Compressed size: {}", compressed_size);
                 compressed.truncate(compressed_size);
 
                 let mut decompressed = Vec::new();
@@ -96,6 +99,9 @@ mod tests {
 
     #[cfg(feature = "gzip")]
     test_variant!(gzip, None);
+
+    #[cfg(feature = "igzip")]
+    test_variant!(igzip, None);
 
     #[cfg(feature = "brotli")]
     test_variant!(brotli, None);

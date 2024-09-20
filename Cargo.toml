@@ -8,13 +8,14 @@ readme      = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
-default           = ["snappy", "lz4", "bzip2", "brotli", "xz", "zstd", "gzip", "deflate", "blosc2"]
+default           = ["snappy", "lz4", "bzip2", "brotli", "xz", "zstd", "gzip", "deflate", "blosc2", "igzip"]
 capi              = ["dep:libc"]
 snappy            = ["dep:snap"]
 lz4               = ["dep:lz4"]
 bzip2             = ["dep:bzip2"]
 brotli            = ["dep:brotli"]
 zstd              = ["dep:zstd"]
+igzip             = ["dep:isal-rs"]
 
 gzip              = ["gzip-static"]
 gzip-static       = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2"]
@@ -47,6 +48,8 @@ libdeflate-sys = { version = "<1.20.0", optional = true }  # TODO: requires gcc>
 blosc2-rs      = { version = "0.3.1+2.15.1", optional = true, default-features = false }
 zstd           = { version = "^0.13", optional = true }
 xz2            = { version = "0.1.7", optional = true }
+# isal-rs        = { path = "../isal-rs", optional = true }
+isal-rs        = { git = "https://github.com/milesgranger/isal-rs.git", branch = "updates" }
 
 [build-dependencies]
 cbindgen = "^0.24"
