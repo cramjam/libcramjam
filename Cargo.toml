@@ -49,7 +49,7 @@ blosc2-rs      = { version = "0.3.1+2.15.1", optional = true, default-features =
 zstd           = { version = "^0.13", optional = true }
 xz2            = { version = "0.1.7", optional = true }
 # isal-rs        = { path = "../isal-rs", optional = true }
-isal-rs        = { git = "https://github.com/milesgranger/isal-rs.git", branch = "updates" }
+isal-rs        = { git = "https://github.com/milesgranger/isal-rs.git", branch = "updates", optional = true }
 
 [build-dependencies]
 cbindgen = "^0.24"
