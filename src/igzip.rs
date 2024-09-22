@@ -5,7 +5,7 @@ use std::io::Error;
 
 const DEFAULT_COMPRESSION_LEVEL: u32 = 3;
 
-/// Decompress gzip data
+/// Decompress igzip data
 #[inline(always)]
 pub fn decompress<W: Write + ?Sized, R: Read>(input: R, output: &mut W) -> Result<usize, Error> {
     let mut decoder = isal::igzip::read::Decoder::new(input);
@@ -13,7 +13,7 @@ pub fn decompress<W: Write + ?Sized, R: Read>(input: R, output: &mut W) -> Resul
     Ok(nbytes as usize)
 }
 
-/// Compress gzip data
+/// Compress igzip data
 #[inline(always)]
 pub fn compress<W: Write + ?Sized, R: Read>(
     input: R,
