@@ -71,6 +71,10 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install automake autoconf coreutils libtool nasm
 
+      - name: Set MSVC developer prompt
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1.6.0
+
       - name: Audit
         if: |
           !matrix.codec && matrix.capi
