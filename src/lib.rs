@@ -18,7 +18,7 @@ mod capi;
 pub mod deflate;
 #[cfg(any(feature = "gzip", feature = "gzip-static", feature = "gzip-shared"))]
 pub mod gzip;
-#[cfg(feature = "igzip")]
+#[cfg(any(feature = "igzip", feature = "isal-static", feature = "isal-shared"))]
 pub mod igzip;
 #[cfg(feature = "lz4")]
 pub mod lz4;
