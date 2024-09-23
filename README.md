@@ -15,10 +15,11 @@ Features:
 - `lz4`
 - `bzip2`
 - `brotli`
+- `zstd`
+- `igzip`
 - `xz`
   - `xz-static`
   - `xz-shared`
-- `zstd`
 - `gzip`
   - `gzip-static`
   - `gzip-shared`
