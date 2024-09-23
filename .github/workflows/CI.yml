@@ -63,6 +63,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         name: Rust Cache
 
+      - name: Install nasm
+        if: runner.os != 'macOS'
+        uses: ilammy/setup-nasm@v1
+
+      - name: Install build deps (OSX)
+        if: runner.os == 'macOS'
+        run: brew install automake autoconf coreutils libtool nasm
+
       - name: Audit
         if: |
           !matrix.codec && matrix.capi
