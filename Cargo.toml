@@ -17,9 +17,18 @@ brotli            = ["dep:brotli"]
 zstd              = ["dep:zstd"]
 
 igzip             = ["isal-static"]
-isal-static       = ["dep:isal-rs", "isal-rs/static"]
-isal-shared       = ["dep:isal-rs", "isal-rs/shared"]
-use-system-isal   = ["isal-rs/use-system-isal"]
+igzip-static      = ["isal-static"]
+igzip-shared      = ["isal-shared"]
+
+# ISA-L not supported on 32-bit; Cargo doesn't offer a way to disable a single feature
+# So we avoid including the isal-rs dep until build.rs can check the target bit width.
+# From there it will enable 'isal-supported' feature, then map the isal-static/shared/use-system-isal
+# features the the isal-rs crate features
+isal-if-supported = []
+isal-static       = ["isal-if-supported"]
+isal-shared       = ["isal-if-supported"]
+use-system-isal   = ["isal-if-supported"]
+isal-is-supported = ["dep:isal-rs"]
 
 gzip              = ["gzip-static"]
 gzip-static       = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2"]

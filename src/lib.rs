@@ -18,7 +18,7 @@ mod capi;
 pub mod deflate;
 #[cfg(any(feature = "gzip", feature = "gzip-static", feature = "gzip-shared"))]
 pub mod gzip;
-#[cfg(any(feature = "igzip", feature = "isal-static", feature = "isal-shared"))]
+#[cfg(feature = "isal-is-supported")]
 pub mod igzip;
 #[cfg(feature = "lz4")]
 pub mod lz4;
@@ -100,7 +100,7 @@ mod tests {
     #[cfg(feature = "gzip")]
     test_variant!(gzip, None);
 
-    #[cfg(feature = "igzip")]
+    #[cfg(feature = "isal-is-supported")]
     test_variant!(igzip, None);
 
     #[cfg(feature = "brotli")]
