@@ -1,6 +1,6 @@
 [package]
 name        = "libcramjam"
-version     = "0.5.0"
+version     = "0.5.1"
 edition     = "2021"
 license     = "MIT"
 description = "Compression library combining a plethora of algorithms in a similar as possible API"
@@ -15,7 +15,14 @@ lz4               = ["dep:lz4"]
 bzip2             = ["dep:bzip2"]
 brotli            = ["dep:brotli"]
 zstd              = ["dep:zstd"]
-igzip             = ["dep:isal-rs"]
+
+igzip             = ["isal-static"]
+igzip-static      = ["isal-static"]
+igzip-shared      = ["isal-shared"]
+
+isal-static       = ["dep:isal-rs", "isal-rs/static"]
+isal-shared       = ["dep:isal-rs", "isal-rs/shared"]
+use-system-isal   = ["dep:isal-rs", "isal-rs/use-system-isal"]
 
 gzip              = ["gzip-static"]
 gzip-static       = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2"]
@@ -48,7 +55,10 @@ libdeflate-sys = { version = "<1.20.0", optional = true }  # TODO: requires gcc>
 blosc2-rs      = { version = "0.3.1+2.15.1", optional = true, default-features = false }
 zstd           = { version = "^0.13", optional = true }
 xz2            = { version = "0.1.7", optional = true }
-isal-rs        = { version = "0.3.0+496255c", optional = true }
+
+# ISA-L not supported on 32-bit; Cargo doesn't offer a way to disable a single feature
+[target.'cfg(target_pointer_width = "64")'.dependencies]
+isal-rs        = { version = "0.3.1+496255c", optional = true, default-features = false }
 
 [build-dependencies]
 cbindgen = "^0.24"
