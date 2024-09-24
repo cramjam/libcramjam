@@ -20,9 +20,9 @@ igzip             = ["isal-static"]
 igzip-static      = ["isal-static"]
 igzip-shared      = ["isal-shared"]
 
-isal-static       = ["dep:isal-rs"]
-isal-shared       = ["dep:isal-rs"]
-use-system-isal   = ["dep:isal-rs"]
+isal-static       = ["dep:isal-rs", "isal-rs/static"]
+isal-shared       = ["dep:isal-rs", "isal-rs/shared"]
+use-system-isal   = ["dep:isal-rs", "isal-rs/use-system-isal"]
 
 gzip              = ["gzip-static"]
 gzip-static       = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2"]
