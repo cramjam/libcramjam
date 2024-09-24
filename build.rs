@@ -1,9 +1,6 @@
 fn main() {
     // See note in Cargo.toml
     if cfg!(target_pointer_width = "64") {
-        #[cfg(feature = "isal-if-supported")]
-        println!("cargo:rustc-cfg=feature=\"isal-is-supported\"");
-
         #[cfg(feature = "use-system-isal")]
         println!("cargo:rustc-cfg=feature=\"isal-rs/use-system-isal\"");
 
@@ -14,9 +11,6 @@ fn main() {
         println!("cargo:rustc-cfg=feature=\"isal-rs/shared\"");
     } else {
         let msg = "feature set but ISA-L not supported on 32 bit systems.";
-
-        #[cfg(feature = "isal-if-supported")]
-        println!("cargo:warning='isal-if-supported' {}", msg);
 
         #[cfg(feature = "use-system-isal")]
         println!("cargo:warning='use-system-isal' {}", msg);

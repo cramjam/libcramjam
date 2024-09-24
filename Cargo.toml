@@ -20,15 +20,9 @@ igzip             = ["isal-static"]
 igzip-static      = ["isal-static"]
 igzip-shared      = ["isal-shared"]
 
-# ISA-L not supported on 32-bit; Cargo doesn't offer a way to disable a single feature
-# So we avoid including the isal-rs dep until build.rs can check the target bit width.
-# From there it will enable 'isal-supported' feature, then map the isal-static/shared/use-system-isal
-# features the the isal-rs crate features
-isal-if-supported = []
-isal-static       = ["isal-if-supported"]
-isal-shared       = ["isal-if-supported"]
-use-system-isal   = ["isal-if-supported"]
-isal-is-supported = ["dep:isal-rs"]
+isal-static       = ["dep:isal-rs"]
+isal-shared       = ["dep:isal-rs"]
+use-system-isal   = ["dep:isal-rs"]
 
 gzip              = ["gzip-static"]
 gzip-static       = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2"]
@@ -61,8 +55,11 @@ libdeflate-sys = { version = "<1.20.0", optional = true }  # TODO: requires gcc>
 blosc2-rs      = { version = "0.3.1+2.15.1", optional = true, default-features = false }
 zstd           = { version = "^0.13", optional = true }
 xz2            = { version = "0.1.7", optional = true }
+
+# ISA-L not supported on 32-bit; Cargo doesn't offer a way to disable a single feature
+[target.'cfg(target_pointer_width = "64")'.dependencies]
 # isal-rs        = { version = "0.3.0+496255c", optional = true }
-isal-rs        = { git = "https://github.com/milesgranger/isal-rs.git", branch = "support-use-system-isal", optional = true, default-features = false }
+isal-rs = { git = "https://github.com/milesgranger/isal-rs.git", branch = "support-use-system-isal", optional = true, default-features = false }
 
 [build-dependencies]
 cbindgen = "^0.24"

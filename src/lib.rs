@@ -18,7 +18,10 @@ mod capi;
 pub mod deflate;
 #[cfg(any(feature = "gzip", feature = "gzip-static", feature = "gzip-shared"))]
 pub mod gzip;
-#[cfg(feature = "isal-is-supported")]
+#[cfg(all(
+    any(feature = "igzip", feature = "igzip-static", feature = "igzip-shared"),
+    target_pointer_width = "64"
+))]
 pub mod igzip;
 #[cfg(feature = "lz4")]
 pub mod lz4;
@@ -100,7 +103,10 @@ mod tests {
     #[cfg(feature = "gzip")]
     test_variant!(gzip, None);
 
-    #[cfg(feature = "isal-is-supported")]
+    #[cfg(all(
+        any(feature = "igzip", feature = "igzip-static", feature = "igzip-shared"),
+        target_pointer_width = "64"
+    ))]
     test_variant!(igzip, None);
 
     #[cfg(feature = "brotli")]
