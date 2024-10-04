@@ -12,7 +12,7 @@ const DEFAULT_COMPRESSION_LEVEL: u32 = 3;
 /// Decompress igzip data
 #[inline(always)]
 pub fn decompress<W: Write + ?Sized, R: Read>(input: R, output: &mut W) -> Result<usize, Error> {
-    let mut decoder = isal::igzip::read::Decoder::new(input);
+    let mut decoder = isal::read::GzipDecoder::new(input);
     let nbytes = std::io::copy(&mut decoder, output)?;
     Ok(nbytes as usize)
 }
@@ -25,8 +25,8 @@ pub fn compress<W: Write + ?Sized, R: Read>(
     level: Option<u32>,
 ) -> Result<usize, Error> {
     let level = level.unwrap_or_else(|| DEFAULT_COMPRESSION_LEVEL);
-    let level = isal::igzip::CompressionLevel::try_from(level as isize)?;
-    let mut encoder = isal::igzip::read::Encoder::new(input, level, true);
+    let level = isal::CompressionLevel::try_from(level as isize)?;
+    let mut encoder = isal::read::GzipEncoder::new(input, level);
     let n_bytes = std::io::copy(&mut encoder, output)?;
     Ok(n_bytes as usize)
 }
