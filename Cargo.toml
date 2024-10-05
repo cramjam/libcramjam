@@ -1,6 +1,6 @@
 [package]
 name        = "libcramjam"
-version     = "0.5.3"
+version     = "0.6.0"
 edition     = "2021"
 license     = "MIT"
 description = "Compression library combining a plethora of algorithms in a similar as possible API"
@@ -8,7 +8,7 @@ readme      = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
-default           = ["snappy", "lz4", "bzip2", "brotli", "xz", "zstd", "gzip", "deflate", "blosc2", "igzip"]
+default           = ["snappy", "lz4", "bzip2", "brotli", "xz", "zstd", "gzip", "deflate", "blosc2", "igzip", "ideflate", "izlib", "zlib"]
 capi              = ["dep:libc"]
 snappy            = ["dep:snap"]
 lz4               = ["dep:lz4"]
@@ -20,6 +20,14 @@ igzip             = ["isal-static"]
 igzip-static      = ["isal-static"]
 igzip-shared      = ["isal-shared"]
 
+ideflate          = ["isal-static"]
+ideflate-static   = ["isal-static"]
+ideflate-shared   = ["isal-shared"]
+
+izlib             = ["isal-static"]
+izlib-static      = ["isal-static"]
+izlib-shared      = ["isal-shared"]
+
 isal-static       = ["dep:isal-rs", "isal-rs/static"]
 isal-shared       = ["dep:isal-rs", "isal-rs/shared"]
 use-system-isal   = ["dep:isal-rs", "isal-rs/use-system-isal"]
@@ -27,6 +35,10 @@ use-system-isal   = ["dep:isal-rs", "isal-rs/use-system-isal"]
 gzip              = ["gzip-static"]
 gzip-static       = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2"]
 gzip-shared       = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2", "libdeflate-sys/dynamic"]
+
+zlib              = ["zlib-static"]
+zlib-static       = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2"]
+zlib-shared       = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2", "libdeflate-sys/dynamic"]
 
 deflate           = ["deflate-static"]
 deflate-static    = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2"]

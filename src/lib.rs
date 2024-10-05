@@ -19,16 +19,32 @@ pub mod deflate;
 #[cfg(any(feature = "gzip", feature = "gzip-static", feature = "gzip-shared"))]
 pub mod gzip;
 #[cfg(all(
+    any(
+        feature = "ideflate",
+        feature = "ideflate-static",
+        feature = "ideflate-shared"
+    ),
+    target_pointer_width = "64"
+))]
+pub mod ideflate;
+#[cfg(all(
     any(feature = "igzip", feature = "igzip-static", feature = "igzip-shared"),
     target_pointer_width = "64"
 ))]
 pub mod igzip;
+#[cfg(all(
+    any(feature = "izlib", feature = "izlib-static", feature = "izlib-shared"),
+    target_pointer_width = "64"
+))]
+pub mod izlib;
 #[cfg(feature = "lz4")]
 pub mod lz4;
 #[cfg(feature = "snappy")]
 pub mod snappy;
 #[cfg(any(feature = "xz", feature = "xz-static", feature = "xz-shared"))]
 pub mod xz;
+#[cfg(any(feature = "zlib", feature = "zlib-static", feature = "zlib-shared"))]
+pub mod zlib;
 #[cfg(feature = "zstd")]
 pub mod zstd;
 
@@ -36,13 +52,34 @@ pub mod zstd;
 mod tests {
 
     use std::io::Cursor;
+    use std::str::FromStr;
+
+    // Generate some 'real-world' data by reading src code and duplicating until well over buf size
+    static LARGE_DATA: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
+        // use src code as base, and we have at least 2mb of data
+        let mut bytes = read_dir_files(std::path::PathBuf::from_str("./src").unwrap());
+        while bytes.len() < 5e6 as usize {
+            bytes.extend(bytes.clone());
+        }
+        bytes
+    });
+
+    fn read_dir_files(dir: std::path::PathBuf) -> Vec<u8> {
+        let mut all_bytes = vec![];
+        for entry in std::fs::read_dir(dir).unwrap().into_iter() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                all_bytes.extend(std::fs::read(entry.path()).unwrap());
+            } else if entry.file_type().unwrap().is_dir() {
+                all_bytes.extend(read_dir_files(entry.path()));
+            }
+        }
+        all_bytes
+    }
 
     // Default testing data
     fn gen_data() -> Vec<u8> {
-        (0..1_000_000)
-            .map(|_| b"oh what a beautiful morning, oh what a beautiful day!!".to_vec())
-            .flat_map(|v| v)
-            .collect()
+        (&*LARGE_DATA).clone()
     }
 
     // Single test generation
@@ -109,6 +146,22 @@ mod tests {
     ))]
     test_variant!(igzip, None);
 
+    #[cfg(all(
+        any(
+            feature = "ideflate",
+            feature = "ideflate-static",
+            feature = "ideflate-shared"
+        ),
+        target_pointer_width = "64"
+    ))]
+    test_variant!(ideflate, None);
+
+    #[cfg(all(
+        any(feature = "izlib", feature = "izlib-static", feature = "izlib-shared"),
+        target_pointer_width = "64"
+    ))]
+    test_variant!(izlib, None);
+
     #[cfg(feature = "brotli")]
     test_variant!(brotli, None);
 
@@ -120,6 +173,9 @@ mod tests {
 
     #[cfg(feature = "zstd")]
     test_variant!(zstd, None);
+
+    #[cfg(feature = "zlib")]
+    test_variant!(zlib, None);
 
     #[cfg(feature = "lz4")]
     test_variant!(lz4, None);

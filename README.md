@@ -9,26 +9,25 @@ A Rust library combining different compression algorithms/libraries in a common 
 [![Documentation](https://docs.rs/libcramjam/badge.svg)](https://docs.rs/libcramjam)
 ![License](https://img.shields.io/crates/l/libcramjam.svg)
 
-Features:
+---
+
+#### Features 
+
+(dynamic/static build features available on some variants, check [Cargo.toml](./Cargo.toml)):
 
 - `snappy`
 - `lz4`
 - `bzip2`
 - `brotli`
 - `zstd`
-- `igzip`
+- `zlib`
 - `xz`
-  - `xz-static`
-  - `xz-shared`
 - `gzip`
-  - `gzip-static`
-  - `gzip-shared`
 - `deflate`
-  - `deflate-static`
-  - `deflate-shared`
 - `blosc2`
-  - `blosc2-shared`
-  - `blosc2-static`
+- `igzip`  (GZIP using ISA-L backend)
+- `ideflate`  (DEFLATE using ISA-L backend)
+- `izlib`  (ZLIB using ISA-L backend)
 - `capi`: Build a C-ABI library. Compatible with [`cargo-c`](https://github.com/lu-zero/cargo-c)
 
 
