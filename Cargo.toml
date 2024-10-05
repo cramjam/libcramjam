@@ -8,7 +8,7 @@ readme      = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
-default           = ["snappy", "lz4", "bzip2", "brotli", "xz", "zstd", "gzip", "deflate", "blosc2", "igzip", "ideflate", "izlib"]
+default           = ["snappy", "lz4", "bzip2", "brotli", "xz", "zstd", "gzip", "deflate", "blosc2", "igzip", "ideflate", "izlib", "zlib"]
 capi              = ["dep:libc"]
 snappy            = ["dep:snap"]
 lz4               = ["dep:lz4"]
@@ -35,6 +35,10 @@ use-system-isal   = ["dep:isal-rs", "isal-rs/use-system-isal"]
 gzip              = ["gzip-static"]
 gzip-static       = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2"]
 gzip-shared       = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2", "libdeflate-sys/dynamic"]
+
+zlib              = ["zlib-static"]
+zlib-static       = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2"]
+zlib-shared       = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2", "libdeflate-sys/dynamic"]
 
 deflate           = ["deflate-static"]
 deflate-static    = ["dep:libdeflater", "dep:libdeflate-sys", "dep:flate2"]

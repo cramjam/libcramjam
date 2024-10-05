@@ -43,6 +43,8 @@ pub mod lz4;
 pub mod snappy;
 #[cfg(any(feature = "xz", feature = "xz-static", feature = "xz-shared"))]
 pub mod xz;
+#[cfg(feature = "zlib")]
+pub mod zlib;
 #[cfg(feature = "zstd")]
 pub mod zstd;
 
@@ -171,6 +173,9 @@ mod tests {
 
     #[cfg(feature = "zstd")]
     test_variant!(zstd, None);
+
+    #[cfg(feature = "zlib")]
+    test_variant!(zlib, None);
 
     #[cfg(feature = "lz4")]
     test_variant!(lz4, None);
