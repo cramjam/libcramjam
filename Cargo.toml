@@ -58,7 +58,7 @@ xz2            = { version = "0.1.7", optional = true }
 
 # ISA-L not supported on 32-bit; Cargo doesn't offer a way to disable a single feature
 [target.'cfg(target_pointer_width = "64")'.dependencies]
-isal-rs        = { version = "0.5.0+496255c", optional = true, default-features = false }
+isal-rs        = { version = "^0.5", optional = true, default-features = false }
 
 [build-dependencies]
 cbindgen = "^0.24"
