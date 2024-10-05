@@ -19,10 +19,24 @@ pub mod deflate;
 #[cfg(any(feature = "gzip", feature = "gzip-static", feature = "gzip-shared"))]
 pub mod gzip;
 #[cfg(all(
+    any(
+        feature = "ideflate",
+        feature = "ideflate-static",
+        feature = "ideflate-shared"
+    ),
+    target_pointer_width = "64"
+))]
+pub mod ideflate;
+#[cfg(all(
     any(feature = "igzip", feature = "igzip-static", feature = "igzip-shared"),
     target_pointer_width = "64"
 ))]
 pub mod igzip;
+#[cfg(all(
+    any(feature = "izlib", feature = "izlib-static", feature = "izlib-shared"),
+    target_pointer_width = "64"
+))]
+pub mod izlib;
 #[cfg(feature = "lz4")]
 pub mod lz4;
 #[cfg(feature = "snappy")]
@@ -108,6 +122,22 @@ mod tests {
         target_pointer_width = "64"
     ))]
     test_variant!(igzip, None);
+
+    #[cfg(all(
+        any(
+            feature = "ideflate",
+            feature = "ideflate-static",
+            feature = "ideflate-shared"
+        ),
+        target_pointer_width = "64"
+    ))]
+    test_variant!(ideflate, None);
+
+    #[cfg(all(
+        any(feature = "izlib", feature = "izlib-static", feature = "izlib-shared"),
+        target_pointer_width = "64"
+    ))]
+    test_variant!(izlib, None);
 
     #[cfg(feature = "brotli")]
     test_variant!(brotli, None);

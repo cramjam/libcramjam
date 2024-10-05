@@ -1,4 +1,4 @@
-//! igzip de/compression interface
+//! GZIP w/ ISA-L de/compression interface
 #[cfg(all(
     any(feature = "igzip", feature = "igzip-static", feature = "igzip-shared"),
     target_pointer_width = "64",
