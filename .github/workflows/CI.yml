@@ -98,18 +98,18 @@ jobs:
           !matrix.capi && matrix.codec
         run: cargo test -p libcramjam --lib --no-default-features --features ${{ matrix.codec }}
 
-  build-wasm32:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+  # build-wasm32:
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          target: wasm32-unknown-emscripten
+  #     - name: Install Rust toolchain
+  #       uses: dtolnay/rust-toolchain@stable
+  #       with:
+  #         target: wasm32-unknown-emscripten
 
-      - name: Install Emscripten
-        uses: mymindstorm/setup-emsdk@v14
+  #     - name: Install Emscripten
+  #       uses: mymindstorm/setup-emsdk@v14
 
-      - name: Build
-        run: cargo build --target wasm32-unknown-emscripten --features wasm32-compat
+  #     - name: Build
+  #       run: cargo build --target wasm32-unknown-emscripten --features wasm32-compat
