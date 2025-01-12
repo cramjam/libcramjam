@@ -73,7 +73,7 @@ mod tests {
 
     #[test]
     fn test_compress() {
-        let _guard = blosc2::Blosc2Guard::new();
+        let _guard = blosc2::Blosc2Guard::get_or_init();
         let mut compressed = vec![];
         let data = b"bytes";
         compress(Cursor::new(data), &mut compressed).unwrap();
