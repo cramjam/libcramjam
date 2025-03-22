@@ -59,7 +59,7 @@ wasm32-compat     = ["blosc2-rs/deactivate-zlib-optim"]
 libc           = { version = "0.2", optional = true }
 snap           = { version = "^1", optional = true }
 brotli         = { version = "^7", default-features = false, features = ["std", "ffi-api"], optional = true }
-bzip2          = { version = "^0.4", optional = true }
+bzip2          = { version = ">=0.4,<0.6", optional = true }
 lz4            = { version = "^1", optional = true }
 flate2         = { version = "^1", optional = true }
 libdeflater    = { version = "^1", optional = true }
