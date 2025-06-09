@@ -33,12 +33,12 @@ isal-shared       = ["dep:isal-rs", "isal-rs/shared"]
 use-system-isal   = ["dep:isal-rs", "isal-rs/use-system-isal"]
 
 gzip              = ["gzip-static"]
-gzip-static       = ["dep:libdeflate-sys", "dep:flate2"]
-gzip-shared       = ["dep:libdeflate-sys", "dep:flate2", "libdeflate-sys/dynamic"]
+gzip-static       = ["dep:libdeflate-sys", "dep:flate2", "deflate-static"]
+gzip-shared       = ["dep:libdeflate-sys", "dep:flate2", "libdeflate-sys/dynamic", "deflate-shared"]
 
 zlib              = ["zlib-static"]
-zlib-static       = ["dep:libdeflate-sys", "dep:flate2"]
-zlib-shared       = ["dep:libdeflate-sys", "dep:flate2", "libdeflate-sys/dynamic"]
+zlib-static       = ["dep:libdeflate-sys", "dep:flate2", "deflate-static"]
+zlib-shared       = ["dep:libdeflate-sys", "dep:flate2", "libdeflate-sys/dynamic", "deflate-shared"]
 
 deflate           = ["deflate-static"]
 deflate-static    = ["dep:libdeflate-sys", "dep:flate2"]
