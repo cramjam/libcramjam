@@ -5,15 +5,15 @@ use flate2::Compression;
 use std::io::prelude::*;
 use std::io::{Cursor, Error};
 
-const DEFAULT_COMPRESSION_LEVEL: u32 = 6;
+pub const DEFAULT_COMPRESSION_LEVEL: u32 = 6;
+pub const GZIP_FOOTER_SIZE: usize = 8;
+pub const GZIP_MIN_HEADER_SIZE: usize = 10;
+pub const GZIP_MIN_OVERHEAD: usize = GZIP_MIN_HEADER_SIZE + GZIP_FOOTER_SIZE;
 
-pub fn compress_bound(input_len: usize, level: Option<i32>) -> Result<usize, Error> {
-    let level = level.unwrap_or_else(|| DEFAULT_COMPRESSION_LEVEL as _);
-    let mut c = libdeflater::Compressor::new(
-        libdeflater::CompressionLvl::new(level)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{:?}", e)))?,
-    );
-    Ok(c.gzip_compress_bound(input_len))
+/// Compression upper bound
+// xref: https://github.com/ebiggers/libdeflate/blob/6bb493615b0ef35c98fc4aa4ec04f448788db6a5/lib/gzip_compress.c#L85
+pub fn compress_bound(input_len: usize) -> usize {
+    GZIP_MIN_OVERHEAD + crate::deflate::compress_bound(input_len)
 }
 
 /// Decompress gzip data
@@ -28,7 +28,11 @@ pub fn decompress<W: Write + ?Sized, R: Read>(input: R, output: &mut W) -> Resul
 
 /// Compress gzip data
 #[inline(always)]
-pub fn compress<W: Write + ?Sized, R: Read>(input: R, output: &mut W, level: Option<u32>) -> Result<usize, Error> {
+pub fn compress<W: Write + ?Sized, R: Read>(
+    input: R,
+    output: &mut W,
+    level: Option<u32>,
+) -> Result<usize, Error> {
     let level = level.unwrap_or_else(|| DEFAULT_COMPRESSION_LEVEL);
     let mut encoder = GzEncoder::new(input, Compression::new(level));
     let n_bytes = std::io::copy(&mut encoder, output)?;

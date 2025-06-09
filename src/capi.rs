@@ -253,23 +253,34 @@ pub extern "C" fn compress(
         #[cfg(feature = "bzip2")]
         Codec::Bzip2 => bzip2::compress(&mut decompressed, &mut compressed, level.map(|v| v as _)),
         #[cfg(feature = "brotli")]
-        Codec::Brotli => brotli::compress(&mut decompressed, &mut compressed, level.map(|v| v as _)),
+        Codec::Brotli => {
+            brotli::compress(&mut decompressed, &mut compressed, level.map(|v| v as _))
+        }
         #[cfg(feature = "gzip")]
         Codec::Gzip => gzip::compress(&mut decompressed, &mut compressed, level.map(|v| v as _)),
         #[cfg(feature = "zstd")]
-        Codec::Zstd => zstd::compress(&mut decompressed, &mut compressed, level.map(|v: i32| v as i32)),
+        Codec::Zstd => zstd::compress(
+            &mut decompressed,
+            &mut compressed,
+            level.map(|v: i32| v as i32),
+        ),
         #[cfg(feature = "lz4")]
         Codec::Lz4 => lz4::compress(&mut decompressed, &mut compressed, level.map(|v| v as _)),
         // TODO: Support passing acceleration
         #[cfg(feature = "lz4")]
-        Codec::Lz4Block => lz4::block::compress_vec(decompressed.get_ref(), level.map(|v| v as _), None, Some(true))
-            .map(|v| {
-                let len = v.len();
-                *compressed.get_mut() = v;
-                compressed.set_position(len as _);
-                decompressed.set_position(input_len as _);
-                len
-            }), // TODO
+        Codec::Lz4Block => lz4::block::compress_vec(
+            decompressed.get_ref(),
+            level.map(|v| v as _),
+            None,
+            Some(true),
+        )
+        .map(|v| {
+            let len = v.len();
+            *compressed.get_mut() = v;
+            compressed.set_position(len as _);
+            decompressed.set_position(input_len as _);
+            len
+        }), // TODO
     };
     match ret {
         Ok(n) => {
@@ -302,7 +313,8 @@ pub extern "C" fn decompress_into(
     error: &mut *mut c_char,
 ) {
     let mut compressed = Cursor::new(unsafe { std::slice::from_raw_parts(input, input_len) });
-    let mut decompressed = Cursor::new(unsafe { std::slice::from_raw_parts_mut(output, output_len) });
+    let mut decompressed =
+        Cursor::new(unsafe { std::slice::from_raw_parts_mut(output, output_len) });
 
     let ret: Result<usize, std::io::Error> = match codec {
         #[cfg(feature = "snappy")]
@@ -320,7 +332,9 @@ pub extern "C" fn decompress_into(
         #[cfg(feature = "lz4")]
         Codec::Lz4 => lz4::decompress(&mut compressed, &mut decompressed),
         #[cfg(feature = "lz4")]
-        Codec::Lz4Block => lz4::block::decompress_into(&compressed.get_ref(), decompressed.get_mut(), None),
+        Codec::Lz4Block => {
+            lz4::block::decompress_into(&compressed.get_ref(), decompressed.get_mut(), None)
+        }
     };
     match ret {
         Ok(n) => {
@@ -364,16 +378,28 @@ pub extern "C" fn compress_into(
         #[cfg(feature = "bzip2")]
         Codec::Bzip2 => bzip2::compress(&mut decompressed, &mut compressed, level.map(|v| v as _)),
         #[cfg(feature = "brotli")]
-        Codec::Brotli => brotli::compress(&mut decompressed, &mut compressed, level.map(|v| v as _)),
+        Codec::Brotli => {
+            brotli::compress(&mut decompressed, &mut compressed, level.map(|v| v as _))
+        }
         #[cfg(feature = "gzip")]
         Codec::Gzip => gzip::compress(&mut decompressed, &mut compressed, level.map(|v| v as _)),
         #[cfg(feature = "zstd")]
-        Codec::Zstd => zstd::compress(&mut decompressed, &mut compressed, level.map(|v: i32| v as i32)),
+        Codec::Zstd => zstd::compress(
+            &mut decompressed,
+            &mut compressed,
+            level.map(|v: i32| v as i32),
+        ),
         #[cfg(feature = "lz4")]
         Codec::Lz4 => lz4::compress(&mut decompressed, &mut compressed, level.map(|v| v as _)),
         // TODO: Support passing acceleration
         #[cfg(feature = "lz4")]
-        Codec::Lz4Block => lz4::block::compress_into(decompressed, compressed, level.map(|v| v as _), None, Some(true)),
+        Codec::Lz4Block => lz4::block::compress_into(
+            decompressed,
+            compressed,
+            level.map(|v| v as _),
+            None,
+            Some(true),
+        ),
     };
     match ret {
         Ok(n) => {
@@ -391,7 +417,11 @@ pub extern "C" fn compress_into(
 /* ---------- Streaming Compressor --------------- */
 #[no_mangle]
 #[allow(unused_variables)]
-pub extern "C" fn compressor_init(codec: StreamingCodec, level: i32, error: &mut *mut c_char) -> *mut c_void {
+pub extern "C" fn compressor_init(
+    codec: StreamingCodec,
+    level: i32,
+    error: &mut *mut c_char,
+) -> *mut c_void {
     match codec {
         #[cfg(feature = "bzip2")]
         StreamingCodec::StreamingBzip2 => {
@@ -399,7 +429,10 @@ pub extern "C" fn compressor_init(codec: StreamingCodec, level: i32, error: &mut
                 error_to_ptr("Bzip2 requires compression level >= 0", error);
                 return std::ptr::null_mut();
             }
-            let compressor = bzip2::bzip2::write::BzEncoder::new(vec![], bzip2::bzip2::Compression::new(level as _));
+            let compressor = bzip2::bzip2::write::BzEncoder::new(
+                vec![],
+                bzip2::bzip2::Compression::new(level as _),
+            );
             Box::into_raw(Box::new(compressor)) as _
         }
         #[cfg(feature = "brotli")]
@@ -417,7 +450,10 @@ pub extern "C" fn compressor_init(codec: StreamingCodec, level: i32, error: &mut
                 error_to_ptr("Gzip requires compression level >= 1", error);
                 return std::ptr::null_mut();
             }
-            let compressor = gzip::flate2::write::GzEncoder::new(vec![], gzip::flate2::Compression::new(level as _));
+            let compressor = gzip::flate2::write::GzEncoder::new(
+                vec![],
+                gzip::flate2::Compression::new(level as _),
+            );
             Box::into_raw(Box::new(compressor)) as _
         }
         #[cfg(feature = "zstd")]
@@ -478,7 +514,10 @@ pub extern "C" fn free_compressor(codec: StreamingCodec, compressor_ptr: &mut *m
 }
 
 #[no_mangle]
-pub extern "C" fn compressor_inner(codec: StreamingCodec, compressor_ptr: &mut *mut c_void) -> Buffer {
+pub extern "C" fn compressor_inner(
+    codec: StreamingCodec,
+    compressor_ptr: &mut *mut c_void,
+) -> Buffer {
     match codec {
         #[cfg(feature = "bzip2")]
         StreamingCodec::StreamingBzip2 => {
@@ -510,7 +549,8 @@ pub extern "C" fn compressor_inner(codec: StreamingCodec, compressor_ptr: &mut *
         }
         #[cfg(feature = "snappy")]
         StreamingCodec::StreamingSnappy => {
-            let compressor = unsafe { Box::from_raw(*compressor_ptr as *mut SnappyFrameCompressor) };
+            let compressor =
+                unsafe { Box::from_raw(*compressor_ptr as *mut SnappyFrameCompressor) };
             let buffer = Buffer::from(compressor.get_ref());
             *compressor_ptr = Box::into_raw(compressor) as _;
             buffer
@@ -577,7 +617,8 @@ pub extern "C" fn compressor_finish(
         }
         #[cfg(feature = "snappy")]
         StreamingCodec::StreamingSnappy => {
-            let compressor = unsafe { Box::from_raw(*compressor_ptr as *mut SnappyFrameCompressor) };
+            let compressor =
+                unsafe { Box::from_raw(*compressor_ptr as *mut SnappyFrameCompressor) };
             match compressor.into_inner() {
                 Ok(buf) => Buffer::from(buf),
                 Err(err) => {
@@ -604,7 +645,11 @@ pub extern "C" fn compressor_finish(
 }
 
 #[no_mangle]
-pub extern "C" fn compressor_flush(codec: StreamingCodec, compressor_ptr: &mut *mut c_void, error: &mut *mut c_char) {
+pub extern "C" fn compressor_flush(
+    codec: StreamingCodec,
+    compressor_ptr: &mut *mut c_void,
+    error: &mut *mut c_char,
+) {
     match codec {
         #[cfg(feature = "bzip2")]
         StreamingCodec::StreamingBzip2 => {
@@ -640,7 +685,8 @@ pub extern "C" fn compressor_flush(codec: StreamingCodec, compressor_ptr: &mut *
         }
         #[cfg(feature = "snappy")]
         StreamingCodec::StreamingSnappy => {
-            let mut compressor = unsafe { Box::from_raw(*compressor_ptr as *mut SnappyFrameCompressor) };
+            let mut compressor =
+                unsafe { Box::from_raw(*compressor_ptr as *mut SnappyFrameCompressor) };
             if let Err(err) = compressor.flush() {
                 error_to_ptr(err, error);
             }
@@ -727,7 +773,8 @@ pub extern "C" fn compressor_compress(
         }
         #[cfg(feature = "snappy")]
         StreamingCodec::StreamingSnappy => {
-            let mut compressor = unsafe { Box::from_raw(*compressor_ptr as *mut SnappyFrameCompressor) };
+            let mut compressor =
+                unsafe { Box::from_raw(*compressor_ptr as *mut SnappyFrameCompressor) };
             match std::io::copy(&mut decompressed, &mut compressor) {
                 Ok(n) => {
                     *nbytes_written = n as _;
@@ -778,7 +825,10 @@ pub extern "C" fn free_decompressor(codec: StreamingCodec, decompressor_ptr: &mu
 
 #[no_mangle]
 #[allow(unused_variables)]
-pub extern "C" fn decompressor_inner(codec: StreamingCodec, decompressor_ptr: &mut *mut c_void) -> Buffer {
+pub extern "C" fn decompressor_inner(
+    codec: StreamingCodec,
+    decompressor_ptr: &mut *mut c_void,
+) -> Buffer {
     let decompressor = unsafe { Box::from_raw(*decompressor_ptr as *mut Decompressor) };
     let buf = Buffer::from(decompressor.get_ref());
     *decompressor_ptr = Box::into_raw(decompressor) as _;
@@ -877,15 +927,14 @@ pub extern "C" fn lz4_block_max_compressed_len(input_len: usize, error: &mut *mu
 
 #[cfg(feature = "deflate")]
 #[no_mangle]
-pub extern "C" fn deflate_max_compressed_len(input_len: usize, level: i32) -> usize {
-    deflate::compress_bound(input_len, Some(level))
+pub extern "C" fn deflate_max_compressed_len(input_len: usize) -> usize {
+    deflate::compress_bound(input_len)
 }
 
 #[cfg(feature = "gzip")]
 #[no_mangle]
-pub extern "C" fn gzip_max_compressed_len(input_len: usize, level: i32) -> usize {
-    let level = if level < 0 { 0 } else { level };
-    gzip::compress_bound(input_len, Some(level)).unwrap()
+pub extern "C" fn gzip_max_compressed_len(input_len: usize) -> usize {
+    gzip::compress_bound(input_len)
 }
 
 #[cfg(feature = "zstd")]
@@ -908,7 +957,11 @@ pub extern "C" fn brotli_max_compressed_len(input_len: usize) -> usize {
 
 #[cfg(feature = "snappy")]
 #[no_mangle]
-pub extern "C" fn snappy_raw_decompressed_len(input: *const u8, input_len: usize, error: &mut *mut c_char) -> isize {
+pub extern "C" fn snappy_raw_decompressed_len(
+    input: *const u8,
+    input_len: usize,
+    error: &mut *mut c_char,
+) -> isize {
     let input = unsafe { slice::from_raw_parts(input, input_len) };
     match snap::raw::decompress_len(input) {
         Ok(n) => n as _,
@@ -1037,7 +1090,8 @@ mod tests {
         assert!(buffer.owned);
 
         // retrieve compressed data and compare to actual rust impl
-        let compressed = unsafe { Vec::from_raw_parts(buffer.data as *mut u8, buffer.len, buffer.len) };
+        let compressed =
+            unsafe { Vec::from_raw_parts(buffer.data as *mut u8, buffer.len, buffer.len) };
         assert_eq!(&compressed, expected);
 
         // And decompress
@@ -1060,7 +1114,8 @@ mod tests {
         assert_eq!(nbytes_written, buffer.len);
         assert_eq!(nbytes_written, DATA.len());
         assert!(buffer.owned);
-        let decompressed = unsafe { Vec::from_raw_parts(buffer.data as *mut u8, buffer.len, buffer.len) };
+        let decompressed =
+            unsafe { Vec::from_raw_parts(buffer.data as *mut u8, buffer.len, buffer.len) };
         assert_eq!(DATA.as_slice(), &decompressed);
     }
 }
