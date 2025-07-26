@@ -19,9 +19,17 @@ pub fn decompress<W: Write + ?Sized, R: Read>(input: R, output: &mut W) -> Resul
 
 /// Compress gzip data
 #[inline(always)]
-pub fn compress<W: Write + ?Sized, R: Read>(input: R, output: &mut W, level: Option<i32>) -> Result<usize, Error> {
+pub fn compress<W: Write + ?Sized, R: Read>(
+    input: R,
+    output: &mut W,
+    level: Option<i32>,
+    input_size: Option<usize>,
+) -> Result<usize, Error> {
     let level = level.unwrap_or_else(|| DEFAULT_COMPRESSION_LEVEL); // 0 will use zstd's default, currently 3
     let mut encoder = zstd::stream::read::Encoder::new(input, level)?;
+
+    encoder.set_pledged_src_size(input_size.map(|v| v as u64))?;
+
     let n_bytes = std::io::copy(&mut encoder, output)?;
     Ok(n_bytes as usize)
 }

@@ -1,6 +1,11 @@
 fn main() {
     // See note in Cargo.toml
     if cfg!(target_pointer_width = "32") {
+        #[cfg(any(
+            feature = "use-system-isal",
+            feature = "isal-static",
+            feature = "isal-shared"
+        ))]
         let msg = "feature set but ISA-L not supported on 32 bit systems.";
 
         #[cfg(feature = "use-system-isal")]
