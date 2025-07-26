@@ -263,6 +263,7 @@ pub extern "C" fn compress(
             &mut decompressed,
             &mut compressed,
             level.map(|v: i32| v as i32),
+            Some(input_len),
         ),
         #[cfg(feature = "lz4")]
         Codec::Lz4 => lz4::compress(&mut decompressed, &mut compressed, level.map(|v| v as _)),
@@ -388,6 +389,7 @@ pub extern "C" fn compress_into(
             &mut decompressed,
             &mut compressed,
             level.map(|v: i32| v as i32),
+            Some(input_len),
         ),
         #[cfg(feature = "lz4")]
         Codec::Lz4 => lz4::compress(&mut decompressed, &mut compressed, level.map(|v| v as _)),
@@ -1063,7 +1065,7 @@ mod tests {
     #[test]
     fn test_zstd_roundtrip() {
         let mut expected = Cursor::new(vec![]);
-        zstd::compress(Cursor::new(DATA), &mut expected, Some(6)).unwrap();
+        zstd::compress(Cursor::new(DATA), &mut expected, Some(6), Some(DATA.len())).unwrap();
         let expected = expected.into_inner();
         roundtrip(Codec::Zstd, &expected, 6);
     }
