@@ -172,7 +172,7 @@ mod tests {
     test_variant!(deflate, None);
 
     #[cfg(feature = "zstd")]
-    test_variant!(zstd, None);
+    test_variant!(zstd, None, None);
 
     #[cfg(feature = "zlib")]
     test_variant!(zlib, None);
