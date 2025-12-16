@@ -83,7 +83,7 @@ libc           = { version = "0.2", optional = true }
 snap           = { version = "^1", optional = true }
 brotli         = { version = "^8", default-features = false, features = ["std", "ffi-api"], optional = true }
 # C backends (see the codec features above)
-bzip2          = { version = ">=0.4,<0.6", optional = true }
+bzip2          = { version = ">=0.4,<0.7", optional = true }
 lz4            = { version = "^1", optional = true }
 flate2         = { version = "^1", optional = true }
 zstd           = { version = "^0.13", optional = true }
