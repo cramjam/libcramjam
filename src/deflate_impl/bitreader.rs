@@ -20,21 +20,49 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    #[inline]
-    fn fill(&mut self, need: u32) {
-        while self.bit_count < need && self.pos < self.data.len() {
-            self.bit_buf |= (self.data[self.pos] as u64) << self.bit_count;
-            self.pos += 1;
-            self.bit_count += 8;
+    /// Bulk-fill the bit buffer. Loads 4 bytes at a time when possible.
+    #[inline(always)]
+    fn fill(&mut self, _need: u32) {
+        if self.bit_count <= 32 && self.pos + 4 <= self.data.len() {
+            // Fast path: load 4 bytes at once.
+            let bytes = [
+                self.data[self.pos],
+                self.data[self.pos + 1],
+                self.data[self.pos + 2],
+                self.data[self.pos + 3],
+            ];
+            self.bit_buf |= (u32::from_le_bytes(bytes) as u64) << self.bit_count;
+            self.pos += 4;
+            self.bit_count += 32;
+        } else {
+            while self.bit_count <= 56 && self.pos < self.data.len() {
+                self.bit_buf |= (self.data[self.pos] as u64) << self.bit_count;
+                self.pos += 1;
+                self.bit_count += 8;
+            }
         }
     }
 
     /// Read n bits (0..=57) as a u32, LSB first.
-    #[inline]
+    #[inline(always)]
     pub fn read_bits(&mut self, n: u32) -> io::Result<u32> {
         if n == 0 {
             return Ok(0);
         }
+        // Fast path: buffer already has enough bits.
+        if self.bit_count >= n {
+            let mask = (1u64 << n) - 1;
+            let value = (self.bit_buf & mask) as u32;
+            self.bit_buf >>= n;
+            self.bit_count -= n;
+            return Ok(value);
+        }
+        self.read_bits_slow(n)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn read_bits_slow(&mut self, n: u32) -> io::Result<u32> {
         self.fill(n);
         if self.bit_count < n {
             return Err(io::Error::new(
@@ -55,8 +83,18 @@ impl<'a> BitReader<'a> {
     /// upper bits.  This is safe for Huffman table lookups because short codes
     /// are replicated across all suffix extensions.  Returns `Err` only when
     /// **zero** bits are available.
-    #[inline]
+    #[inline(always)]
     pub fn peek_bits(&mut self, n: u32) -> io::Result<u32> {
+        // Fast path: buffer already has enough bits.
+        if self.bit_count >= n {
+            return Ok((self.bit_buf & ((1u64 << n) - 1)) as u32);
+        }
+        self.peek_bits_slow(n)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn peek_bits_slow(&mut self, n: u32) -> io::Result<u32> {
         self.fill(n);
         if self.bit_count == 0 {
             return Err(io::Error::new(
@@ -69,7 +107,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Consume n bits (after a successful peek).
-    #[inline]
+    #[inline(always)]
     pub fn consume(&mut self, n: u32) {
         self.bit_buf >>= n;
         self.bit_count -= n;

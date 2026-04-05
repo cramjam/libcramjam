@@ -12,13 +12,9 @@ use super::bitwriter::BitWriter;
 // ---------------------------------------------------------------------------
 
 /// Reverse the lowest `num_bits` bits of `value`.
-pub fn reverse_bits(mut value: u32, num_bits: u32) -> u32 {
-    let mut result = 0u32;
-    for _ in 0..num_bits {
-        result = (result << 1) | (value & 1);
-        value >>= 1;
-    }
-    result
+#[inline(always)]
+pub fn reverse_bits(value: u32, num_bits: u32) -> u32 {
+    value.reverse_bits() >> (32 - num_bits)
 }
 
 /// Compute canonical Huffman codes from code lengths (RFC 1951 section 3.2.2).
@@ -116,24 +112,31 @@ impl HuffmanDecoder {
     }
 
     /// Decode one symbol from the bit reader.
-    #[inline]
+    #[inline(always)]
     pub fn decode(&self, reader: &mut BitReader) -> io::Result<u16> {
-        if self.max_bits == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "decode from empty huffman table",
-            ));
-        }
         let bits = reader.peek_bits(self.max_bits)?;
         let (sym, len) = self.table[bits as usize];
         if len == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid huffman code",
-            ));
+            return Self::decode_error(self.max_bits);
         }
         reader.consume(len as u32);
         Ok(sym)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn decode_error(max_bits: u32) -> io::Result<u16> {
+        if max_bits == 0 {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decode from empty huffman table",
+            ))
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid huffman code",
+            ))
+        }
     }
 }
 

@@ -40,7 +40,8 @@ pub fn deflate_decompress<W: Write + ?Sized, R: Read>(
 ) -> io::Result<usize> {
     let mut data = Vec::new();
     input.read_to_end(&mut data)?;
-    let (decompressed, _consumed) = inflate::inflate(&data)?;
+    let mut decompressed = Vec::with_capacity(data.len().saturating_mul(3));
+    inflate::inflate_into(&data, &mut decompressed)?;
     output.write_all(&decompressed)?;
     Ok(decompressed.len())
 }
@@ -103,7 +104,7 @@ pub fn gzip_decompress<W: Write + ?Sized, R: Read>(
     let mut data = Vec::new();
     input.read_to_end(&mut data)?;
 
-    let mut all_output = Vec::new();
+    let mut decompressed = Vec::with_capacity(data.len().saturating_mul(3));
     let mut pos = 0;
 
     while pos < data.len() {
@@ -133,7 +134,6 @@ pub fn gzip_decompress<W: Write + ?Sized, R: Read>(
             ));
         }
         let flg = data[pos + 3];
-        // Check reserved bits.
         if flg & 0xE0 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -142,8 +142,6 @@ pub fn gzip_decompress<W: Write + ?Sized, R: Read>(
         }
 
         let mut hdr_end = pos + 10;
-
-        // FEXTRA
         if flg & 0x04 != 0 {
             if hdr_end + 2 > data.len() {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "gzip: truncated FEXTRA"));
@@ -151,34 +149,26 @@ pub fn gzip_decompress<W: Write + ?Sized, R: Read>(
             let xlen = u16::from_le_bytes([data[hdr_end], data[hdr_end + 1]]) as usize;
             hdr_end += 2 + xlen;
         }
-        // FNAME
         if flg & 0x08 != 0 {
-            while hdr_end < data.len() && data[hdr_end] != 0 {
-                hdr_end += 1;
-            }
-            hdr_end += 1; // skip NUL
-        }
-        // FCOMMENT
-        if flg & 0x10 != 0 {
-            while hdr_end < data.len() && data[hdr_end] != 0 {
-                hdr_end += 1;
-            }
+            while hdr_end < data.len() && data[hdr_end] != 0 { hdr_end += 1; }
             hdr_end += 1;
         }
-        // FHCRC
-        if flg & 0x02 != 0 {
-            hdr_end += 2;
+        if flg & 0x10 != 0 {
+            while hdr_end < data.len() && data[hdr_end] != 0 { hdr_end += 1; }
+            hdr_end += 1;
         }
+        if flg & 0x02 != 0 { hdr_end += 2; }
 
         if hdr_end > data.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "gzip: truncated header fields"));
         }
 
-        // Inflate.
-        let (decompressed, consumed) = inflate::inflate(&data[hdr_end..])?;
+        // Inflate directly into the output buffer.
+        let out_start = decompressed.len();
+        let consumed = inflate::inflate_into(&data[hdr_end..], &mut decompressed)?;
         let data_end = hdr_end + consumed;
 
-        // Footer: CRC32 + ISIZE.
+        // Footer: CRC32 + ISIZE — verify on the slice just produced.
         if data_end + 8 > data.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "gzip: truncated footer"));
         }
@@ -187,31 +177,23 @@ pub fn gzip_decompress<W: Write + ?Sized, R: Read>(
         let expected_isize =
             u32::from_le_bytes(data[data_end + 4..data_end + 8].try_into().unwrap());
 
-        let actual_crc = crc32::crc32(&decompressed);
+        let member = &decompressed[out_start..];
+        let actual_crc = crc32::crc32(member);
         if actual_crc != expected_crc {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "gzip: CRC-32 mismatch (expected {:08x}, got {:08x})",
-                    expected_crc, actual_crc
-                ),
+                format!("gzip: CRC-32 mismatch (expected {:08x}, got {:08x})", expected_crc, actual_crc),
             ));
         }
-
-        let actual_isize = decompressed.len() as u32;
-        if actual_isize != expected_isize {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "gzip: ISIZE mismatch",
-            ));
+        if member.len() as u32 != expected_isize {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "gzip: ISIZE mismatch"));
         }
 
-        all_output.extend_from_slice(&decompressed);
         pos = data_end + 8;
     }
 
-    let n = all_output.len();
-    output.write_all(&all_output)?;
+    let n = decompressed.len();
+    output.write_all(&decompressed)?;
     Ok(n)
 }
 
@@ -316,7 +298,8 @@ pub fn zlib_decompress<W: Write + ?Sized, R: Read>(
     }
 
     let hdr_size = ZLIB_HEADER_SIZE;
-    let (decompressed, consumed) = inflate::inflate(&data[hdr_size..])?;
+    let mut decompressed = Vec::with_capacity(data.len().saturating_mul(3));
+    let consumed = inflate::inflate_into(&data[hdr_size..], &mut decompressed)?;
     let data_end = hdr_size + consumed;
 
     if data_end + 4 > data.len() {
@@ -330,10 +313,7 @@ pub fn zlib_decompress<W: Write + ?Sized, R: Read>(
     if actual != expected {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "zlib: adler-32 mismatch (expected {:08x}, got {:08x})",
-                expected, actual
-            ),
+            format!("zlib: adler-32 mismatch (expected {:08x}, got {:08x})", expected, actual),
         ));
     }
 

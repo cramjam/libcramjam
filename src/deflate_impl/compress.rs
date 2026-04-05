@@ -25,22 +25,23 @@ const NONE: u32 = u32::MAX; // sentinel for empty hash chain
 
 struct Config {
     good_length: usize,
-    max_lazy: usize,
     nice_length: usize,
     max_chain: usize,
+    insert_step: usize, // 0 = skip all match insertions, 1 = every pos, N = every Nth
+    use_fixed: bool,    // true = use fixed Huffman codes (skip tree building)
 }
 
 const CONFIGS: [Config; 10] = [
-    Config { good_length: 0, max_lazy: 0, nice_length: 0, max_chain: 0 },       // 0: stored
-    Config { good_length: 4, max_lazy: 4, nice_length: 8, max_chain: 4 },       // 1
-    Config { good_length: 4, max_lazy: 5, nice_length: 16, max_chain: 8 },      // 2
-    Config { good_length: 4, max_lazy: 6, nice_length: 32, max_chain: 32 },     // 3
-    Config { good_length: 4, max_lazy: 4, nice_length: 16, max_chain: 16 },     // 4
-    Config { good_length: 8, max_lazy: 16, nice_length: 32, max_chain: 32 },    // 5
-    Config { good_length: 8, max_lazy: 16, nice_length: 128, max_chain: 128 },  // 6: default
-    Config { good_length: 8, max_lazy: 32, nice_length: 128, max_chain: 256 },  // 7
-    Config { good_length: 32, max_lazy: 128, nice_length: 258, max_chain: 1024 }, // 8
-    Config { good_length: 32, max_lazy: 258, nice_length: 258, max_chain: 4096 }, // 9
+    Config { good_length: 0, nice_length: 0, max_chain: 0, insert_step: 0, use_fixed: false },        // 0: stored
+    Config { good_length: 4, nice_length: 8, max_chain: 4, insert_step: 0, use_fixed: true },         // 1
+    Config { good_length: 4, nice_length: 16, max_chain: 8, insert_step: 4, use_fixed: true },        // 2
+    Config { good_length: 4, nice_length: 32, max_chain: 32, insert_step: 4, use_fixed: true },       // 3
+    Config { good_length: 4, nice_length: 16, max_chain: 16, insert_step: 2, use_fixed: false },      // 4
+    Config { good_length: 8, nice_length: 32, max_chain: 32, insert_step: 1, use_fixed: false },      // 5
+    Config { good_length: 8, nice_length: 128, max_chain: 128, insert_step: 1, use_fixed: false },    // 6: default
+    Config { good_length: 8, nice_length: 128, max_chain: 256, insert_step: 1, use_fixed: false },    // 7
+    Config { good_length: 32, nice_length: 258, max_chain: 1024, insert_step: 1, use_fixed: false },  // 8
+    Config { good_length: 32, nice_length: 258, max_chain: 4096, insert_step: 1, use_fixed: false },  // 9
 ];
 
 // ---------------------------------------------------------------------------
@@ -113,54 +114,133 @@ fn compress_with_huffman(input: &[u8], level: usize) -> Vec<u8> {
         let is_final = end >= input.len();
 
         let tokens = lz77(input, offset, end, config);
-        write_best_block(&mut w, &input[offset..end], &tokens, is_final);
+        write_best_block(&mut w, &input[offset..end], &tokens, is_final, config.use_fixed);
 
         offset = end;
     }
     w.finish()
 }
 
-/// Choose the smallest block encoding (stored vs dynamic Huffman) and write it.
+/// Choose the smallest block encoding and write it.
 fn write_best_block(
     w: &mut BitWriter,
     raw_data: &[u8],
     tokens: &[Token],
     is_final: bool,
+    use_fixed: bool,
 ) {
-    // Compute frequencies.
-    let mut lit_freq = [0u32; 286];
-    let mut dist_freq = [0u32; 30];
-    lit_freq[256] = 1; // end-of-block always present
-    for token in tokens {
-        match token {
-            Token::Literal(b) => lit_freq[*b as usize] += 1,
-            Token::Match { length, distance } => {
-                let (sym, _, _) = tables::length_to_symbol(*length);
-                lit_freq[sym as usize] += 1;
-                let (dsym, _, _) = tables::distance_to_symbol(*distance);
-                dist_freq[dsym as usize] += 1;
+    let stored_bits = stored_block_bits(raw_data.len());
+
+    if use_fixed {
+        // Fast path for low levels: compare stored vs fixed Huffman only.
+        let fixed_bits = estimate_fixed_bits(tokens);
+        if stored_bits <= fixed_bits && raw_data.len() <= MAX_STORED_BLOCK {
+            write_stored_block(w, raw_data, is_final);
+        } else {
+            write_fixed_block(w, tokens, is_final);
+        }
+    } else {
+        // Full path: compare stored vs dynamic Huffman.
+        let mut lit_freq = [0u32; 286];
+        let mut dist_freq = [0u32; 30];
+        lit_freq[256] = 1;
+        for token in tokens {
+            match token {
+                Token::Literal(b) => lit_freq[*b as usize] += 1,
+                Token::Match { length, distance } => {
+                    let (sym, _, _) = tables::length_to_symbol(*length);
+                    lit_freq[sym as usize] += 1;
+                    let (dsym, _, _) = tables::distance_to_symbol(*distance);
+                    dist_freq[dsym as usize] += 1;
+                }
             }
         }
-    }
+        let lit_lengths = huffman::build_lengths(&lit_freq, 15);
+        let dist_lengths = huffman::build_lengths(&dist_freq, 15);
+        let dynamic_bits = estimate_dynamic_bits(tokens, &lit_lengths, &dist_lengths, &lit_freq, &dist_freq);
 
-    // Build dynamic Huffman codes.
-    let lit_lengths = huffman::build_lengths(&lit_freq, 15);
-    let dist_lengths = huffman::build_lengths(&dist_freq, 15);
-
-    // Estimate sizes.
-    let stored_bits = stored_block_bits(raw_data.len());
-    let dynamic_bits = estimate_dynamic_bits(tokens, &lit_lengths, &dist_lengths, &lit_freq, &dist_freq);
-
-    if stored_bits <= dynamic_bits && raw_data.len() <= MAX_STORED_BLOCK {
-        write_stored_block(w, raw_data, is_final);
-    } else {
-        write_dynamic_block(w, tokens, &lit_lengths, &dist_lengths, is_final);
+        if stored_bits <= dynamic_bits && raw_data.len() <= MAX_STORED_BLOCK {
+            write_stored_block(w, raw_data, is_final);
+        } else {
+            write_dynamic_block(w, tokens, &lit_lengths, &dist_lengths, is_final);
+        }
     }
 }
 
 fn stored_block_bits(data_len: usize) -> usize {
     // 3 bits header + align (worst 7) + 4 bytes len/nlen + data
     3 + 7 + 32 + data_len * 8
+}
+
+fn estimate_fixed_bits(tokens: &[Token]) -> usize {
+    static FIXED_LIT: std::sync::OnceLock<[u8; 288]> = std::sync::OnceLock::new();
+    static FIXED_DIST: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    let fl = FIXED_LIT.get_or_init(tables::fixed_literal_lengths);
+    let fd = FIXED_DIST.get_or_init(tables::fixed_distance_lengths);
+
+    let mut bits = 3usize; // block header
+    for token in tokens {
+        match token {
+            Token::Literal(b) => bits += fl[*b as usize] as usize,
+            Token::Match { length, distance } => {
+                let (sym, extra, _) = tables::length_to_symbol(*length);
+                bits += fl[sym as usize] as usize + extra as usize;
+                let (dsym, dextra, _) = tables::distance_to_symbol(*distance);
+                bits += fd[dsym as usize] as usize + dextra as usize;
+            }
+        }
+    }
+    bits += fl[256] as usize; // end-of-block
+    bits
+}
+
+// ---------------------------------------------------------------------------
+// Fixed Huffman block writer (levels 1-3)
+// ---------------------------------------------------------------------------
+
+fn fixed_lit_codes() -> &'static [(u32, u8)] {
+    static CODES: std::sync::OnceLock<Vec<(u32, u8)>> = std::sync::OnceLock::new();
+    CODES.get_or_init(|| huffman::canonical_codes(&tables::fixed_literal_lengths()))
+}
+
+fn fixed_dist_codes() -> &'static [(u32, u8)] {
+    static CODES: std::sync::OnceLock<Vec<(u32, u8)>> = std::sync::OnceLock::new();
+    CODES.get_or_init(|| huffman::canonical_codes(&tables::fixed_distance_lengths()))
+}
+
+fn write_fixed_block(w: &mut BitWriter, tokens: &[Token], is_final: bool) {
+    w.write_bits(is_final as u32, 1);
+    w.write_bits(0b01, 2); // BTYPE = fixed Huffman
+
+    let lit_codes = fixed_lit_codes();
+    let dist_codes = fixed_dist_codes();
+
+    for token in tokens {
+        match token {
+            Token::Literal(b) => {
+                let (code, len) = lit_codes[*b as usize];
+                w.write_bits(code, len as u32);
+            }
+            Token::Match { length, distance } => {
+                let (sym, extra_bits, extra_val) = tables::length_to_symbol(*length);
+                let (code, len) = lit_codes[sym as usize];
+                w.write_bits(code, len as u32);
+                if extra_bits > 0 {
+                    w.write_bits(extra_val as u32, extra_bits as u32);
+                }
+                let (dsym, dextra_bits, dextra_val) = tables::distance_to_symbol(*distance);
+                let (dcode, dlen) = dist_codes[dsym as usize];
+                w.write_bits(dcode, dlen as u32);
+                if dextra_bits > 0 {
+                    w.write_bits(dextra_val as u32, dextra_bits as u32);
+                }
+            }
+        }
+    }
+
+    // End-of-block symbol (256).
+    let (code, len) = lit_codes[256];
+    w.write_bits(code, len as u32);
 }
 
 fn estimate_dynamic_bits(
@@ -425,13 +505,18 @@ fn lz77(input: &[u8], start: usize, end: usize, config: &Config) -> Vec<Token> {
                 length: best_len as u16,
                 distance: best_dist,
             });
-            // Insert hash entries for every position inside the match.
-            for i in 1..best_len {
-                let p = pos + i;
-                if p + MIN_MATCH <= end {
-                    let h2 = hash3(&input[p..]);
-                    prev[p & WINDOW_MASK] = head[h2];
-                    head[h2] = p as u32;
+            // Insert hash entries for positions inside the match.
+            // At low levels, skip most/all insertions for speed.
+            if config.insert_step > 0 {
+                let mut i = config.insert_step;
+                while i < best_len {
+                    let p = pos + i;
+                    if p + MIN_MATCH <= end {
+                        let h2 = hash3(&input[p..]);
+                        prev[p & WINDOW_MASK] = head[h2];
+                        head[h2] = p as u32;
+                    }
+                    i += config.insert_step;
                 }
             }
             pos += best_len;

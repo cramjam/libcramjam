@@ -6,21 +6,20 @@ use super::bitreader::BitReader;
 use super::huffman::HuffmanDecoder;
 use super::tables;
 
-/// Decompress a raw DEFLATE stream.
+/// Decompress a raw DEFLATE stream, appending to `output`.
 ///
-/// Returns `(decompressed_data, input_bytes_consumed)`.
-pub fn inflate(input: &[u8]) -> io::Result<(Vec<u8>, usize)> {
+/// Returns the number of input bytes consumed.
+pub fn inflate_into(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
     let mut reader = BitReader::new(input);
-    let mut output: Vec<u8> = Vec::new();
 
     loop {
         let bfinal = reader.read_bits(1)?;
         let btype = reader.read_bits(2)?;
 
         match btype {
-            0 => inflate_stored(&mut reader, &mut output)?,
-            1 => inflate_fixed(&mut reader, &mut output)?,
-            2 => inflate_dynamic(&mut reader, &mut output)?,
+            0 => inflate_stored(&mut reader, output)?,
+            1 => inflate_fixed(&mut reader, output)?,
+            2 => inflate_dynamic(&mut reader, output)?,
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -34,7 +33,13 @@ pub fn inflate(input: &[u8]) -> io::Result<(Vec<u8>, usize)> {
         }
     }
 
-    let consumed = reader.bytes_consumed();
+    Ok(reader.bytes_consumed())
+}
+
+/// Convenience wrapper: decompress into a new Vec.
+pub fn inflate(input: &[u8]) -> io::Result<(Vec<u8>, usize)> {
+    let mut output = Vec::with_capacity(input.len().saturating_mul(3));
+    let consumed = inflate_into(input, &mut output)?;
     Ok((output, consumed))
 }
 
@@ -182,11 +187,20 @@ fn decode_block(
                     ));
                 }
 
-                // Copy (may overlap: distance < length is valid and creates repeating patterns).
+                // Copy back-reference. May overlap (distance < length creates repeating patterns).
                 let start = output.len() - distance;
-                for i in 0..length {
-                    let byte = output[start + i];
-                    output.push(byte);
+                if distance >= length {
+                    // Non-overlapping: single memcpy.
+                    output.extend_from_within(start..start + length);
+                } else {
+                    // Overlapping: copy in chunks of `distance` bytes.
+                    let mut remaining = length;
+                    while remaining > 0 {
+                        let copy_len = remaining.min(distance);
+                        let src = output.len() - distance;
+                        output.extend_from_within(src..src + copy_len);
+                        remaining -= copy_len;
+                    }
                 }
             }
             _ => {
