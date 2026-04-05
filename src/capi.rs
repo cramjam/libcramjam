@@ -132,7 +132,7 @@ type Bzip2Compressor = bzip2::bzip2::write::BzEncoder<Vec<u8>>;
 #[cfg(feature = "lz4")]
 type Lz4Compressor = crate::lz4::lz4::Encoder<Vec<u8>>;
 #[cfg(feature = "gzip")]
-type GzipCompressor = crate::gzip::flate2::write::GzEncoder<Vec<u8>>;
+type GzipCompressor = crate::deflate_impl::GzipStreamCompressor;
 #[cfg(feature = "brotli")]
 type BrotliCompressor = brotli::brotli::CompressorWriter<Vec<u8>>;
 #[cfg(feature = "zstd")]
@@ -452,9 +452,9 @@ pub extern "C" fn compressor_init(
                 error_to_ptr("Gzip requires compression level >= 1", error);
                 return std::ptr::null_mut();
             }
-            let compressor = gzip::flate2::write::GzEncoder::new(
+            let compressor = crate::deflate_impl::GzipStreamCompressor::new(
                 vec![],
-                gzip::flate2::Compression::new(level as _),
+                level as u32,
             );
             Box::into_raw(Box::new(compressor)) as _
         }

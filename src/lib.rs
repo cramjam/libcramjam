@@ -10,6 +10,21 @@ pub mod brotli;
 pub mod bzip2;
 #[cfg(feature = "capi")]
 mod capi;
+
+// Pure-Rust DEFLATE / gzip / zlib implementation (no C dependencies).
+#[cfg(any(
+    feature = "deflate",
+    feature = "deflate-static",
+    feature = "deflate-shared",
+    feature = "gzip",
+    feature = "gzip-static",
+    feature = "gzip-shared",
+    feature = "zlib",
+    feature = "zlib-static",
+    feature = "zlib-shared",
+))]
+pub(crate) mod deflate_impl;
+
 #[cfg(any(
     feature = "deflate",
     feature = "deflate-static",
