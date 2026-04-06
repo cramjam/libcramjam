@@ -136,7 +136,7 @@ type GzipCompressor = crate::deflate_impl::GzipStreamCompressor;
 #[cfg(feature = "brotli")]
 type BrotliCompressor = brotli::brotli::CompressorWriter<Vec<u8>>;
 #[cfg(feature = "zstd")]
-type ZstdCompressor<'a> = crate::zstd::zstd::Encoder<'a, Vec<u8>>;
+type ZstdCompressor = crate::zstd_impl::ZstdStreamCompressor;
 
 type Decompressor = Cursor<Vec<u8>>;
 
@@ -460,7 +460,7 @@ pub extern "C" fn compressor_init(
         }
         #[cfg(feature = "zstd")]
         StreamingCodec::StreamingZstd => {
-            let compressor = zstd::zstd::Encoder::new(vec![], level);
+            let compressor = crate::zstd_impl::ZstdStreamCompressor::new(vec![], level);
             Box::into_raw(Box::new(compressor)) as _
         }
         #[cfg(feature = "snappy")]

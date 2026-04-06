@@ -25,6 +25,10 @@ mod capi;
 ))]
 pub(crate) mod deflate_impl;
 
+// Pure-Rust Zstandard implementation (no C dependencies).
+#[cfg(feature = "zstd")]
+pub(crate) mod zstd_impl;
+
 #[cfg(any(
     feature = "deflate",
     feature = "deflate-static",
