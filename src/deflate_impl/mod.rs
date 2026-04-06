@@ -40,7 +40,7 @@ pub fn deflate_decompress<W: Write + ?Sized, R: Read>(
 ) -> io::Result<usize> {
     let mut data = Vec::new();
     input.read_to_end(&mut data)?;
-    let mut decompressed = Vec::with_capacity(data.len().saturating_mul(3));
+    let mut decompressed = Vec::with_capacity(std::cmp::max(data.len().saturating_mul(4), 32768));
     inflate::inflate_into(&data, &mut decompressed)?;
     output.write_all(&decompressed)?;
     Ok(decompressed.len())
@@ -104,7 +104,15 @@ pub fn gzip_decompress<W: Write + ?Sized, R: Read>(
     let mut data = Vec::new();
     input.read_to_end(&mut data)?;
 
-    let mut decompressed = Vec::with_capacity(data.len().saturating_mul(3));
+    // Use the ISIZE hint from the last 4 bytes of the gzip footer to pre-allocate.
+    // For single-member streams this gives the exact size; for multi-member
+    // it's a lower bound (and we'll grow as needed).
+    let size_hint = if data.len() >= 8 {
+        u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap()) as usize
+    } else {
+        data.len().saturating_mul(3)
+    };
+    let mut decompressed = Vec::with_capacity(size_hint);
     let mut pos = 0;
 
     while pos < data.len() {
@@ -163,12 +171,15 @@ pub fn gzip_decompress<W: Write + ?Sized, R: Read>(
             return Err(io::Error::new(io::ErrorKind::InvalidData, "gzip: truncated header fields"));
         }
 
-        // Inflate directly into the output buffer.
+        // Inflate, then CRC32 the result (separate pass — keeps inflate loop
+        // unperturbed for maximum throughput; data is still in L2 cache).
         let out_start = decompressed.len();
         let consumed = inflate::inflate_into(&data[hdr_end..], &mut decompressed)?;
         let data_end = hdr_end + consumed;
+        let member_len = decompressed.len() - out_start;
+        let actual_crc = crc32::crc32(&decompressed[out_start..]);
 
-        // Footer: CRC32 + ISIZE — verify on the slice just produced.
+        // Footer: CRC32 + ISIZE.
         if data_end + 8 > data.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "gzip: truncated footer"));
         }
@@ -177,15 +188,13 @@ pub fn gzip_decompress<W: Write + ?Sized, R: Read>(
         let expected_isize =
             u32::from_le_bytes(data[data_end + 4..data_end + 8].try_into().unwrap());
 
-        let member = &decompressed[out_start..];
-        let actual_crc = crc32::crc32(member);
         if actual_crc != expected_crc {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("gzip: CRC-32 mismatch (expected {:08x}, got {:08x})", expected_crc, actual_crc),
             ));
         }
-        if member.len() as u32 != expected_isize {
+        if member_len as u32 != expected_isize {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "gzip: ISIZE mismatch"));
         }
 
@@ -298,9 +307,10 @@ pub fn zlib_decompress<W: Write + ?Sized, R: Read>(
     }
 
     let hdr_size = ZLIB_HEADER_SIZE;
-    let mut decompressed = Vec::with_capacity(data.len().saturating_mul(3));
+    let mut decompressed = Vec::with_capacity(std::cmp::max(data.len().saturating_mul(4), 32768));
     let consumed = inflate::inflate_into(&data[hdr_size..], &mut decompressed)?;
     let data_end = hdr_size + consumed;
+    let actual = adler32::adler32(&decompressed);
 
     if data_end + 4 > data.len() {
         return Err(io::Error::new(
@@ -309,7 +319,6 @@ pub fn zlib_decompress<W: Write + ?Sized, R: Read>(
         ));
     }
     let expected = u32::from_be_bytes(data[data_end..data_end + 4].try_into().unwrap());
-    let actual = adler32::adler32(&decompressed);
     if actual != expected {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

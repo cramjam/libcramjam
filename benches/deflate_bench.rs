@@ -277,5 +277,78 @@ fn bench_compression_ratio(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_compress, bench_decompress, bench_compression_ratio);
+criterion_group!(benches, bench_compress, bench_decompress, bench_compression_ratio, bench_gzip_inflate_only, bench_crc32_raw);
 criterion_main!(benches);
+
+/// Isolate: gzip decompress WITHOUT the final write_all copy.
+/// Measures inflate + CRC32 only.
+fn bench_gzip_inflate_only(c: &mut Criterion) {
+    let data = gen_text(100_000);
+    let gz = f2_gzip_compress(&data, 6);
+
+    let mut group = c.benchmark_group("gzip_overhead");
+    group.throughput(Throughput::Bytes(data.len() as u64));
+
+    // Full gzip::decompress (includes write_all copy).
+    group.bench_function("full_gzip_decompress", |b| {
+        b.iter(|| {
+            let mut out = Vec::with_capacity(data.len());
+            libcramjam::gzip::decompress(&mut Cursor::new(gz.as_slice()), &mut out).unwrap();
+            out
+        })
+    });
+
+    // Raw deflate decompress (no checksum, no gzip wrapper).
+    group.bench_function("raw_deflate_decompress", |b| {
+        // Strip gzip header/footer to get raw deflate.
+        let raw = &gz[10..gz.len() - 8]; // skip 10-byte header, 8-byte footer
+        b.iter(|| {
+            let mut out = Vec::with_capacity(data.len());
+            libcramjam::deflate::decompress(&mut Cursor::new(raw), &mut out).unwrap();
+            out
+        })
+    });
+
+    // Measure just a 100KB memcpy (simulates write_all).
+    group.bench_function("memcpy_100k", |b| {
+        let src = vec![0u8; 100_000];
+        b.iter(|| {
+            let mut dst = Vec::with_capacity(100_000);
+            dst.extend_from_slice(&src);
+            dst
+        })
+    });
+
+    group.finish();
+}
+
+criterion_group!(overhead, bench_gzip_inflate_only);
+
+fn bench_crc32_raw(c: &mut Criterion) {
+    let data = gen_text(100_000);
+    let mut group = c.benchmark_group("crc32_raw");
+    group.throughput(Throughput::Bytes(data.len() as u64));
+    // Measure CRC32 cost by: gzip_decompress - deflate_decompress = CRC32 + wrapper.
+    // Also measure raw flate2 CRC32 for comparison.
+    let gz = f2_gzip_compress(&data, 6);
+    let raw = &gz[10..gz.len() - 8];
+
+    group.bench_function("our_inflate_only", |b| {
+        b.iter(|| {
+            let mut out = Vec::with_capacity(100_000);
+            libcramjam::deflate::decompress(&mut Cursor::new(raw), &mut out).unwrap();
+            out
+        })
+    });
+    group.bench_function("our_gzip_full", |b| {
+        b.iter(|| {
+            let mut out = Vec::with_capacity(100_000);
+            libcramjam::gzip::decompress(&mut Cursor::new(gz.as_slice()), &mut out).unwrap();
+            out
+        })
+    });
+    group.bench_function("flate2_gzip_full", |b| {
+        b.iter(|| f2_gzip_decompress(&gz))
+    });
+    group.finish();
+}

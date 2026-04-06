@@ -7,7 +7,6 @@ use super::huffman::HuffmanDecoder;
 use super::tables;
 
 /// Decompress a raw DEFLATE stream, appending to `output`.
-///
 /// Returns the number of input bytes consumed.
 pub fn inflate_into(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
     let mut reader = BitReader::new(input);
@@ -83,14 +82,12 @@ fn inflate_dynamic(reader: &mut BitReader, output: &mut Vec<u8>) -> io::Result<(
     let hdist = reader.read_bits(5)? as usize + 1;
     let hclen = reader.read_bits(4)? as usize + 4;
 
-    // Read code-length code lengths.
     let mut cl_lengths = [0u8; 19];
     for i in 0..hclen {
         cl_lengths[tables::CODE_LENGTH_ORDER[i]] = reader.read_bits(3)? as u8;
     }
     let cl_dec = HuffmanDecoder::from_lengths(&cl_lengths)?;
 
-    // Decode literal/length + distance code lengths.
     let total = hlit + hdist;
     let mut all_lengths: Vec<u8> = Vec::with_capacity(total);
 
@@ -99,7 +96,6 @@ fn inflate_dynamic(reader: &mut BitReader, output: &mut Vec<u8>) -> io::Result<(
         match sym {
             0..=15 => all_lengths.push(sym as u8),
             16 => {
-                // Repeat previous length 3..6 times.
                 let count = reader.read_bits(2)? as usize + 3;
                 let prev = *all_lengths
                     .last()
@@ -110,7 +106,6 @@ fn inflate_dynamic(reader: &mut BitReader, output: &mut Vec<u8>) -> io::Result<(
                 }
             }
             17 => {
-                // Repeat 0 for 3..10 times.
                 let count = reader.read_bits(3)? as usize + 3;
                 let count = count.min(total - all_lengths.len());
                 for _ in 0..count {
@@ -118,7 +113,6 @@ fn inflate_dynamic(reader: &mut BitReader, output: &mut Vec<u8>) -> io::Result<(
                 }
             }
             18 => {
-                // Repeat 0 for 11..138 times.
                 let count = reader.read_bits(7)? as usize + 11;
                 let count = count.min(total - all_lengths.len());
                 for _ in 0..count {
@@ -156,7 +150,6 @@ fn decode_block(
                 output.push(sym as u8);
             }
             256 => {
-                // End of block.
                 return Ok(());
             }
             257..=285 => {
@@ -187,13 +180,10 @@ fn decode_block(
                     ));
                 }
 
-                // Copy back-reference. May overlap (distance < length creates repeating patterns).
                 let start = output.len() - distance;
                 if distance >= length {
-                    // Non-overlapping: single memcpy.
                     output.extend_from_within(start..start + length);
                 } else {
-                    // Overlapping: copy in chunks of `distance` bytes.
                     let mut remaining = length;
                     while remaining > 0 {
                         let copy_len = remaining.min(distance);
@@ -219,7 +209,6 @@ mod tests {
 
     #[test]
     fn test_inflate_flate2_level1_text() {
-        // 100 bytes of text compressed by flate2 at level 1 (verified with Python zlib).
         let compressed: Vec<u8> = vec![
             0x0d, 0xc9, 0xcb, 0x15, 0x84, 0x20, 0x0c, 0x05, 0xd0, 0x56, 0x5e, 0x01, 0x73, 0xa6,
             0x12, 0x97, 0x36, 0x80, 0x18, 0x35, 0x0a, 0x04, 0x93, 0xe0, 0xaf, 0x7a, 0xdd, 0xde,
