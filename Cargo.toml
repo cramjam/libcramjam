@@ -62,6 +62,7 @@ brotli         = { version = "^8", default-features = false, features = ["std", 
 bzip2          = { version = ">=0.4,<0.6", optional = true }
 lz4            = { version = "^1", optional = true }
 crc32fast       = "^1"
+simd-adler32    = "^0.3"
 # flate2 and libdeflate-sys removed: gzip/deflate/zlib are now pure Rust
 blosc2-rs      = { version = "0.4.0+2.15.2", optional = true, default-features = false }
 zstd           = { version = "^0.13", optional = true }
