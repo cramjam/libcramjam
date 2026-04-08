@@ -14,7 +14,7 @@ snappy            = ["dep:snap"]
 lz4               = ["dep:lz4"]
 bzip2             = ["dep:bzip2"]
 brotli            = ["dep:brotli"]
-zstd              = ["dep:ruzstd"]
+zstd              = []
 
 igzip             = ["isal-static"]
 igzip-static      = ["isal-static"]
@@ -65,7 +65,6 @@ crc32fast       = "^1"
 simd-adler32    = "^0.3"
 # flate2 and libdeflate-sys removed: gzip/deflate/zlib are now pure Rust
 blosc2-rs      = { version = "0.4.0+2.15.2", optional = true, default-features = false }
-ruzstd         = { version = "^0.8", optional = true }
 xz2            = { version = "0.1.7", optional = true }
 
 # ISA-L not supported on 32-bit; Cargo doesn't offer a way to disable a single feature

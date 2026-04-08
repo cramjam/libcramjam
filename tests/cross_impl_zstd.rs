@@ -1,6 +1,6 @@
 //! Cross-implementation tests: our pure-Rust zstd vs the C-backed `zstd` crate.
 
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read};
 
 fn gen_text(size: usize) -> Vec<u8> {
     let phrases: &[&[u8]] = &[
@@ -115,13 +115,40 @@ fn our_compress_c_decompress() {
         ("one_byte", vec![42]),
         ("text_100", gen_text(100)),
         ("text_10k", gen_text(10_000)),
+        ("text_100k", gen_text(100_000)),
+        ("text_130k", gen_text(130_000)), // crosses 128KB block boundary
+        ("text_300k", gen_text(300_000)),
+        ("text_1m", gen_text(1_000_000)),
         ("random_1k", gen_random(0xBEEF, 1000)),
+        ("random_100k", gen_random(0xBEEF, 100_000)),
+        ("repeated_500k", vec![0xAAu8; 500_000]),
     ] {
-        let compressed = our_zstd_compress(&data, 0);
-        let decompressed = c_zstd_decompress(&compressed);
-        assert_eq!(
-            decompressed, data,
-            "ours->c failed: corpus={name}"
-        );
+        for level in [1, 3, 6, 9] {
+            let compressed = our_zstd_compress(&data, level);
+            let decompressed = c_zstd_decompress(&compressed);
+            assert_eq!(
+                decompressed, data,
+                "ours->c failed: corpus={name}, level={level}"
+            );
+        }
+    }
+}
+
+#[test]
+fn our_roundtrip_large() {
+    // Round-trip large inputs through our encoder + decoder.
+    for (name, data) in [
+        ("text_1m", gen_text(1_000_000)),
+        ("text_5m", gen_text(5_000_000)),
+        ("repeated_2m", vec![0xAAu8; 2_000_000]),
+    ] {
+        for level in [1, 3, 6, 9] {
+            let compressed = our_zstd_compress(&data, level);
+            let decompressed = our_zstd_decompress(&compressed);
+            assert_eq!(
+                decompressed, data,
+                "ours->ours failed: corpus={name}, level={level}"
+            );
+        }
     }
 }

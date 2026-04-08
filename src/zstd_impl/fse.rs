@@ -6,7 +6,7 @@
 
 use std::io;
 
-use super::bits::{ForwardByteReader, ReverseBitReader};
+use super::bits::{ForwardBitWriter, ForwardByteReader, ReverseBitReader};
 
 /// Maximum accuracy log for FSE tables.
 pub const FSE_MAX_ACCURACY_LOG: u32 = 9;
@@ -301,3 +301,162 @@ pub const MATCHLEN_TABLE: [(u32, u8); 53] = [
     (67, 4), (83, 4), (99, 5), (131, 7), (259, 8), (515, 9), (1027, 10), (2051, 11),
     (4099, 12), (8195, 13), (16387, 14), (32771, 15), (65539, 16),
 ];
+
+// ---------------------------------------------------------------------------
+// FSE encoder side
+// ---------------------------------------------------------------------------
+
+/// One encoder-side state slot for a particular symbol.  These are derived
+/// from the decoder table by inverting the (state → symbol) mapping.
+#[derive(Clone, Copy, Debug)]
+struct FseEncoderState {
+    /// The decoder-table index this slot transitions INTO.  Becomes the new
+    /// `state` value after encoding the symbol.
+    index: u16,
+    /// `num_bits` worth of low bits of the *previous* state are written to the
+    /// stream when transitioning here.  Equal to the decoder entry's num_bits.
+    num_bits: u8,
+    /// Inclusive range of *previous* state indexes that route to this slot.
+    /// `prev_state ∈ [base..=last]` chooses this slot when encoding the symbol.
+    base: u32,
+    last: u32,
+}
+
+/// Encoder-side FSE table: per-symbol list of state slots.
+pub struct FseEncoder {
+    /// `slots[symbol]` holds the encoder slots for that symbol, sorted by `index`.
+    slots: Vec<Vec<FseEncoderState>>,
+    pub accuracy_log: u32,
+}
+
+impl FseEncoder {
+    /// Build an encoder table from a decoder table.
+    pub fn from_decoder(dec: &FseTable, num_symbols: usize) -> Self {
+        let acc_log = dec.accuracy_log;
+        let table_size = 1usize << acc_log;
+        let mut slots: Vec<Vec<FseEncoderState>> = vec![Vec::new(); num_symbols];
+
+        // Each decoder entry says: at decoder state `i`, the symbol is `sym`
+        // and the next state is `baseline + read_bits(num_bits)`.  Inverting:
+        // when we ENCODE `sym`, we need to land on entry `i`.  The set of
+        // *prior* states that select entry `i` is exactly
+        //   prev_state ∈ [baseline + 0 .. baseline + (1<<num_bits) - 1]
+        // which is what the decoder will output.
+        for i in 0..table_size {
+            let entry = dec.table[i];
+            let sym = entry.symbol as usize;
+            let nb = entry.num_bits as u32;
+            let base = entry.baseline as u32;
+            let span = 1u32 << nb;
+            slots[sym].push(FseEncoderState {
+                index: i as u16,
+                num_bits: nb as u8,
+                base,
+                last: base + span - 1,
+            });
+        }
+
+        // Sort each symbol's slot list by `base` so the lookup is O(log n)
+        // (or even O(1) given small list sizes).
+        for s in slots.iter_mut() {
+            s.sort_by_key(|st| st.base);
+        }
+
+        Self {
+            slots,
+            accuracy_log: acc_log,
+        }
+    }
+
+    /// Number of distinct slots for `sym` — equal to the FSE probability.
+    pub fn symbol_count(&self, sym: u8) -> usize {
+        self.slots[sym as usize].len()
+    }
+
+    /// Initial encoder state for the FIRST symbol to be encoded (which is
+    /// the LAST symbol in input order).  By zstd convention, use the slot
+    /// with the smallest `index` for that symbol.
+    pub fn start_state(&self, sym: u8) -> u32 {
+        self.slots[sym as usize][0].index as u32
+    }
+
+    /// Encode one symbol: write the low bits of `prev_state`, return the new
+    /// state.  Caller must have at least `symbol_count(sym) > 0` for this to
+    /// be a valid encoding (i.e. the FSE table must contain `sym`).
+    pub fn encode_symbol(&self, prev_state: u32, sym: u8, w: &mut ForwardBitWriter) -> u32 {
+        let slot = self.find_slot(sym, prev_state);
+        let diff = prev_state - slot.base;
+        w.write_bits(diff as u64, slot.num_bits as u32);
+        slot.index as u32
+    }
+
+    /// Find the slot whose [base..=last] contains `prev_state`.
+    /// Slots are sorted by `base`, but the predefined-table slot ranges
+    /// can WRAP around table_size, so the simple linear scan must check
+    /// each candidate explicitly.
+    fn find_slot(&self, sym: u8, prev_state: u32) -> &FseEncoderState {
+        let table_size = 1u32 << self.accuracy_log;
+        let slots = &self.slots[sym as usize];
+        for s in slots {
+            // Range [base..=last] in modular table_size space.
+            if s.base <= s.last {
+                if prev_state >= s.base && prev_state <= s.last {
+                    return s;
+                }
+            } else {
+                // Wrapped range (base > last) covers [base..table_size) ∪ [0..=last]
+                if prev_state >= s.base && prev_state < table_size {
+                    return s;
+                }
+                if prev_state <= s.last {
+                    return s;
+                }
+            }
+        }
+        // Should never happen with a well-formed table.
+        panic!(
+            "FSE encoder: no slot for sym={} prev_state={} (table_size={})",
+            sym, prev_state, table_size
+        );
+    }
+}
+
+#[cfg(test)]
+mod encoder_tests {
+    use super::*;
+    use crate::zstd_impl::bits::{ForwardBitWriter, ReverseBitReader};
+
+    /// End-to-end check: predefined LL table encode→decode round trip.
+    #[test]
+    fn fse_encode_decode_roundtrip_litlen() {
+        let dec = predefined_litlen_table();
+        let enc = FseEncoder::from_decoder(&dec, 36);
+
+        // Symbols to encode (must all be < 36 and have probability > 0 in the table).
+        let input: Vec<u8> = vec![0, 1, 2, 3, 4, 5, 10, 15, 20, 25, 30, 31, 0, 5, 10];
+
+        let mut w = ForwardBitWriter::new();
+        // Encode in REVERSE order (decoder reads MSB-first from end → forward).
+        let mut state = enc.start_state(*input.last().unwrap());
+        for &sym in input.iter().rev().skip(1) {
+            state = enc.encode_symbol(state, sym, &mut w);
+        }
+        // Final state goes last so the decoder reads it first.
+        w.write_bits(state as u64, enc.accuracy_log);
+        let bytes = w.finalize();
+
+        // Now decode forward and check we recover the input.
+        let mut br = ReverseBitReader::new(&bytes).unwrap();
+        br.skip_padding_bits().unwrap();
+        let mut decoded = Vec::new();
+        let mut state = br.get_bits(dec.accuracy_log);
+        for _ in 0..input.len() {
+            decoded.push(dec.symbol(state));
+            // For the LAST symbol decoded we mustn't update state (no more bits).
+            if decoded.len() < input.len() {
+                state = dec.next_state(state, &mut br);
+            }
+        }
+        assert_eq!(decoded, input, "FSE encode/decode roundtrip mismatch");
+    }
+}

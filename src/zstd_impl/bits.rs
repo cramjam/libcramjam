@@ -172,6 +172,84 @@ impl<'a> ReverseBitReader<'a> {
     }
 }
 
+/// Forward bit writer used to encode the zstd backward bitstream.
+///
+/// Bits are written LSB-first within each byte; bytes are emitted in increasing
+/// address order.  The first bit written ends up at bit 0 of byte 0.  When the
+/// decoder loads bytes from the END as a little-endian u64 and reads MSB-first,
+/// it sees the LAST bit written first — so the encoder must emit symbols in
+/// REVERSE order, then call `finalize` to add the end-of-stream sentinel.
+pub struct ForwardBitWriter {
+    pub output: Vec<u8>,
+    /// Up to 64 unflushed bits, packed at the LSB side.
+    partial: u64,
+    bits_in_partial: u32,
+}
+
+impl ForwardBitWriter {
+    pub fn new() -> Self {
+        Self {
+            output: Vec::new(),
+            partial: 0,
+            bits_in_partial: 0,
+        }
+    }
+
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            output: Vec::with_capacity(cap),
+            partial: 0,
+            bits_in_partial: 0,
+        }
+    }
+
+    /// Total bits written so far (including unflushed).
+    #[inline]
+    pub fn bit_len(&self) -> usize {
+        self.output.len() * 8 + self.bits_in_partial as usize
+    }
+
+    /// Write the low `n` bits of `bits` (n ≤ 56).  Caller must ensure that
+    /// the upper bits beyond `n` are zero.
+    #[inline]
+    pub fn write_bits(&mut self, bits: u64, n: u32) {
+        debug_assert!(n <= 56);
+        debug_assert!(n == 64 || bits >> n == 0, "extra bits set above n");
+        self.partial |= bits << self.bits_in_partial;
+        self.bits_in_partial += n;
+        if self.bits_in_partial >= 32 {
+            // Drain 4 full bytes to keep partial usable.
+            let lo = self.partial as u32;
+            self.output.extend_from_slice(&lo.to_le_bytes());
+            self.partial >>= 32;
+            self.bits_in_partial -= 32;
+        }
+    }
+
+    /// Add the end-of-stream sentinel '1' bit and pad with zeroes to the next
+    /// byte boundary.  After this call the buffer contains a complete zstd
+    /// backward bitstream readable by `ReverseBitReader`.
+    pub fn finalize(mut self) -> Vec<u8> {
+        // Sentinel bit. If the partial buffer has 0 spare bits in the current byte,
+        // we still need a 1 bit which lands at bit 0 of a fresh byte.
+        self.write_bits(1, 1);
+        // Flush any remaining partial bits to the next byte boundary.
+        let leftover = self.bits_in_partial;
+        if leftover > 0 {
+            let bytes = ((leftover + 7) / 8) as usize;
+            let buf = self.partial.to_le_bytes();
+            self.output.extend_from_slice(&buf[..bytes]);
+        }
+        self.output
+    }
+}
+
+impl Default for ForwardBitWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Simple forward byte reader for frame/block headers.
 pub struct ForwardByteReader<'a> {
     pub data: &'a [u8],
@@ -312,5 +390,43 @@ mod tests {
         let data = [0x00];
         let mut br = ReverseBitReader::new(&data).unwrap();
         assert!(br.skip_padding_bits().is_err());
+    }
+
+    /// Encoder writes symbols in REVERSE; the reverse-MSB decoder must
+    /// recover them in FORWARD order.
+    #[test]
+    fn writer_reader_roundtrip_simple() {
+        // Encode the sequence [3, 7, 1, 0] with 4 bits each, then decode
+        // and expect to read them in forward order.
+        let symbols: [u32; 4] = [3, 7, 1, 0];
+        let mut bw = ForwardBitWriter::new();
+        for &s in symbols.iter().rev() {
+            bw.write_bits(s as u64, 4);
+        }
+        let bytes = bw.finalize();
+
+        let mut br = ReverseBitReader::new(&bytes).unwrap();
+        br.skip_padding_bits().unwrap();
+        for &expected in &symbols {
+            assert_eq!(br.get_bits(4) as u32, expected);
+        }
+    }
+
+    #[test]
+    fn writer_reader_roundtrip_mixed_widths() {
+        // Encoder side, in DECODE order: read 5 bits = 0x1A, then 3 = 0b101,
+        // then 12 = 0xABC, then 8 = 0xFF.
+        let plan: &[(u64, u32)] = &[(0x1A, 5), (0b101, 3), (0xABC, 12), (0xFF, 8)];
+        let mut bw = ForwardBitWriter::new();
+        for &(v, n) in plan.iter().rev() {
+            bw.write_bits(v, n);
+        }
+        let bytes = bw.finalize();
+
+        let mut br = ReverseBitReader::new(&bytes).unwrap();
+        br.skip_padding_bits().unwrap();
+        for &(v, n) in plan {
+            assert_eq!(br.get_bits(n) as u64, v);
+        }
     }
 }
