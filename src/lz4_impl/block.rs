@@ -27,9 +27,8 @@ use std::io;
 
 const MIN_MATCH: usize = 4;
 const MAX_OFFSET: usize = 65_535;
-/// Last LITERAL_END bytes are always literals (no matches at the end).
-const LAST_LITERALS: usize = 5;
-/// Lookback distance for the LAST possible match.
+/// Lookback distance for the LAST possible match — last 12 bytes of any
+/// block must be literals (RFC requirement).
 const MIN_TRAILING_LITERALS: usize = 12;
 const HASH_BITS: usize = 14;
 const HASH_SIZE: usize = 1 << HASH_BITS;
@@ -41,14 +40,22 @@ const NONE: u32 = u32::MAX;
 // =========================================================================
 
 /// Decompress an LZ4 block into `output`.  Returns the number of OUTPUT bytes
-/// written.  The caller is responsible for the output buffer's capacity.
+/// written.  Reserves an aggressive amount of capacity up-front so the inner
+/// loop can avoid `Vec` growth checks via direct unchecked writes.
 pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
+    // Reserve a generous amount of headroom so we never reallocate inside the
+    // hot loop.  Worst case is bounded by `input.len() * 256` (single token,
+    // 1 byte literal + 65535-byte match), but we cap at the LZ4 frame block
+    // limit + slack.
+    let upper_bound = (input.len() * 256 + 65_536).min(8 * 1024 * 1024);
+    output.reserve(upper_bound);
+
     let start = output.len();
     let mut ip = 0usize;
     let in_len = input.len();
 
     while ip < in_len {
-        let token = input[ip];
+        let token = unsafe { *input.get_unchecked(ip) };
         ip += 1;
 
         // -- Literal run --
@@ -61,7 +68,7 @@ pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize>
                         "lz4: unexpected end while reading literal length",
                     ));
                 }
-                let b = input[ip];
+                let b = unsafe { *input.get_unchecked(ip) };
                 ip += 1;
                 lit_len += b as usize;
                 if b != 255 {
@@ -76,7 +83,9 @@ pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize>
                 "lz4: literal run exceeds input",
             ));
         }
-        output.extend_from_slice(&input[ip..ip + lit_len]);
+        // Wildcopy literals: copy in 8-byte chunks then trim.  We reserved
+        // headroom above so writing past the current len is in-bounds.
+        copy_literals(output, &input[ip..ip + lit_len]);
         ip += lit_len;
 
         // End of block: when there are no more bytes, we're done (the last
@@ -92,7 +101,10 @@ pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize>
                 "lz4: missing match offset",
             ));
         }
-        let offset = u16::from_le_bytes([input[ip], input[ip + 1]]) as usize;
+        let offset = u16::from_le_bytes([
+            unsafe { *input.get_unchecked(ip) },
+            unsafe { *input.get_unchecked(ip + 1) },
+        ]) as usize;
         ip += 2;
         if offset == 0 {
             return Err(io::Error::new(
@@ -110,7 +122,7 @@ pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize>
                         "lz4: unexpected end while reading match length",
                     ));
                 }
-                let b = input[ip];
+                let b = unsafe { *input.get_unchecked(ip) };
                 ip += 1;
                 match_len += b as usize;
                 if b != 255 {
@@ -127,19 +139,54 @@ pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize>
                 "lz4: match offset beyond output",
             ));
         }
-        let match_start = cur - offset;
-        if offset >= match_len {
-            output.extend_from_within(match_start..match_start + match_len);
-        } else {
-            // Overlapping copy: byte-by-byte to handle the run-length case.
-            for i in 0..match_len {
-                let b = output[match_start + i];
-                output.push(b);
-            }
-        }
+        copy_match(output, offset, match_len);
     }
 
     Ok(output.len() - start)
+}
+
+/// Copy a literal run into `output`.  Uses `extend_from_slice` which calls
+/// memcpy internally; the up-front `reserve` in the caller eliminates the
+/// per-call growth check.
+#[inline(always)]
+fn copy_literals(output: &mut Vec<u8>, literals: &[u8]) {
+    output.extend_from_slice(literals);
+}
+
+/// Copy a match (back-reference) into `output` using LZ4's wildcopy strategy.
+/// Caller must have reserved enough capacity in `output`.
+#[inline(always)]
+fn copy_match(output: &mut Vec<u8>, offset: usize, match_len: usize) {
+    let cur = output.len();
+    let match_start = cur - offset;
+    let end = cur + match_len;
+    debug_assert!(output.capacity() >= end + 16);
+
+    if offset >= 8 && end + 16 <= output.capacity() {
+        // Wildcopy 8-byte chunks.  Reading from src is always safe because
+        // the bytes we read in chunk N were written by an earlier chunk
+        // (or already exist as initialized output).  The dst writes go into
+        // reserved spare capacity, which we then truncate via set_len.
+        unsafe {
+            let base = output.as_mut_ptr();
+            let mut i = 0usize;
+            while i < match_len {
+                let src = base.add(match_start + i);
+                let dst = base.add(cur + i);
+                std::ptr::copy_nonoverlapping(src, dst, 8);
+                i += 8;
+            }
+            output.set_len(end);
+        }
+    } else {
+        // Slow / overlapping path: 1 byte at a time.  Required when
+        // offset < 8 (small-period RLE) OR when we're near the end of the
+        // reserved capacity and can't safely overshoot by 8 bytes.
+        for i in 0..match_len {
+            let b = output[match_start + i];
+            output.push(b);
+        }
+    }
 }
 
 // =========================================================================

@@ -95,6 +95,10 @@ harness = false
 name = "zstd_bench"
 harness = false
 
+[[bench]]
+name = "lz4_bench"
+harness = false
+
 [profile.release]
 strip = true
 lto = "fat"
