@@ -235,24 +235,25 @@ fn decode_one_frame(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
         // The output goes through inverse RLE2 (RUNA/RUNB → zero runs)
         // then inverse MTF.  We do RLE2 inline; MTF inverse is below.
         let mut bwt_input: Vec<u8> = Vec::with_capacity(max_block_size);
-        // Inverse MTF state: list of alphabet indices in MTF order.  Each
-        // entry is a 0..num_used index into `alphabet_to_byte`, NOT a raw
-        // byte — `num_used` can be 256 which doesn't fit in u8.
-        let mut mtf_list: Vec<u16> = (0..num_used as u16).collect();
+        // Inverse MTF state.  Fixed-size [u16; 256] arrays let LLVM elide
+        // bounds checks and keep everything in L1.  `mtf_list[i]` is the
+        // alphabet-index (into `alphabet_to_byte`) currently at MTF position i.
+        let mut mtf_list: [u16; 256] = [0; 256];
+        for i in 0..num_used {
+            mtf_list[i] = i as u16;
+        }
 
-        let mut group_pos = 0usize;
+        let mut group_left: usize = 0;
         let mut selector_idx = 0usize;
         let mut current_table: &HufTable = &tables[selectors[0] as usize];
-
-        let runa_b_code = 0u16; // RUNA = symbol 0, RUNB = symbol 1
-        let _ = runa_b_code;
 
         let eob_symbol = (num_used + 1) as u16;
         let mut zero_run: u32 = 0;
         let mut run_weight: u32 = 1;
+        let max_mtf_index = num_used; // valid range 1..=num_used (sym 2..=num_used+1)
 
         loop {
-            if group_pos == 0 {
+            if group_left == 0 {
                 if selector_idx >= selectors.len() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -261,13 +262,18 @@ fn decode_one_frame(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
                 }
                 current_table = &tables[selectors[selector_idx] as usize];
                 selector_idx += 1;
+                group_left = HUFFMAN_GROUP_SIZE;
             }
-            group_pos = (group_pos + 1) % HUFFMAN_GROUP_SIZE;
+            group_left -= 1;
 
             let sym = current_table.decode(&mut br)?;
             if sym == eob_symbol {
                 // Flush any pending zero run before exiting.
-                flush_zero_run(&mut bwt_input, &mut mtf_list, &mut zero_run, &alphabet_to_byte)?;
+                if zero_run > 0 {
+                    let byte = alphabet_to_byte[mtf_list[0] as usize];
+                    let new_len = bwt_input.len() + zero_run as usize;
+                    bwt_input.resize(new_len, byte);
+                }
                 break;
             }
             if sym <= 1 {
@@ -281,36 +287,48 @@ fn decode_one_frame(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
                 continue;
             }
             // Real (non-zero) MTF index.  Flush any pending zero run first.
-            flush_zero_run(&mut bwt_input, &mut mtf_list, &mut zero_run, &alphabet_to_byte)?;
+            if zero_run > 0 {
+                let byte = alphabet_to_byte[mtf_list[0] as usize];
+                let new_len = bwt_input.len() + zero_run as usize;
+                bwt_input.resize(new_len, byte);
+                zero_run = 0;
+            }
             run_weight = 1;
 
             let mtf_index = (sym - 1) as usize; // sym 2 → MTF index 1, etc.
-            if mtf_index >= mtf_list.len() {
+            if mtf_index >= max_mtf_index {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "bzip2: MTF index out of range",
                 ));
             }
-            let alpha_idx = mtf_list[mtf_index];
-            // Move to front.
-            for i in (1..=mtf_index).rev() {
-                mtf_list[i] = mtf_list[i - 1];
+            // Move-to-front: shift mtf_list[0..mtf_index] right by one slot
+            // (memmove via copy_within), then update slot 0.  No position
+            // table needed because the decoder receives the index directly.
+            unsafe {
+                let p = mtf_list.as_mut_ptr();
+                let alpha_idx = *p.add(mtf_index);
+                std::ptr::copy(p, p.add(1), mtf_index);
+                *p = alpha_idx;
+                bwt_input.push(*alphabet_to_byte.get_unchecked(alpha_idx as usize));
             }
-            mtf_list[0] = alpha_idx;
-            bwt_input.push(alphabet_to_byte[alpha_idx as usize]);
         }
 
         // -- Inverse BWT --
         let plain = inverse_bwt(&bwt_input, bwt_origin)?;
 
-        // -- Inverse RLE1 --
-        let block_bytes = inverse_rle1(&plain);
-
-        // -- CRC --
+        // -- Fused inverse RLE1 + CRC + output extend --
+        // Instead of building an intermediate `block_bytes` vec, expand the
+        // RLE1 stream directly into `output` while updating the per-block
+        // CRC.  Saves one allocation and one pass over the data.
         let mut block_crc = Crc32::new();
-        block_crc.update(&block_bytes);
+        let block_start = output.len();
+        inverse_rle1_into(&plain, output, &mut block_crc);
         let computed_block_crc = block_crc.finalize();
         if computed_block_crc != stored_block_crc {
+            // Roll back the partial block we just wrote so the caller doesn't
+            // see corrupted data on the error path.
+            output.truncate(block_start);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -321,47 +339,19 @@ fn decode_one_frame(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
         }
         // Combined CRC: rotate left by 1 and XOR (per the spec).
         combined_crc = combined_crc.rotate_left(1) ^ stored_block_crc;
-
-        output.extend_from_slice(&block_bytes);
     }
-}
-
-fn flush_zero_run(
-    out: &mut Vec<u8>,
-    mtf_list: &mut Vec<u16>,
-    zero_run: &mut u32,
-    alphabet_to_byte: &[u8; 256],
-) -> io::Result<()> {
-    let n = *zero_run as usize;
-    if n == 0 {
-        return Ok(());
-    }
-    *zero_run = 0;
-    // The MTF index 0 corresponds to mtf_list[0].  We don't move-to-front
-    // for index 0 (it's already at the front).  Just emit n copies.
-    if mtf_list.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "bzip2: zero-run with empty MTF list",
-        ));
-    }
-    let byte_alpha = mtf_list[0];
-    let byte = alphabet_to_byte[byte_alpha as usize];
-    for _ in 0..n {
-        out.push(byte);
-    }
-    Ok(())
 }
 
 // =========================================================================
 // Inverse Burrows-Wheeler Transform
 // =========================================================================
 //
-// Standard counting-sort + cycle-following algorithm:
-//   1. Compute P[i] for each i where P[i] is the row of L[i] in the sorted
-//      first-column ordering, broken by ascending original index.
-//   2. Starting from `origin`, walk P for N steps, emitting L[walk] in
-//      REVERSE output order (so the first emit fills the last output slot).
+// Standard counting-sort + cycle-following algorithm.  We pack the
+// "next-index" and the "byte" together into a single u32 entry per BWT
+// position so the hot walk is a single random-access load per step instead
+// of two — halves the cache misses on the random-access walk, which is the
+// main bottleneck.  Bzip2 limits blocks to 900 KB so 24 bits of next-index
+// is plenty.
 fn inverse_bwt(last_column: &[u8], origin: usize) -> io::Result<Vec<u8>> {
     let len = last_column.len();
     if len == 0 {
@@ -387,20 +377,39 @@ fn inverse_bwt(last_column: &[u8], origin: usize) -> io::Result<Vec<u8>> {
         running += n;
     }
 
-    // P[i] = (count of L[j] < L[i] for any j) + (count of L[j] == L[i] for j < i)
-    let mut p = vec![0u32; len];
+    // p_byte[i] = ((next_index << 8) | byte) for BWT row i.
+    let mut p_byte = vec![0u32; len];
     for (i, &b) in last_column.iter().enumerate() {
         let s = counts[b as usize];
-        p[i] = s;
+        p_byte[i] = (s << 8) | b as u32;
         counts[b as usize] = s + 1;
     }
 
-    // Walk N steps from origin, filling the output BACKWARD.
+    // Walk N steps from `origin`, filling the output BACKWARD.  Single
+    // random-access load per step.  We issue a software prefetch one step
+    // ahead so the next entry can be in flight while we process the current
+    // one — this masks part of the L2/L3 latency on the random-access walk.
     let mut out = vec![0u8; len];
     let mut j = origin;
-    for i in (0..len).rev() {
-        out[i] = last_column[j];
-        j = p[j] as usize;
+    unsafe {
+        let pb = p_byte.as_ptr();
+        let dst = out.as_mut_ptr();
+        for i in (0..len).rev() {
+            let entry = *pb.add(j);
+            let j_next = (entry >> 8) as usize;
+            #[cfg(target_arch = "x86_64")]
+            {
+                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                _mm_prefetch(pb.add(j_next) as *const i8, _MM_HINT_T0);
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                use std::arch::aarch64::{_prefetch, _PREFETCH_LOCALITY3, _PREFETCH_READ};
+                _prefetch(pb.add(j_next) as *const i8, _PREFETCH_READ, _PREFETCH_LOCALITY3);
+            }
+            *dst.add(i) = entry as u8;
+            j = j_next;
+        }
     }
     Ok(out)
 }
@@ -424,8 +433,12 @@ pub(crate) fn test_only_inverse_bwt(last: &[u8], origin: usize) -> io::Result<Ve
 // run reaches 4, the next input byte is the count and we expand by that
 // many copies.  After expansion, the counter resets — even if the next
 // input byte is again the same, it doesn't add to a brand-new run yet.
-fn inverse_rle1(input: &[u8]) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::with_capacity(input.len());
+fn inverse_rle1_into(input: &[u8], out: &mut Vec<u8>, crc: &mut Crc32) {
+    // Reserve a generous lower bound to keep this from realloc-ing in the
+    // common case.  RLE1 expansion is at most ~64x for pathological runs but
+    // is usually <2x; this just avoids the first few re-grows.
+    out.reserve(input.len());
+    let (mut state, tbl) = crc.snapshot();
     let mut i = 0usize;
     let mut run_len = 0usize;
     let mut last: u8 = 0;
@@ -435,36 +448,52 @@ fn inverse_rle1(input: &[u8]) -> Vec<u8> {
         if run_len > 0 && b == last {
             run_len += 1;
             out.push(b);
+            // Inline CRC update — tbl reference is already in scope, no
+            // OnceLock get per byte.
+            let idx = (((state >> 24) as u8) ^ b) as usize;
+            state = (state << 8) ^ tbl[idx];
             if run_len == 4 {
                 // Next byte is the extra-run-length count.
                 if i < input.len() {
                     let extra = input[i] as usize;
                     i += 1;
-                    for _ in 0..extra {
-                        out.push(b);
+                    if extra > 0 {
+                        // Bulk-extend then bulk-CRC the run.
+                        let start = out.len();
+                        out.resize(start + extra, b);
+                        // CRC the run inline.
+                        for _ in 0..extra {
+                            let idx = (((state >> 24) as u8) ^ b) as usize;
+                            state = (state << 8) ^ tbl[idx];
+                        }
                     }
                 }
-                // Reset the run counter so the next byte starts fresh.
                 run_len = 0;
             }
         } else {
             last = b;
             run_len = 1;
             out.push(b);
+            let idx = (((state >> 24) as u8) ^ b) as usize;
+            state = (state << 8) ^ tbl[idx];
         }
     }
-    out
+    crc.restore(state);
 }
 
 // =========================================================================
 // Canonical Huffman decoder for bzip2's per-table code-length lists.
 // =========================================================================
+//
+// The hot decode path uses a `PEEK_LEN`-bit lookup table: peek the top
+// `PEEK_LEN` bits of the bit stream, look up `(symbol, code_len)`, advance
+// by `code_len` bits.  Codes longer than `PEEK_LEN` (rare for small alpha
+// sizes) fall through to a per-bit walk.
+
+const PEEK_LEN: u32 = 10;
+const PEEK_TABLE_SIZE: usize = 1 << PEEK_LEN;
 
 struct HufTable {
-    // base[k] = (first_code_at_length_k << (max_len - k)) computed once;
-    // limit[k] is the largest code (left-justified) of length k.
-    // For each length, codes are assigned in canonical order with lower
-    // symbol indexes getting smaller codes.
     min_len: u8,
     max_len: u8,
     /// `limit[k]` = max canonical code for length k, left-justified to max_len.
@@ -475,6 +504,11 @@ struct HufTable {
     /// `perm[i]` = symbol assigned to the i-th canonical code (in length
     /// order, lower symbols first).
     perm: Vec<u16>,
+    /// Per-pattern (sym, len) lookup keyed by the top `PEEK_LEN` bits of the
+    /// bit stream.  `peek_len[i] == 0` indicates a code longer than
+    /// `PEEK_LEN` — fall through to the slow path.
+    peek_sym: Box<[u16; PEEK_TABLE_SIZE]>,
+    peek_len: Box<[u8; PEEK_TABLE_SIZE]>,
 }
 
 impl HufTable {
@@ -522,20 +556,52 @@ impl HufTable {
         }
 
         // Compute limit[k] and base[k] using the standard algorithm.
-        // Assign canonical codes: at length min_len, first code = 0; at
-        // each subsequent length, the next code is `(prev_max + 1) << 1`.
         let mut code: u32 = 0;
         let mut idx = 0u32;
         for k in min_len..=max_len {
             let n = count[k as usize];
-            // Code range for length k: [code .. code + n).
-            // limit[k] = (code + n - 1) left-justified to max_len.
-            // base[k] = code - idx (so symbol_offset = (left_justified_code >> (max_len - k)) - base[k] gives perm index).
             let last = code + n - 1;
             limit[k as usize] = last << (max_len - k);
             base[k as usize] = code as i32 - idx as i32;
             idx += n;
             code = (last + 1) << 1;
+        }
+
+        // Build the peek table.  Walk perm in code-order, computing the
+        // canonical code for each symbol; for codes ≤ PEEK_LEN, fan out
+        // across `1 << (PEEK_LEN - k)` slots in the peek table.  For longer
+        // codes we leave peek_len[slot] = 0 so the decoder falls back to the
+        // bit-walk.
+        let mut peek_sym: Box<[u16; PEEK_TABLE_SIZE]> =
+            vec![0u16; PEEK_TABLE_SIZE].into_boxed_slice().try_into().unwrap();
+        let mut peek_len: Box<[u8; PEEK_TABLE_SIZE]> =
+            vec![0u8; PEEK_TABLE_SIZE].into_boxed_slice().try_into().unwrap();
+        {
+            let mut code: u32 = 0;
+            let mut perm_idx = 0usize;
+            for k in 1..=max_len as u32 {
+                let n = count[k as usize] as usize;
+                if k <= PEEK_LEN {
+                    let pad = PEEK_LEN - k;
+                    let span = 1usize << pad;
+                    for _ in 0..n {
+                        let start = (code as usize) << pad;
+                        let sym = perm[perm_idx];
+                        for slot in start..start + span {
+                            peek_sym[slot] = sym;
+                            peek_len[slot] = k as u8;
+                        }
+                        code += 1;
+                        perm_idx += 1;
+                    }
+                } else {
+                    // Skip past these codes (leave peek_len = 0 for their
+                    // prefix slots so the decoder takes the slow path).
+                    code += n as u32;
+                    perm_idx += n;
+                }
+                code <<= 1;
+            }
         }
 
         Ok(Self {
@@ -544,14 +610,34 @@ impl HufTable {
             limit,
             base,
             perm,
+            peek_sym,
+            peek_len,
         })
     }
 
-    /// Decode one Huffman symbol from the bit stream.  Reads bits one at a
-    /// time until a length matches `limit[k]`.
+    /// Decode one Huffman symbol from the bit stream.  Hot path: peek
+    /// `PEEK_LEN` bits and look up `(sym, code_len)` in O(1).  Slow path:
+    /// per-bit walk for codes longer than `PEEK_LEN`.
     #[inline]
     fn decode(&self, br: &mut BitReader<'_>) -> io::Result<u16> {
-        // Start by reading min_len bits and left-justifying to max_len.
+        // Refill so we have at least PEEK_LEN bits ready.  If the input
+        // is too short for PEEK_LEN, fall through to the slow path which
+        // handles short tails one bit at a time.
+        if br.refill(PEEK_LEN).is_ok() {
+            let p = br.peek(PEEK_LEN) as usize;
+            let len = self.peek_len[p];
+            if len > 0 {
+                br.consume(len as u32);
+                return Ok(self.peek_sym[p]);
+            }
+        }
+        self.decode_slow(br)
+    }
+
+    /// Slow per-bit decode used for codes longer than `PEEK_LEN` and at the
+    /// very end of the bitstream when `refill(PEEK_LEN)` fails.
+    #[cold]
+    fn decode_slow(&self, br: &mut BitReader<'_>) -> io::Result<u16> {
         let mut k = self.min_len;
         let mut code: u32 = br.read_bits(k as u32)? << (self.max_len - k);
         loop {
@@ -571,7 +657,6 @@ impl HufTable {
                     "bzip2: Huffman code longer than max_len",
                 ));
             }
-            // Read one more bit and OR it into the appropriate position.
             let next = br.read_bits(1)?;
             code |= next << (self.max_len - k - 1);
             k += 1;

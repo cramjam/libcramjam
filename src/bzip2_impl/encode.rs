@@ -8,12 +8,9 @@
 //!   5. Huffman — multi-table canonical Huffman with selector groups.
 //!   6. Frame  — 4-byte file header, per-block bit-packed payload, EOS marker.
 //!
-//! This is an MVP encoder.  It uses a simple `Vec<&[u8]>::sort_by` for the
-//! BWT instead of a real suffix array, and starts with 2 Huffman tables and
-//! one refinement pass instead of bzip2's full 4-pass selector optimization.
-//! Both can be improved later.
-
-use std::cmp::Ordering;
+//! BWT uses SA-IS (Suffix Array - Induced Sort) on the doubled input plus a
+//! sentinel for linear-time cyclic rotation sorting.  Multi-table Huffman uses
+//! the bzip2 spec's 2..=6 table count with 4 selector-refinement iterations.
 
 use super::bits::BitWriter;
 use super::crc::Crc32;
@@ -97,29 +94,64 @@ fn encode_block(bw: &mut BitWriter, block: &[u8], block_crc: u32) {
         }
     }
 
-    // MTF list of alphabet indices.
-    let mut mtf: Vec<u16> = (0..num_used as u16).collect();
+    // MTF state — fixed-size 256-entry stacks let LLVM avoid bounds checks and
+    // keep everything in L1.  `mtf[i]` = alphabet index currently at MTF
+    // position `i`; `mtf_pos[a]` = position of alphabet index `a` (inverse map
+    // for O(1) lookup, replacing the linear `iter().position(...)` scan).
+    let mut mtf: [u16; 256] = [0; 256];
+    let mut mtf_pos: [u16; 256] = [0; 256];
+    for i in 0..num_used {
+        mtf[i] = i as u16;
+        mtf_pos[i] = i as u16;
+    }
     let alpha_size = num_used + 2; // RUNA + RUNB + (num_used - 1) MTF symbols + EOB
     let eob_symbol = (num_used + 1) as u16;
 
     // Output: a sequence of u16 alphabet symbols (RUNA=0, RUNB=1, MTF1..=num_used,
     // EOB=num_used+1).
-    let mut symbols: Vec<u16> = Vec::with_capacity(bwt_out.len());
+    let mut symbols: Vec<u16> = Vec::with_capacity(bwt_out.len() + 1);
     let mut zero_run: u32 = 0;
 
     for &b in &bwt_out {
         let alpha_idx = byte_to_alpha[b as usize];
-        // Find the MTF position of this alphabet index.
-        let pos = mtf.iter().position(|&x| x == alpha_idx).unwrap();
-        // Move to front.
-        for i in (1..=pos).rev() {
-            mtf[i] = mtf[i - 1];
-        }
-        mtf[0] = alpha_idx;
+        // O(1) MTF position lookup via the inverse table.
+        let pos = mtf_pos[alpha_idx as usize] as usize;
 
         if pos == 0 {
             zero_run += 1;
         } else {
+            // Move-to-front: shift mtf[0..pos] one slot right, then update
+            // mtf_pos for each shifted element.  We do the shift with
+            // `copy_within` (SIMD memmove) and the position-table update in
+            // a tight sweep.  `unsafe` skips bounds checks; `pos < 256` and
+            // both arrays are length 256 so the indices are always valid.
+            unsafe {
+                let mtf_ptr = mtf.as_mut_ptr();
+                let pos_ptr = mtf_pos.as_mut_ptr();
+                // Equivalent to mtf.copy_within(0..pos, 1).
+                std::ptr::copy(mtf_ptr, mtf_ptr.add(1), pos);
+                // Sweep updates mtf_pos[mtf[i]] = i for i in 1..=pos.
+                let mut i = 1usize;
+                while i + 4 <= pos + 1 {
+                    let a0 = *mtf_ptr.add(i);
+                    let a1 = *mtf_ptr.add(i + 1);
+                    let a2 = *mtf_ptr.add(i + 2);
+                    let a3 = *mtf_ptr.add(i + 3);
+                    *pos_ptr.add(a0 as usize) = i as u16;
+                    *pos_ptr.add(a1 as usize) = (i + 1) as u16;
+                    *pos_ptr.add(a2 as usize) = (i + 2) as u16;
+                    *pos_ptr.add(a3 as usize) = (i + 3) as u16;
+                    i += 4;
+                }
+                while i <= pos {
+                    let a = *mtf_ptr.add(i);
+                    *pos_ptr.add(a as usize) = i as u16;
+                    i += 1;
+                }
+                *mtf_ptr = alpha_idx;
+                *pos_ptr.add(alpha_idx as usize) = 0;
+            }
+
             // Flush any pending zero run as RUNA/RUNB.
             if zero_run > 0 {
                 emit_zero_run(&mut symbols, zero_run);
@@ -170,18 +202,23 @@ fn encode_block(bw: &mut BitWriter, block: &[u8], block_crc: u32) {
     bw.write_bits(selectors.len() as u64, 15);
     let mut sel_pos: [u8; MAX_HUFFMAN_TABLES] = [0, 1, 2, 3, 4, 5];
     for &s in &selectors {
-        let s = s as usize;
-        let pos = sel_pos.iter().position(|&p| p == s as u8).unwrap();
+        // Linear scan over at most 6 entries — branch-prediction-friendly.
+        let mut pos = 0usize;
+        while sel_pos[pos] != s {
+            pos += 1;
+        }
         // Move to front.
-        for i in (1..=pos).rev() {
+        let v = sel_pos[pos];
+        let mut i = pos;
+        while i > 0 {
             sel_pos[i] = sel_pos[i - 1];
+            i -= 1;
         }
-        sel_pos[0] = s as u8;
-        // Write `pos` ones followed by a zero.
-        for _ in 0..pos {
-            bw.write_bits(1, 1);
-        }
-        bw.write_bits(0, 1);
+        sel_pos[0] = v;
+        // Write `pos` ones followed by a zero as a single bit-field.
+        // (1 << (pos+1)) - 2 is `pos` ones followed by a zero, MSB-first.
+        let bits = (1u64 << (pos + 1)) - 2;
+        bw.write_bits(bits, (pos + 1) as u32);
     }
 
     // Per-table code lengths: 5-bit start, then deltas.
@@ -205,11 +242,17 @@ fn encode_block(bw: &mut BitWriter, block: &[u8], block_crc: u32) {
         }
     }
 
-    // Encoded data: write each symbol with the table chosen by its 50-symbol group.
-    for (i, &sym) in symbols.iter().enumerate() {
-        let group = i / HUFFMAN_GROUP_SIZE;
-        let table = &tables[selectors[group] as usize];
-        bw.write_bits(table.codes[sym as usize] as u64, table.code_lens[sym as usize] as u32);
+    // Encoded data: write each symbol with the table chosen by its 50-symbol
+    // group.  Hoist the table-lookup out of the inner loop so the per-symbol
+    // path is just two array accesses + write_bits.
+    for (g, chunk) in symbols.chunks(HUFFMAN_GROUP_SIZE).enumerate() {
+        let table = &tables[selectors[g] as usize];
+        let codes = &table.codes;
+        let code_lens = &table.code_lens;
+        for &sym in chunk {
+            let s = sym as usize;
+            bw.write_bits(codes[s] as u64, code_lens[s] as u32);
+        }
     }
 }
 
@@ -257,14 +300,20 @@ fn forward_rle1(input: &[u8]) -> Vec<u8> {
 // Forward BWT
 // =========================================================================
 //
-// We sort all `n` rotations of the input.  Naive comparator-based sorting
-// is O(n² log n) because each rotation comparison can scan up to n bytes.
-// Instead we use Manber-Myers prefix doubling on the DOUBLED input
-// (`input ++ input`): rotations of `input` correspond to length-`n`
-// prefixes of suffixes 0..n of the doubled input.  Manber-Myers sorts
-// suffixes by progressively longer prefixes (1, 2, 4, 8, ...), reaching a
-// total complexity of O(n log² n) which is fast enough for the 900 KiB
-// max block size.
+// We need to sort all `n` cyclic rotations of `input`.  Two strategies:
+//
+//   * SA-IS over `input ++ input ++ [sentinel]` (linear-time suffix sort)
+//     filtered to positions in [0, n).  Wins decisively for inputs with
+//     long LCPs (text, source code, structured binaries).
+//
+//   * Prefix-doubling over rotations (Manber-Myers) with 2-pass LSD radix
+//     sort per doubling step.  Wins for high-entropy inputs (random,
+//     incompressible) where 1–2 doubling passes are enough to fully
+//     disambiguate every rotation.
+//
+// We pick between them with a cheap heuristic: count distinct 2-grams.
+// Random-like inputs have ~65k distinct 2-grams (close to n); text-like
+// inputs have far fewer.  Threshold at n/2.
 fn forward_bwt(input: &[u8]) -> (Vec<u8>, usize) {
     let n = input.len();
     if n == 0 {
@@ -274,14 +323,89 @@ fn forward_bwt(input: &[u8]) -> (Vec<u8>, usize) {
         return (vec![input[0]], 0);
     }
 
-    // Sort the n rotation starts using prefix doubling.
+    if is_high_entropy_input(input) {
+        bwt_via_prefix_doubling(input)
+    } else {
+        bwt_via_sais(input)
+    }
+}
+
+/// Heuristic: input is "high entropy" (random-like) iff its number of
+/// distinct cyclic 2-grams is > n/2.  Costs O(n) time and O(65536/8) bytes.
+fn is_high_entropy_input(input: &[u8]) -> bool {
+    let n = input.len();
+    if n < 32 {
+        // For very small inputs the heuristic isn't meaningful — the
+        // doubling-vs-sais constant factor doesn't matter either, so use
+        // prefix doubling (simpler / lower setup cost).
+        return true;
+    }
+    // Bitset of seen 2-grams (8 KB).
+    let mut seen = [0u64; 1024]; // 1024 * 64 = 65536 bits
+    let mut distinct = 0usize;
+    for i in 0..n {
+        let next = if i + 1 == n { 0 } else { i + 1 };
+        let g = ((input[i] as usize) << 8) | input[next] as usize;
+        let word = g >> 6;
+        let bit = 1u64 << (g & 63);
+        if seen[word] & bit == 0 {
+            seen[word] |= bit;
+            distinct += 1;
+            if distinct > n / 2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn bwt_via_sais(input: &[u8]) -> (Vec<u8>, usize) {
+    let n = input.len();
+    // Build T = input ++ input ++ [sentinel] over a 257-symbol alphabet:
+    //   * bytes are mapped to 1..=256 so 0 is reserved for the sentinel
+    //   * the trailing 0 is the unique smallest character
+    // Length = 2n + 1.
+    let total = 2 * n + 1;
+    let mut t = vec![0u32; total];
+    for i in 0..n {
+        let b = (input[i] as u32) + 1;
+        t[i] = b;
+        t[i + n] = b;
+    }
+    t[total - 1] = 0;
+
+    // Sort all suffixes of T.
+    let sa = sais(&t, 257);
+
+    // Filter to keep only positions in [0, n) — these are the n rotation
+    // starts in cyclic order.  Allocate exactly n slots.
+    let mut last = Vec::with_capacity(n);
+    let mut origin = 0usize;
+    let mut row = 0usize;
+    for &p in &sa {
+        let p = p as usize;
+        if p < n {
+            // BWT row: cyclic char preceding rotation start `p` is input[(p + n - 1) % n].
+            let last_byte_index = if p == 0 { n - 1 } else { p - 1 };
+            last.push(input[last_byte_index]);
+            if p == 0 {
+                origin = row;
+            }
+            row += 1;
+        }
+    }
+    debug_assert_eq!(last.len(), n);
+    (last, origin)
+}
+
+fn bwt_via_prefix_doubling(input: &[u8]) -> (Vec<u8>, usize) {
+    let n = input.len();
     let order = manber_myers_rotations(input);
 
-    // Last column: for each row in sorted order, take input[(start + n - 1) % n].
     let mut last = Vec::with_capacity(n);
     let mut origin = 0usize;
     for (row, &start) in order.iter().enumerate() {
-        let last_byte_index = (start as usize + n - 1) % n;
+        let last_byte_index = if start == 0 { n - 1 } else { start as usize - 1 };
         last.push(input[last_byte_index]);
         if start == 0 {
             origin = row;
@@ -290,32 +414,68 @@ fn forward_bwt(input: &[u8]) -> (Vec<u8>, usize) {
     (last, origin)
 }
 
-/// Manber-Myers prefix doubling on rotations of `input`.  Returns a vector
-/// `order[i] = the starting index (0..n) of the i-th rotation in sorted
-/// lexicographic order`.
+/// Prefix doubling on rotations of `input`, but with a 2-pass LSD radix sort
+/// per doubling step instead of a comparator-based sort.  This brings the
+/// per-pass complexity from O(n log n) to O(n), so the total is O(n log n)
+/// instead of O(n log² n).
 ///
-/// Implementation note: rotations are compared in modular space, so the
-/// "second key" at offset `k` wraps around using `(pos + k) % n`.
+/// Returns `order[i] = the starting index (0..n) of the i-th rotation in
+/// sorted lexicographic order`.  Cyclic comparisons are handled by treating
+/// the "second key" at offset `k` as `rank[(pos + k) % n]`.
 fn manber_myers_rotations(input: &[u8]) -> Vec<u32> {
     let n = input.len();
     let mut order: Vec<u32> = (0..n as u32).collect();
     let mut rank: Vec<u32> = input.iter().map(|&b| b as u32).collect();
     let mut new_rank = vec![0u32; n];
 
+    let key_range = n.max(256) + 1;
+    let mut counts: Vec<u32> = vec![0u32; key_range + 1];
+    let mut tmp_order: Vec<u32> = vec![0u32; n];
+
+    #[inline(always)]
+    fn wrap(a: usize, k: usize, n: usize) -> usize {
+        let p = a + k;
+        if p >= n { p - n } else { p }
+    }
+
     let mut k = 1usize;
     loop {
-        // Sort `order` by (rank[a], rank[(a+k) % n]) — fall back to a stable
-        // tie-breaker by index so equal pairs end up in a deterministic order.
-        order.sort_unstable_by(|&a, &b| {
-            let ra = rank[a as usize];
-            let rb = rank[b as usize];
-            if ra != rb {
-                return ra.cmp(&rb);
-            }
-            let na = (a as usize + k) % n;
-            let nb = (b as usize + k) % n;
-            rank[na].cmp(&rank[nb])
-        });
+        // ---- LSD radix sort by (primary = rank[a], secondary = rank[(a+k)%n]) ----
+        // Pass 1: stable sort `order → tmp_order` by the SECONDARY key.
+        for c in counts.iter_mut() {
+            *c = 0;
+        }
+        for &a in &order {
+            let s = rank[wrap(a as usize, k, n)] as usize;
+            counts[s + 1] += 1;
+        }
+        for i in 1..counts.len() {
+            counts[i] += counts[i - 1];
+        }
+        for &a in &order {
+            let s = rank[wrap(a as usize, k, n)] as usize;
+            let slot = counts[s] as usize;
+            tmp_order[slot] = a;
+            counts[s] += 1;
+        }
+
+        // Pass 2: stable sort `tmp_order → order` by the PRIMARY key.
+        for c in counts.iter_mut() {
+            *c = 0;
+        }
+        for &a in &tmp_order {
+            let p = rank[a as usize] as usize;
+            counts[p + 1] += 1;
+        }
+        for i in 1..counts.len() {
+            counts[i] += counts[i - 1];
+        }
+        for &a in &tmp_order {
+            let p = rank[a as usize] as usize;
+            let slot = counts[p] as usize;
+            order[slot] = a;
+            counts[p] += 1;
+        }
 
         // Reassign ranks based on the new order.
         new_rank[order[0] as usize] = 0;
@@ -323,12 +483,11 @@ fn manber_myers_rotations(input: &[u8]) -> Vec<u32> {
             let prev = order[i - 1] as usize;
             let cur = order[i] as usize;
             let same = rank[prev] == rank[cur]
-                && rank[(prev + k) % n] == rank[(cur + k) % n];
+                && rank[wrap(prev, k, n)] == rank[wrap(cur, k, n)];
             new_rank[cur] = new_rank[prev] + if same { 0 } else { 1 };
         }
 
-        // If all ranks are unique we're done — every rotation has been
-        // distinguished from every other.
+        // If all ranks are unique we're done.
         if new_rank[order[n - 1] as usize] as usize == n - 1 {
             return order;
         }
@@ -340,20 +499,271 @@ fn manber_myers_rotations(input: &[u8]) -> Vec<u32> {
     }
 }
 
-#[allow(dead_code)]
-fn compare_rotations(data: &[u8], a: usize, b: usize) -> Ordering {
-    // Kept for reference / debugging.
-    let n = data.len();
-    for k in 0..n {
-        let pa = (a + k) % n;
-        let pb = (b + k) % n;
-        match data[pa].cmp(&data[pb]) {
-            Ordering::Equal => continue,
-            other => return other,
+// =========================================================================
+// SA-IS (Suffix Array Induced Sort) — Nong, Zhang, Chan (2009)
+// =========================================================================
+//
+// `sais` computes the suffix array of `text` over an alphabet of size `k`.
+// `text` MUST end with a unique smallest character (the sentinel).  The
+// alphabet symbol values must lie in `0..k`.  Returns a vector `sa` of
+// length `text.len()` where `sa[i]` is the starting index of the i-th
+// smallest suffix.
+//
+// The algorithm:
+//   1. Classify positions as L-type or S-type.
+//   2. Identify LMS positions (S-type whose left neighbour is L-type).
+//   3. Place LMS positions at the END of their character buckets.
+//   4. Induced-sort L-types left-to-right (places L positions at the START
+//      of buckets in order they're discovered).
+//   5. Induced-sort S-types right-to-left (END of buckets).
+//   6. Name LMS substrings; if all unique, the LMS sort is exact.  Otherwise
+//      recurse on the reduced sequence to get the LMS sort, then redo steps
+//      3–5.
+//
+// Reference: "Linear Suffix Array Construction by Almost Pure Induced-Sorting"
+// by G. Nong, S. Zhang, W.H. Chan (2009).
+fn sais(text: &[u32], k: usize) -> Vec<u32> {
+    let n = text.len();
+    let mut sa = vec![0u32; n];
+    sais_impl(text, &mut sa, k);
+    sa
+}
+
+/// Sentinel value used to mark "empty slot" in the SA during induced sort.
+const SAIS_EMPTY: u32 = u32::MAX;
+
+fn sais_impl(t: &[u32], sa: &mut [u32], k: usize) {
+    let n = t.len();
+    debug_assert!(n >= 2, "SA-IS requires at least 2 elements (incl. sentinel)");
+
+    // ---- 1. Classify L/S types ----
+    // type[i] = true (S) means t[i..] < t[i+1..]; false (L) means t[i..] > t[i+1..].
+    // The sentinel at position n-1 is S by convention.
+    let mut t_type = vec![false; n];
+    t_type[n - 1] = true;
+    for i in (0..n - 1).rev() {
+        t_type[i] = if t[i] < t[i + 1] {
+            true
+        } else if t[i] > t[i + 1] {
+            false
+        } else {
+            t_type[i + 1]
+        };
+    }
+
+    // ---- 2. Bucket sizes (count of each character in t) ----
+    let mut bucket = vec![0u32; k];
+    for &c in t {
+        bucket[c as usize] += 1;
+    }
+
+    // ---- 3. Place LMS positions at the END of their buckets ----
+    for s in sa.iter_mut() {
+        *s = SAIS_EMPTY;
+    }
+    let mut bucket_end = sais_bucket_ends(&bucket);
+    for i in 1..n {
+        if t_type[i] && !t_type[i - 1] {
+            let c = t[i] as usize;
+            bucket_end[c] -= 1;
+            sa[bucket_end[c] as usize] = i as u32;
         }
     }
-    Ordering::Equal
+
+    // ---- 4. Induced sort L-types ----
+    induced_sort_l(t, sa, &t_type, &bucket);
+
+    // ---- 5. Induced sort S-types ----
+    induced_sort_s(t, sa, &t_type, &bucket);
+
+    // ---- 6. Name LMS substrings ----
+    // Collect LMS positions in SA order, then assign each substring a name
+    // based on whether it equals the previous one.
+    let mut name_count: u32 = 0;
+    let mut prev_lms: Option<usize> = None;
+    // Reuse the second half of `sa` to store names temporarily.  After this
+    // pass, sa[..n1] holds LMS-position-in-text-order entries replaced with
+    // their names; we then compact.
+    let mut name_buf = vec![SAIS_EMPTY; n];
+    for i in 0..n {
+        let pos = sa[i];
+        if pos == SAIS_EMPTY {
+            continue;
+        }
+        let pos = pos as usize;
+        // pos is LMS iff pos > 0 && t_type[pos] && !t_type[pos-1].
+        if pos == 0 || !t_type[pos] || t_type[pos - 1] {
+            continue;
+        }
+        let is_new = match prev_lms {
+            None => true,
+            Some(prev) => !lms_substr_equal(t, &t_type, prev, pos),
+        };
+        if is_new {
+            name_count += 1;
+        }
+        name_buf[pos] = name_count - 1;
+        prev_lms = Some(pos);
+    }
+    // Compact names into sa[..n1] in text order.
+    let mut n1 = 0usize;
+    for i in 0..n {
+        if name_buf[i] != SAIS_EMPTY {
+            sa[n1] = name_buf[i];
+            n1 += 1;
+        }
+    }
+    drop(name_buf);
+
+    // ---- 7. Recurse if needed ----
+    if (name_count as usize) < n1 {
+        // Some LMS substrings collided.  Recurse to sort them properly.
+        // Allocate sub_sa as a fresh buffer; we can't easily reuse sa because
+        // we need both the names and the result simultaneously.
+        let mut sub_t = vec![0u32; n1];
+        sub_t.copy_from_slice(&sa[..n1]);
+        let mut sub_sa = vec![0u32; n1];
+        sais_impl(&sub_t, &mut sub_sa, name_count as usize);
+
+        // Map sub_sa indices back to original LMS positions.
+        // We need an "LMS positions in text order" list.
+        let mut lms_positions: Vec<u32> = Vec::with_capacity(n1);
+        for i in 1..n {
+            if t_type[i] && !t_type[i - 1] {
+                lms_positions.push(i as u32);
+            }
+        }
+        // sa[..n1] now becomes the LMS positions in sorted-by-suffix order.
+        for i in 0..n1 {
+            sa[i] = lms_positions[sub_sa[i] as usize];
+        }
+    } else {
+        // All LMS substrings are distinct → the names already give the sort
+        // order directly.  We need sa[..n1] = LMS positions in sorted order.
+        // Currently sa[..n1] = names in text order, but since each name maps
+        // 1:1 to a position, we can invert.
+        let mut lms_positions: Vec<u32> = Vec::with_capacity(n1);
+        for i in 1..n {
+            if t_type[i] && !t_type[i - 1] {
+                lms_positions.push(i as u32);
+            }
+        }
+        // sa[i] is the name (= sort rank) of lms_positions[i].
+        let mut tmp = vec![0u32; n1];
+        for i in 0..n1 {
+            tmp[sa[i] as usize] = lms_positions[i];
+        }
+        sa[..n1].copy_from_slice(&tmp);
+    }
+
+    // ---- 8. Final placement: clear sa[n1..], place sorted LMS positions
+    //         at the ENDS of their buckets, then re-induce L and S. ----
+    for i in n1..n {
+        sa[i] = SAIS_EMPTY;
+    }
+    let mut bucket_end = sais_bucket_ends(&bucket);
+    // Walk sorted LMS positions in REVERSE order so that placing at bucket
+    // ends preserves their order within each bucket.
+    for i in (0..n1).rev() {
+        let pos = sa[i] as usize;
+        sa[i] = SAIS_EMPTY; // clear before re-placing
+        let c = t[pos] as usize;
+        bucket_end[c] -= 1;
+        sa[bucket_end[c] as usize] = pos as u32;
+    }
+
+    induced_sort_l(t, sa, &t_type, &bucket);
+    induced_sort_s(t, sa, &t_type, &bucket);
 }
+
+#[inline]
+fn sais_bucket_ends(bucket: &[u32]) -> Vec<u32> {
+    let k = bucket.len();
+    let mut ends = vec![0u32; k];
+    let mut sum = 0u32;
+    for c in 0..k {
+        sum += bucket[c];
+        ends[c] = sum;
+    }
+    ends
+}
+
+#[inline]
+fn sais_bucket_starts(bucket: &[u32]) -> Vec<u32> {
+    let k = bucket.len();
+    let mut starts = vec![0u32; k];
+    let mut sum = 0u32;
+    for c in 0..k {
+        starts[c] = sum;
+        sum += bucket[c];
+    }
+    starts
+}
+
+fn induced_sort_l(t: &[u32], sa: &mut [u32], t_type: &[bool], bucket: &[u32]) {
+    let n = t.len();
+    let mut bucket_start = sais_bucket_starts(bucket);
+    for i in 0..n {
+        let p = sa[i];
+        if p == SAIS_EMPTY || p == 0 {
+            continue;
+        }
+        let j = (p - 1) as usize;
+        if !t_type[j] {
+            let c = t[j] as usize;
+            sa[bucket_start[c] as usize] = j as u32;
+            bucket_start[c] += 1;
+        }
+    }
+}
+
+fn induced_sort_s(t: &[u32], sa: &mut [u32], t_type: &[bool], bucket: &[u32]) {
+    let n = t.len();
+    let mut bucket_end = sais_bucket_ends(bucket);
+    for i in (0..n).rev() {
+        let p = sa[i];
+        if p == SAIS_EMPTY || p == 0 {
+            continue;
+        }
+        let j = (p - 1) as usize;
+        if t_type[j] {
+            let c = t[j] as usize;
+            bucket_end[c] -= 1;
+            sa[bucket_end[c] as usize] = j as u32;
+        }
+    }
+}
+
+/// Two LMS substrings are equal iff they have the same length AND the same
+/// characters AND the same L/S type pattern at every position.
+fn lms_substr_equal(t: &[u32], t_type: &[bool], a: usize, b: usize) -> bool {
+    let n = t.len();
+    let mut i = 0usize;
+    loop {
+        let pa = a + i;
+        let pb = b + i;
+        if pa >= n || pb >= n {
+            return false;
+        }
+        if t[pa] != t[pb] || t_type[pa] != t_type[pb] {
+            return false;
+        }
+        // After step 0, check if either position is itself LMS — that marks
+        // the END of the substring.
+        if i > 0 {
+            let a_lms = t_type[pa] && !t_type[pa - 1];
+            let b_lms = t_type[pb] && !t_type[pb - 1];
+            if a_lms && b_lms {
+                return true;
+            }
+            if a_lms != b_lms {
+                return false;
+            }
+        }
+        i += 1;
+    }
+}
+
 
 // =========================================================================
 // Multi-table Huffman
@@ -373,17 +783,41 @@ fn build_huffman_tables(symbols: &[u16], alpha_size: usize) -> (Vec<HufTable>, V
     let num_groups = (symbols.len() + HUFFMAN_GROUP_SIZE - 1) / HUFFMAN_GROUP_SIZE;
     debug_assert!(num_groups > 0);
 
-    // bzip2 spec dictates table-count selection by total symbol count, but
-    // we keep it simple and always use 2 (the minimum).  This is suboptimal
-    // for large blocks; tracked in project_zstd_ratio_gap-style follow-up.
-    let num_tables = 2usize;
+    // Number of Huffman tables — bzip2 selects 2..=6 based on the symbol
+    // count.  More tables → tighter fit per group (smaller bitstream) at
+    // the cost of more selector overhead.  These thresholds match the
+    // reference encoder.
+    let num_tables: usize = if symbols.len() < 200 {
+        2
+    } else if symbols.len() < 600 {
+        3
+    } else if symbols.len() < 1200 {
+        4
+    } else if symbols.len() < 2400 {
+        5
+    } else {
+        6
+    };
 
-    // Initial tables: split groups into halves and count symbols in each.
+    // Initial tables: partition groups into roughly equal "slices" of the
+    // symbol stream so each table gets a contiguous range to start.  This
+    // matches the bzip2 reference's "split work into nTables stripes"
+    // initial assignment.
     let mut counts: Vec<Vec<u32>> = vec![vec![0u32; alpha_size]; num_tables];
-    for (g, chunk) in symbols.chunks(HUFFMAN_GROUP_SIZE).enumerate() {
-        let t = if g * 2 < num_groups { 0 } else { 1 };
-        for &s in chunk {
-            counts[t][s as usize] += 1;
+    {
+        let mut remaining = symbols.len();
+        let mut consumed = 0usize;
+        for t in 0..num_tables {
+            let target = remaining / (num_tables - t);
+            let mut tot = 0usize;
+            let mut sym_idx = consumed;
+            while sym_idx < symbols.len() && tot < target {
+                tot += 1;
+                counts[t][symbols[sym_idx] as usize] += 1;
+                sym_idx += 1;
+            }
+            consumed = sym_idx;
+            remaining -= tot;
         }
     }
 
@@ -393,12 +827,25 @@ fn build_huffman_tables(symbols: &[u16], alpha_size: usize) -> (Vec<HufTable>, V
         .map(|c| build_huffman_from_counts(c, alpha_size))
         .collect();
 
-    // Selector list: assign each group to the cheaper table.
-    let selectors = assign_selectors(symbols, &tables);
+    // Save the initial counts so empty-table iterations can fall back to
+    // a non-zero distribution.
+    let initial_counts = counts;
 
-    // One refinement pass: recount per table from the chosen selectors,
-    // rebuild, re-assign.
-    for _ in 0..3 {
+    // Up to 4 refinement passes (matching the bzip2 reference's
+    // BZ_N_ITERS).  Each pass: assign each group to the cheapest table,
+    // rebuild that table from the symbols actually assigned to it.  Stop
+    // early if the assignment hasn't changed.
+    let mut selectors: Vec<u8> = Vec::with_capacity(num_groups);
+    for _iter in 0..4 {
+        // Reassign every group to the cheaper table.
+        let new_selectors = assign_selectors(symbols, &tables);
+        let stable = new_selectors == selectors;
+        selectors = new_selectors;
+        if stable && _iter > 0 {
+            break;
+        }
+
+        // Recount per table from the new selectors.
         let mut new_counts: Vec<Vec<u32>> = vec![vec![0u32; alpha_size]; num_tables];
         for (g, chunk) in symbols.chunks(HUFFMAN_GROUP_SIZE).enumerate() {
             let t = selectors[g] as usize;
@@ -406,37 +853,63 @@ fn build_huffman_tables(symbols: &[u16], alpha_size: usize) -> (Vec<HufTable>, V
                 new_counts[t][s as usize] += 1;
             }
         }
-        // For tables that received zero symbols, fall back to the original
+        // For tables that received zero symbols, fall back to the initial
         // counts so we don't end up with an all-zero table.
         for (t, c) in new_counts.iter_mut().enumerate() {
             if c.iter().all(|&x| x == 0) {
-                *c = counts[t].clone();
+                *c = initial_counts[t].clone();
             }
         }
         tables = new_counts
             .iter()
             .map(|c| build_huffman_from_counts(c, alpha_size))
             .collect();
-        let _ = assign_selectors(symbols, &tables);
     }
-    let selectors = assign_selectors(symbols, &tables);
+    // Final selector pass with the latest tables.
+    selectors = assign_selectors(symbols, &tables);
 
     debug_assert!(selectors.len() <= MAX_SELECTORS);
     (tables, selectors)
 }
 
 fn assign_selectors(symbols: &[u16], tables: &[HufTable]) -> Vec<u8> {
-    let mut sels = Vec::with_capacity((symbols.len() + HUFFMAN_GROUP_SIZE - 1) / HUFFMAN_GROUP_SIZE);
+    let num_groups = (symbols.len() + HUFFMAN_GROUP_SIZE - 1) / HUFFMAN_GROUP_SIZE;
+    let mut sels = Vec::with_capacity(num_groups);
+    let nt = tables.len();
+    let alpha_size = tables[0].code_lens.len();
+
+    // Transpose code lengths so all tables' lengths for a given symbol are
+    // contiguous in memory.  Layout: `lens_t[sym * MAX_HUFFMAN_TABLES + t]`.
+    // Padded slot for missing tables (t >= nt) is unused; we only sum the
+    // first `nt` slots in the inner loop.
+    let mut lens_t: Vec<u32> = vec![0u32; alpha_size * MAX_HUFFMAN_TABLES];
+    for (t, table) in tables.iter().enumerate() {
+        for (s, &l) in table.code_lens.iter().enumerate() {
+            lens_t[s * MAX_HUFFMAN_TABLES + t] = l as u32;
+        }
+    }
+
     for chunk in symbols.chunks(HUFFMAN_GROUP_SIZE) {
+        let mut costs = [0u32; MAX_HUFFMAN_TABLES];
+        // Inner loop reads `MAX_HUFFMAN_TABLES = 6` u32s per symbol, sum into
+        // costs.  LLVM auto-vectorises this into a small SIMD add.
+        for &s in chunk {
+            let base = (s as usize) * MAX_HUFFMAN_TABLES;
+            // Unrolled by MAX_HUFFMAN_TABLES so the compiler can lift this
+            // into a single SIMD load + add.
+            costs[0] += lens_t[base];
+            costs[1] += lens_t[base + 1];
+            costs[2] += lens_t[base + 2];
+            costs[3] += lens_t[base + 3];
+            costs[4] += lens_t[base + 4];
+            costs[5] += lens_t[base + 5];
+        }
+        // Pick the cheapest active table.
         let mut best_t = 0u8;
-        let mut best_cost = u64::MAX;
-        for (t, table) in tables.iter().enumerate() {
-            let cost: u64 = chunk
-                .iter()
-                .map(|&s| table.code_lens[s as usize] as u64)
-                .sum();
-            if cost < best_cost {
-                best_cost = cost;
+        let mut best_cost = costs[0];
+        for t in 1..nt {
+            if costs[t] < best_cost {
+                best_cost = costs[t];
                 best_t = t as u8;
             }
         }

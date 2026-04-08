@@ -77,6 +77,47 @@ impl<'a> BitReader<'a> {
         Ok(self.read_bits(1)? != 0)
     }
 
+    /// Refill the container so it has at least `n` bits queued.  Reads up to
+    /// 7 bytes from the underlying slice if needed; if the slice is exhausted
+    /// before we hit `n` bits, returns UnexpectedEof.
+    #[inline]
+    pub fn refill(&mut self, n: u32) -> io::Result<()> {
+        debug_assert!(n <= 56);
+        while self.bits_in_container < n {
+            if self.pos >= self.data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "bzip2: ran out of bits",
+                ));
+            }
+            self.container = (self.container << 8) | self.data[self.pos] as u64;
+            self.pos += 1;
+            self.bits_in_container += 8;
+        }
+        Ok(())
+    }
+
+    /// Peek the top `n` bits of the container WITHOUT consuming them.  Caller
+    /// must have already called `refill(n)` (or another method that ensured
+    /// the container has at least `n` bits).
+    #[inline]
+    pub fn peek(&self, n: u32) -> u32 {
+        debug_assert!(self.bits_in_container >= n);
+        let shift = self.bits_in_container - n;
+        let mask: u64 = (1u64 << n) - 1;
+        ((self.container >> shift) & mask) as u32
+    }
+
+    /// Drop the top `n` bits of the container.  Caller is responsible for
+    /// ensuring `bits_in_container >= n` before calling.
+    #[inline]
+    pub fn consume(&mut self, n: u32) {
+        debug_assert!(self.bits_in_container >= n);
+        let shift = self.bits_in_container - n;
+        self.container &= (1u64 << shift).wrapping_sub(1);
+        self.bits_in_container -= n;
+    }
+
     /// Skip remaining bits in the current byte and return how many were
     /// skipped (0..=7).  Used after reading bit-aligned data to land back
     /// on a byte boundary.
@@ -127,17 +168,26 @@ impl BitWriter {
     pub fn write_bits(&mut self, value: u64, n: u32) {
         debug_assert!(n <= 56);
         debug_assert!(n == 64 || value >> n == 0, "extra bits set above n");
-        // Append at the LOW end of the container (MSB-first means the
-        // newest bits are toward the bottom until we drain them).
+        // Append at the LOW end of the container.
         self.container = (self.container << n) | value;
         self.bits_in_container += n;
-        // Drain whole bytes from the TOP.
+        // Drain a full 4-byte chunk if we have ≥32 bits queued.  This is
+        // both fewer drain operations than the per-byte loop AND a single
+        // 4-byte append to the output Vec instead of four `push` calls.
+        // For typical Huffman fields (≤17 bits) one drain per call is
+        // enough; longer fields fall through to the byte loop.
+        if self.bits_in_container >= 32 {
+            self.bits_in_container -= 32;
+            let chunk = ((self.container >> self.bits_in_container) as u32).to_be_bytes();
+            self.output.extend_from_slice(&chunk);
+            self.container &= (1u64 << self.bits_in_container).wrapping_sub(1);
+        }
+        // Drain any remaining whole bytes (used for the rare wide field).
         while self.bits_in_container >= 8 {
             self.bits_in_container -= 8;
             let byte = (self.container >> self.bits_in_container) as u8;
             self.output.push(byte);
         }
-        // Mask off the bits we just emitted.
         if self.bits_in_container == 0 {
             self.container = 0;
         } else {

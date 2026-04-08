@@ -61,6 +61,17 @@ impl Crc32 {
         self.state = (self.state << 8) ^ tbl[idx];
     }
 
+    /// Borrow the (current) raw CRC state plus a static table reference, so
+    /// callers in tight loops can update the CRC without re-fetching the
+    /// `OnceLock` for every byte.
+    pub fn snapshot(&self) -> (u32, &'static [u32; 256]) {
+        (self.state, table())
+    }
+
+    pub fn restore(&mut self, state: u32) {
+        self.state = state;
+    }
+
     pub fn finalize(self) -> u32 {
         self.state ^ 0xFFFFFFFF
     }
