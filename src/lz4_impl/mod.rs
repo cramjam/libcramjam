@@ -5,6 +5,49 @@ pub mod frame;
 
 use std::io::{self, Read, Write};
 
+/// Streaming Write-adapter for the C-API.  Buffers all input then encodes
+/// once on `finish`.  Mirrors `Bzip2StreamCompressor` and
+/// `ZstdStreamCompressor` so the C-API plumbing in `capi.rs` can swap C
+/// lz4's `Encoder` for ours without restructuring.
+pub struct Lz4StreamCompressor {
+    input: Vec<u8>,
+    output: Vec<u8>,
+    level: u32,
+}
+
+impl Lz4StreamCompressor {
+    pub fn new(output: Vec<u8>, level: u32) -> Self {
+        Self {
+            input: Vec::new(),
+            output,
+            level,
+        }
+    }
+
+    pub fn get_ref(&self) -> &Vec<u8> {
+        &self.output
+    }
+
+    pub fn finish(self) -> io::Result<Vec<u8>> {
+        let mut output = self.output;
+        let frame = frame::encode_frame(&self.input);
+        output.extend_from_slice(&frame);
+        let _ = self.level; // level reserved for a future tunable encoder
+        Ok(output)
+    }
+}
+
+impl Write for Lz4StreamCompressor {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.input.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Compress an input stream as an LZ4 frame and write it to `output`.
 pub fn compress<W: Write + ?Sized, R: Read>(
     mut input: R,

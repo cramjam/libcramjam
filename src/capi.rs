@@ -128,9 +128,9 @@ pub enum StreamingCodec {
 #[cfg(feature = "snappy")]
 type SnappyFrameCompressor = snappy::snap::write::FrameEncoder<Vec<u8>>;
 #[cfg(feature = "bzip2")]
-type Bzip2Compressor = bzip2::bzip2::write::BzEncoder<Vec<u8>>;
+type Bzip2Compressor = crate::bzip2_impl::Bzip2StreamCompressor;
 #[cfg(feature = "lz4")]
-type Lz4Compressor = crate::lz4::lz4::Encoder<Vec<u8>>;
+type Lz4Compressor = crate::lz4_impl::Lz4StreamCompressor;
 #[cfg(feature = "gzip")]
 type GzipCompressor = crate::deflate_impl::GzipStreamCompressor;
 #[cfg(feature = "brotli")]
@@ -431,10 +431,8 @@ pub extern "C" fn compressor_init(
                 error_to_ptr("Bzip2 requires compression level >= 0", error);
                 return std::ptr::null_mut();
             }
-            let compressor = bzip2::bzip2::write::BzEncoder::new(
-                vec![],
-                bzip2::bzip2::Compression::new(level as _),
-            );
+            let compressor =
+                crate::bzip2_impl::Bzip2StreamCompressor::new(vec![], level as u32);
             Box::into_raw(Box::new(compressor)) as _
         }
         #[cfg(feature = "brotli")]
@@ -474,7 +472,8 @@ pub extern "C" fn compressor_init(
                 error_to_ptr("Lz4 requires compression level >= 0", error);
                 return std::ptr::null_mut();
             }
-            let compressor = lz4::make_write_compressor(vec![], Some(level as _));
+            let compressor =
+                crate::lz4_impl::Lz4StreamCompressor::new(vec![], level as u32);
             Box::into_raw(Box::new(compressor)) as _
         }
     }
@@ -560,7 +559,7 @@ pub extern "C" fn compressor_inner(
         #[cfg(feature = "lz4")]
         StreamingCodec::StreamingLz4 => {
             let compressor = unsafe { Box::from_raw(*compressor_ptr as *mut Lz4Compressor) };
-            let buffer = Buffer::from(compressor.writer());
+            let buffer = Buffer::from(compressor.get_ref());
             *compressor_ptr = Box::into_raw(compressor) as _;
             buffer
         }
@@ -632,9 +631,8 @@ pub extern "C" fn compressor_finish(
         #[cfg(feature = "lz4")]
         StreamingCodec::StreamingLz4 => {
             let compressor = unsafe { Box::from_raw(*compressor_ptr as *mut Lz4Compressor) };
-            let (w, ret) = compressor.finish();
-            match ret {
-                Ok(_) => Buffer::from(w),
+            match compressor.finish() {
+                Ok(w) => Buffer::from(w),
                 Err(err) => {
                     error_to_ptr(err, error);
                     Buffer::empty()

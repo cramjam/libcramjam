@@ -12,7 +12,7 @@ default           = ["snappy", "lz4", "bzip2", "brotli", "xz", "zstd", "gzip", "
 capi              = ["dep:libc"]
 snappy            = ["dep:snap"]
 lz4               = []
-bzip2             = ["dep:bzip2"]
+bzip2             = []
 brotli            = ["dep:brotli"]
 zstd              = []
 
@@ -59,7 +59,6 @@ wasm32-compat     = ["blosc2-rs/deactivate-zlib-optim"]
 libc           = { version = "0.2", optional = true }
 snap           = { version = "^1", optional = true }
 brotli         = { version = "^8", default-features = false, features = ["std", "ffi-api"], optional = true }
-bzip2          = { version = ">=0.4,<0.6", optional = true }
 crc32fast       = "^1"
 simd-adler32    = "^0.3"
 # flate2 and libdeflate-sys removed: gzip/deflate/zlib are now pure Rust
@@ -85,6 +84,7 @@ subdirectory = "cramjam"
 flate2 = "^1"
 zstd = "^0.13"
 lz4 = "^1"
+bzip2 = ">=0.4,<0.6"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
@@ -97,6 +97,10 @@ harness = false
 
 [[bench]]
 name = "lz4_bench"
+harness = false
+
+[[bench]]
+name = "bzip2_bench"
 harness = false
 
 [profile.release]

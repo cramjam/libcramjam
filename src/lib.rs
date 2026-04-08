@@ -33,6 +33,10 @@ pub(crate) mod zstd_impl;
 #[cfg(feature = "lz4")]
 pub(crate) mod lz4_impl;
 
+// Pure-Rust bzip2 implementation (no C dependencies).
+#[cfg(feature = "bzip2")]
+pub mod bzip2_impl;
+
 #[cfg(any(
     feature = "deflate",
     feature = "deflate-static",
