@@ -266,6 +266,274 @@ fn highest_bit(v: u32) -> u32 {
     31 - v.leading_zeros()
 }
 
+// =========================================================================
+// Huffman ENCODER
+// =========================================================================
+
+/// Per-symbol Huffman encoder table.
+/// `codes[sym] = (code_value, num_bits)`.  num_bits == 0 means the symbol
+/// does not appear and must not be encoded.
+pub struct HufEncoder {
+    pub codes: [(u32, u8); 256],
+    /// Highest non-zero index in `codes` (max symbol value present).
+    pub max_symbol: usize,
+    /// Largest num_bits across all present symbols.
+    pub max_num_bits: u8,
+}
+
+impl HufEncoder {
+    /// Build a Huffman encoder table from raw literal data.
+    pub fn from_data(data: &[u8]) -> Option<Self> {
+        if data.is_empty() {
+            return None;
+        }
+        let mut counts = [0u32; 256];
+        let mut max_sym = 0usize;
+        for &b in data {
+            counts[b as usize] += 1;
+            if b as usize > max_sym {
+                max_sym = b as usize;
+            }
+        }
+        Self::from_counts(&counts[..=max_sym])
+    }
+
+    /// Build from explicit symbol frequencies.  Returns `None` if there's
+    /// only one distinct symbol (a Huffman tree needs at least two).
+    pub fn from_counts(counts: &[u32]) -> Option<Self> {
+        let nonzero = counts.iter().filter(|&&c| c > 0).count();
+        if nonzero < 2 {
+            return None;
+        }
+
+        // Distribute weights using ruzstd's "trivial" scheme: assign weights
+        // by rank (smallest count gets smallest weight) and limit to 11 bits.
+        let mut weights = distribute_weights(nonzero);
+        const HUF_TABLELOG_MAX: usize = 11;
+        // Length-limit so that the resulting Huffman codes never exceed
+        // HUF_TABLELOG_MAX bits.  `redistribute_weights` is a no-op when the
+        // distribution already fits.
+        let length_limit = HUF_TABLELOG_MAX.min(highest_bit(nonzero as u32) as usize + 1).max(2);
+        redistribute_weights(&mut weights, length_limit);
+
+        // Sort the symbols by count ASCENDING — lowest frequency takes the
+        // longest code (smallest weight).  Stable secondary sort by symbol
+        // index makes the encode deterministic.
+        let mut indexed: Vec<(usize, u32)> =
+            counts.iter().copied().enumerate().filter(|(_, c)| *c > 0).collect();
+        indexed.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+
+        // Lay out symbol weights according to the sorted order.
+        let mut sym_weight = [0u8; 256];
+        for ((sym, _), w) in indexed.iter().zip(weights.iter()) {
+            sym_weight[*sym] = *w as u8;
+        }
+
+        Self::from_symbol_weights(&sym_weight, counts.len() - 1)
+    }
+
+    /// Build the encoder table from per-symbol weights.
+    /// `max_symbol` is the largest symbol index that appears.
+    fn from_symbol_weights(sym_weight: &[u8; 256], max_symbol: usize) -> Option<Self> {
+        // Compute max_num_bits from weight sum.
+        let mut weight_sum: u32 = 0;
+        for &w in &sym_weight[..=max_symbol] {
+            if w > 0 {
+                weight_sum += 1u32 << (w as u32 - 1);
+            }
+        }
+        if weight_sum == 0 || !weight_sum.is_power_of_two() {
+            return None;
+        }
+        let max_num_bits = highest_bit(weight_sum) as u8;
+        if max_num_bits as usize > 11 {
+            return None;
+        }
+
+        // Sort present symbols by (num_bits desc, symbol asc) — equivalently,
+        // (weight asc, symbol asc).  Lowest weight = longest code.
+        let mut sorted: Vec<(u8, u8)> = (0..=max_symbol)
+            .filter_map(|sym| {
+                let w = sym_weight[sym];
+                if w > 0 {
+                    Some((sym as u8, w))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        sorted.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+
+        // Assign canonical codes following the zstd convention: longest codes
+        // get the lowest numerical values.  We walk symbols in (weight asc,
+        // symbol asc) order and assign sequential codes within each weight
+        // group, shifting the running counter when the weight changes.
+        let mut codes = [(0u32, 0u8); 256];
+        let mut current_code: u32 = 0;
+        let mut current_weight: u8 = 0;
+        let mut current_num_bits: u8 = 0;
+        for &(sym, w) in &sorted {
+            if w != current_weight {
+                current_code >>= w - current_weight;
+                current_num_bits = max_num_bits + 1 - w;
+                current_weight = w;
+            }
+            codes[sym as usize] = (current_code, current_num_bits);
+            current_code += 1;
+        }
+
+        Some(Self {
+            codes,
+            max_symbol,
+            max_num_bits,
+        })
+    }
+
+    /// Get weights vector (one per symbol up to and including `max_symbol`)
+    /// for serialization in the literals header.
+    pub fn weights(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.max_symbol + 1);
+        for sym in 0..=self.max_symbol {
+            let (_, nb) = self.codes[sym];
+            if nb == 0 {
+                out.push(0);
+            } else {
+                out.push(self.max_num_bits + 1 - nb);
+            }
+        }
+        out
+    }
+
+    /// Encode `data` into `bw` using this table.  Symbols are written in
+    /// REVERSE order so that the backward bitstream reader (decoder) recovers
+    /// them in forward order.
+    pub fn encode_stream(
+        &self,
+        bw: &mut super::bits::ForwardBitWriter,
+        data: &[u8],
+    ) {
+        for &sym in data.iter().rev() {
+            let (code, nb) = self.codes[sym as usize];
+            debug_assert!(nb > 0, "Huffman: symbol {} has zero code length", sym);
+            bw.write_bits(code as u64, nb as u32);
+        }
+    }
+}
+
+/// Distribute weights for `count` distinct symbols such that the sum of
+/// `2^(weight - 1)` is a clean power of two.  Mirrors ruzstd's
+/// `distribute_weights`.
+fn distribute_weights(count: usize) -> Vec<u8> {
+    debug_assert!(count >= 2);
+    debug_assert!(count <= 256);
+    let mut weights: Vec<u8> = Vec::with_capacity(count);
+    weights.push(1);
+    weights.push(1);
+
+    let mut target_weight: u8 = 1;
+    let mut weight_counter: u8 = 2;
+
+    while weights.len() < count {
+        let mut add_new: usize = 1 << (weight_counter - target_weight);
+        let available = count - weights.len();
+        if add_new > available {
+            target_weight = weight_counter;
+            add_new = 1;
+        }
+        for _ in 0..add_new {
+            weights.push(target_weight);
+        }
+        weight_counter += 1;
+    }
+    weights
+}
+
+
+/// Reduce weight variance until the encoded sum fits in `max_num_bits`.
+/// Mirrors ruzstd's `redistribute_weights`.
+fn redistribute_weights(weights: &mut [u8], max_num_bits: usize) {
+    let weight_sum_log = weights
+        .iter()
+        .copied()
+        .map(|x| 1u32 << x)
+        .sum::<u32>()
+        .ilog2() as usize;
+
+    if weight_sum_log < max_num_bits {
+        return;
+    }
+
+    let decrease_by = weight_sum_log - max_num_bits + 1;
+
+    let mut added: u32 = 0;
+    for w in weights.iter_mut() {
+        if (*w as usize) < decrease_by {
+            for add in (*w as usize)..decrease_by {
+                added += 1u32 << add;
+            }
+            *w = decrease_by as u8;
+        }
+    }
+
+    while added > 0 {
+        let mut current_idx = 0usize;
+        let mut current_weight: u8 = 0;
+        for (idx, &w) in weights.iter().enumerate() {
+            if (1u32 << (w - 1)) > added {
+                break;
+            }
+            if w > current_weight {
+                current_weight = w;
+                current_idx = idx;
+            }
+        }
+        if current_weight == 0 {
+            break;
+        }
+        added -= 1u32 << (current_weight - 1);
+        weights[current_idx] -= 1;
+    }
+
+    if weights[0] > 1 {
+        let off = weights[0] - 1;
+        for w in weights.iter_mut() {
+            *w -= off;
+        }
+    }
+}
+
+#[cfg(test)]
+mod encoder_tests {
+    use super::*;
+
+    #[test]
+    fn huffman_encode_decode_roundtrip() {
+        // Build encoder from data, encode to bitstream, decode and verify.
+        let data: Vec<u8> = b"the quick brown fox jumps over the lazy dog".to_vec();
+        let enc = HufEncoder::from_data(&data).expect("must build");
+        let weights = enc.weights();
+        // The encoder weights drop the implicit-last symbol when serialized
+        // (decoder infers it).  Decoder takes the FULL weight vector minus the
+        // last entry.
+        let weights_for_decoder: Vec<u8> = weights[..weights.len() - 1].to_vec();
+        let dec = HufTable::from_weights(&weights_for_decoder).expect("decode table");
+
+        // Encode the data into a backward bitstream.
+        let mut bw = super::super::bits::ForwardBitWriter::new();
+        enc.encode_stream(&mut bw, &data);
+        let bytes = bw.finalize();
+
+        // Decode and check.
+        let mut br = super::super::bits::ReverseBitReader::new(&bytes).unwrap();
+        br.skip_padding_bits().unwrap();
+        let mut decoded: Vec<u8> = Vec::with_capacity(data.len());
+        while decoded.len() < data.len() {
+            decoded.push(dec.decode_symbol(&mut br));
+        }
+        assert_eq!(decoded, data);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

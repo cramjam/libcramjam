@@ -242,6 +242,19 @@ impl ForwardBitWriter {
         }
         self.output
     }
+
+    /// Pad with zeros to the next byte boundary and return the buffer.
+    /// Used for FSE table descriptions, which are packed forward streams
+    /// without the end-of-stream sentinel.
+    pub fn finalize_no_sentinel(mut self) -> Vec<u8> {
+        let leftover = self.bits_in_partial;
+        if leftover > 0 {
+            let bytes = ((leftover + 7) / 8) as usize;
+            let buf = self.partial.to_le_bytes();
+            self.output.extend_from_slice(&buf[..bytes]);
+        }
+        self.output
+    }
 }
 
 impl Default for ForwardBitWriter {
