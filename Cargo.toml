@@ -11,7 +11,7 @@ readme      = "README.md"
 default           = ["snappy", "lz4", "bzip2", "brotli", "xz", "zstd", "gzip", "deflate", "zlib"]
 capi              = ["dep:libc"]
 snappy            = ["dep:snap"]
-lz4               = ["dep:lz4"]
+lz4               = []
 bzip2             = ["dep:bzip2"]
 brotli            = ["dep:brotli"]
 zstd              = []
@@ -60,7 +60,6 @@ libc           = { version = "0.2", optional = true }
 snap           = { version = "^1", optional = true }
 brotli         = { version = "^8", default-features = false, features = ["std", "ffi-api"], optional = true }
 bzip2          = { version = ">=0.4,<0.6", optional = true }
-lz4            = { version = "^1", optional = true }
 crc32fast       = "^1"
 simd-adler32    = "^0.3"
 # flate2 and libdeflate-sys removed: gzip/deflate/zlib are now pure Rust
@@ -85,6 +84,7 @@ subdirectory = "cramjam"
 [dev-dependencies]
 flate2 = "^1"
 zstd = "^0.13"
+lz4 = "^1"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]

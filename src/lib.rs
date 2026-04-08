@@ -29,6 +29,10 @@ pub(crate) mod deflate_impl;
 #[cfg(feature = "zstd")]
 pub(crate) mod zstd_impl;
 
+// Pure-Rust LZ4 implementation (no C dependencies).
+#[cfg(feature = "lz4")]
+pub(crate) mod lz4_impl;
+
 #[cfg(any(
     feature = "deflate",
     feature = "deflate-static",
