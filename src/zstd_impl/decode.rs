@@ -19,7 +19,6 @@ struct FrameHeader {
     content_size: Option<u64>,
     dict_id: Option<u32>,
     content_checksum: bool,
-    single_segment: bool,
 }
 
 fn parse_frame_header(r: &mut ForwardByteReader) -> io::Result<FrameHeader> {
@@ -95,7 +94,6 @@ fn parse_frame_header(r: &mut ForwardByteReader) -> io::Result<FrameHeader> {
         content_size,
         dict_id,
         content_checksum,
-        single_segment,
     })
 }
 
@@ -260,11 +258,12 @@ fn decode_compressed_block(
     // Decode sequences from backward bitstream.
     let bitstream = &seq_data[sr.position()..];
     let mut bits = ReverseBitReader::new(bitstream)?;
+    bits.skip_padding_bits()?;
 
     // Initialize FSE states (order per RFC 8878 Section 3.1.2.1.2.4).
-    let mut ll_state = bits.read_bits(ll_t.accuracy_log);
-    let mut of_state = bits.read_bits(of_t.accuracy_log);
-    let mut ml_state = bits.read_bits(ml_t.accuracy_log);
+    let mut ll_state = bits.get_bits(ll_t.accuracy_log);
+    let mut of_state = bits.get_bits(of_t.accuracy_log);
+    let mut ml_state = bits.get_bits(ml_t.accuracy_log);
     #[cfg(test)]
     if num_sequences <= 10 {
         eprintln!("[init] ll_state={ll_state} of_state={of_state} ml_state={ml_state} ll_acc={} of_acc={} ml_acc={}",
@@ -273,8 +272,6 @@ fn decode_compressed_block(
 
     let mut lit_pos = 0usize;
     for i in 0..num_sequences {
-        bits.reload();
-
         // 1. Peek symbols from current FSE states.
         let of_code = of_t.symbol(of_state) as u32;
         let ml_code = ml_t.symbol(ml_state);
@@ -282,7 +279,7 @@ fn decode_compressed_block(
 
         // 2. Read extra bits in order: Offset, MatchLength, LitLength (RFC 8878 3.1.2.1.2.4).
         let offset_value = if of_code > 0 {
-            (1u32 << of_code) + bits.read_bits(of_code)
+            (1u32 << of_code) + bits.get_bits(of_code)
         } else {
             1
         };
@@ -400,9 +397,13 @@ fn decode_literals_section(
 }
 
 fn decode_lit_size_raw(byte0: u8, size_format: u8, r: &mut ForwardByteReader) -> io::Result<usize> {
+    // Per RFC 8878 §3.1.1.3.1.1 — size_format encoding for Raw/RLE literals:
+    //   00 or 10 → 1-byte header, 5-bit regen size
+    //   01       → 2-byte header, 12-bit regen size
+    //   11       → 3-byte header, 20-bit regen size
     match size_format {
-        0 | 1 => Ok((byte0 >> 3) as usize),
-        2 => {
+        0 | 2 => Ok((byte0 >> 3) as usize),
+        1 => {
             let b1 = r.read_u8()?;
             Ok(((byte0 as usize >> 4) | ((b1 as usize) << 4)) & 0xFFF)
         }
@@ -420,7 +421,6 @@ fn decode_lit_size_compressed(
     size_format: u8,
     r: &mut ForwardByteReader,
 ) -> io::Result<(usize, usize, bool)> {
-    let four_streams = size_format != 0;
     match size_format {
         0 => {
             // Single stream: 10-bit regen, 10-bit compressed.
@@ -488,28 +488,29 @@ fn decode_fse_table_mode(
     max_accuracy_log: u32,
     predefined: fn() -> FseTable,
 ) -> io::Result<()> {
+    // Per RFC 8878 §3.1.1.3.2.1.1 — Symbol_Compression_Mode:
+    //   00 → Predefined
+    //   01 → RLE
+    //   10 → FSE_Compressed
+    //   11 → Repeat (reuse previous table from same frame)
     match mode {
         0 => {
-            // Predefined.
             *table = Some(predefined());
         }
         1 => {
-            // RLE.
             let sym = r.read_u8()?;
             *table = Some(fse::fse_rle_table(sym));
         }
         2 => {
-            // Repeat previous table. (Table must already exist.)
+            *table = Some(FseTable::decode_table(r, max_symbol, max_accuracy_log)?);
+        }
+        3 => {
             if table.is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "zstd: repeat mode without prior FSE table",
                 ));
             }
-        }
-        3 => {
-            // FSE-compressed table.
-            *table = Some(FseTable::decode_table(r, max_symbol, max_accuracy_log)?);
         }
         _ => unreachable!(),
     }
@@ -582,7 +583,7 @@ fn decode_lit_length(code: u8, bits: &mut ReverseBitReader) -> io::Result<usize>
         return Err(io::Error::new(io::ErrorKind::InvalidData, "zstd: invalid literals length code"));
     }
     let (baseline, extra_bits) = fse::LITLEN_TABLE[code as usize];
-    let extra = bits.read_bits(extra_bits as u32);
+    let extra = bits.get_bits(extra_bits as u32);
     Ok((baseline + extra) as usize)
 }
 
@@ -591,7 +592,7 @@ fn decode_match_length(code: u8, bits: &mut ReverseBitReader) -> io::Result<usiz
         return Err(io::Error::new(io::ErrorKind::InvalidData, "zstd: invalid match length code"));
     }
     let (baseline, extra_bits) = fse::MATCHLEN_TABLE[code as usize];
-    let extra = bits.read_bits(extra_bits as u32);
+    let extra = bits.get_bits(extra_bits as u32);
     Ok((baseline + extra) as usize)
 }
 

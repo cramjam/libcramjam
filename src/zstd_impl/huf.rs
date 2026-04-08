@@ -29,62 +29,90 @@ pub struct HufTable {
 impl HufTable {
     /// Build from weights (as decoded from the header).
     /// Weight 0 means symbol not present. Weight w means code length = max_bits + 1 - w.
+    /// The implicit last weight (for symbol == weights.len()) is inferred from the
+    /// constraint that the sum of (1 << (w-1)) over all weights equals 2^max_bits.
     pub fn from_weights(weights: &[u8]) -> io::Result<Self> {
-        if weights.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "zstd: empty Huffman weights"));
+        if weights.is_empty() || weights.len() > 255 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "zstd: invalid Huffman weight count"));
+        }
+        for &w in weights {
+            if w as u32 > HUF_MAX_TABLE_LOG {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "zstd: Huffman weight exceeds limit"));
+            }
         }
 
-        // Determine max number of bits.
-        let max_weight = *weights.iter().max().unwrap() as u32;
-        if max_weight == 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "zstd: all Huffman weights are zero"));
-        }
-
-        // Sum of (1 << (max_weight - w)) for all symbols with w > 0 must be a power of 2.
+        // Sum of (1 << (w - 1)) for all explicitly-given symbols with w > 0.
         let weight_sum: u32 = weights
             .iter()
             .filter(|&&w| w > 0)
             .map(|&w| 1u32 << (w as u32 - 1))
             .sum();
+        if weight_sum == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "zstd: all Huffman weights are zero"));
+        }
 
-        // max_bits = highest_bit(weight_sum) + 1, but weight_sum should be 2^(max_bits-1).
+        // max_bits is the smallest integer such that 2^max_bits > weight_sum.
+        // i.e. max_bits = highest_bit_set(weight_sum), where highest_bit_set is 1-indexed.
         let max_bits = highest_bit(weight_sum) + 1;
         if max_bits > HUF_MAX_TABLE_LOG {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "zstd: Huffman table log too large"));
         }
 
-        // Compute code lengths: num_bits[sym] = max_bits + 1 - weight[sym] (for weight > 0).
+        // Compute the implicit last weight from the leftover.
+        let leftover = (1u32 << max_bits) - weight_sum;
+        if !leftover.is_power_of_two() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "zstd: Huffman leftover is not a power of two"));
+        }
+        let last_weight = highest_bit(leftover) + 1; // 1-indexed log2 of leftover
+
+        // Per-symbol code length (num_bits).  Symbols with weight 0 are unused.
+        let total_symbols = weights.len() + 1;
+        let mut num_bits_per_symbol = vec![0u8; total_symbols];
+        for (sym, &w) in weights.iter().enumerate() {
+            if w > 0 {
+                num_bits_per_symbol[sym] = max_bits as u8 + 1 - w;
+            }
+        }
+        num_bits_per_symbol[weights.len()] = max_bits as u8 + 1 - last_weight as u8;
+
         let table_size = 1usize << max_bits;
         let mut table = vec![HufEntry::default(); table_size];
 
-        // Assign codes using canonical Huffman ordering.
-        // Sort symbols by weight (descending = shorter codes first).
-        let mut symbols: Vec<(u8, u8)> = weights
-            .iter()
-            .enumerate()
-            .filter(|(_, &w)| w > 0)
-            .map(|(sym, &w)| (sym as u8, max_bits as u8 + 1 - w))
-            .collect();
-        symbols.sort_by_key(|&(_, bits)| bits);
+        // Zstd canonical ordering (RFC 8878): longest codes occupy the LOW
+        // end of the table, shortest codes occupy the HIGH end.  Within a
+        // single code length, symbols are placed in ascending symbol order.
+        //
+        // Compute the starting table index for each code length using bit-rank
+        // counts (matches the C reference and ruzstd).
+        let mut bit_rank = vec![0u32; max_bits as usize + 1];
+        for &b in &num_bits_per_symbol {
+            if b > 0 {
+                bit_rank[b as usize] += 1;
+            }
+        }
+        let mut rank_start = vec![0usize; max_bits as usize + 1];
+        // rank_start[max_bits] = 0 (longest codes first); going to shorter codes
+        // we add the slots used by the previous (longer) ranks.
+        for bits in (1..=max_bits as usize).rev() {
+            let prev = if bits == max_bits as usize {
+                0
+            } else {
+                rank_start[bits + 1] + bit_rank[bits + 1] as usize * (1 << (max_bits as usize - (bits + 1)))
+            };
+            rank_start[bits] = prev;
+        }
 
-        // Fill table with replicated entries (same approach as DEFLATE Huffman).
-        let mut code = 0u32;
-        let mut prev_bits = 0u8;
-        for &(sym, bits) in &symbols {
-            if bits != prev_bits {
-                code <<= bits - prev_bits;
-                prev_bits = bits;
+        let mut rank_pos = rank_start.clone();
+        for (sym, &b) in num_bits_per_symbol.iter().enumerate() {
+            if b == 0 {
+                continue;
             }
-            let fill = 1usize << (max_bits as u8 - bits);
-            for j in 0..fill {
-                let idx = ((code as usize) << (max_bits as u8 - bits)) | j;
-                // Reverse bits for the index (zstd Huffman reads MSB-first).
-                // Actually, zstd Huffman codes are stored MSB-first and the table is
-                // indexed by the raw bits as read from the MSB of the bitstream.
-                // So the index IS the code in MSB order, padded with suffix bits.
-                table[idx] = HufEntry { symbol: sym, num_bits: bits };
+            let len = 1usize << (max_bits as u8 - b);
+            let base = rank_pos[b as usize];
+            for j in 0..len {
+                table[base + j] = HufEntry { symbol: sym as u8, num_bits: b };
             }
-            code += 1;
+            rank_pos[b as usize] += len;
         }
 
         Ok(Self { table, max_bits })
@@ -129,6 +157,7 @@ impl HufTable {
     /// Decode a single symbol from a backward bitstream.
     #[inline(always)]
     pub fn decode_symbol(&self, bits: &mut ReverseBitReader) -> u8 {
+        bits.ensure_bits(self.max_bits);
         let idx = bits.peek_bits(self.max_bits);
         let entry = self.table[idx as usize];
         bits.consume(entry.num_bits as u32);
@@ -136,24 +165,45 @@ impl HufTable {
     }
 }
 
-/// Decode Huffman weights using an FSE-compressed bitstream.
+/// Decode Huffman weights using a 2-state FSE-compressed backward bitstream
+/// (RFC 8878 Section 4.2.1.1).  Two interleaved decoder states share one
+/// distribution table; symbols are emitted alternately until the bitstream
+/// is exhausted.
 fn decode_weights_fse(data: &[u8]) -> io::Result<Vec<u8>> {
     let mut reader = super::bits::ForwardByteReader::new(data);
-    let fse_table = fse::FseTable::decode_table(&mut reader, 255, 7)?;
+    let fse_table = fse::FseTable::decode_table(&mut reader, 255, 6)?;
     let remaining = &data[reader.position()..];
 
     let mut bits = ReverseBitReader::new(remaining)?;
-    let mut state = bits.read_bits(fse_table.accuracy_log);
+    bits.skip_padding_bits()?;
 
-    let mut weights = Vec::new();
+    let mut state1 = bits.get_bits(fse_table.accuracy_log);
+    let mut state2 = bits.get_bits(fse_table.accuracy_log);
+
+    let mut weights = Vec::with_capacity(64);
+    // Loop: emit, then update.  When `update` would overrun, the OTHER state
+    // still holds one final unread symbol.
     loop {
-        let sym = fse_table.symbol(state);
-        weights.push(sym);
-        if bits.is_done() {
+        weights.push(fse_table.symbol(state1));
+        state1 = fse_table.next_state(state1, &mut bits);
+        if bits.bits_remaining() < 0 {
+            weights.push(fse_table.symbol(state2));
             break;
         }
-        state = fse_table.next_state(state, &mut bits);
-        bits.reload();
+
+        weights.push(fse_table.symbol(state2));
+        state2 = fse_table.next_state(state2, &mut bits);
+        if bits.bits_remaining() < 0 {
+            weights.push(fse_table.symbol(state1));
+            break;
+        }
+
+        if weights.len() > 255 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "zstd: too many Huffman weights",
+            ));
+        }
     }
     Ok(weights)
 }
@@ -161,9 +211,9 @@ fn decode_weights_fse(data: &[u8]) -> io::Result<Vec<u8>> {
 /// Decode Huffman-compressed literals using 1 stream.
 pub fn decode_literals_1stream(table: &HufTable, data: &[u8], regen_size: usize) -> io::Result<Vec<u8>> {
     let mut bits = ReverseBitReader::new(data)?;
+    bits.skip_padding_bits()?;
     let mut output = Vec::with_capacity(regen_size);
     while output.len() < regen_size {
-        bits.reload();
         output.push(table.decode_symbol(&mut bits));
     }
     Ok(output)
@@ -214,4 +264,42 @@ pub fn decode_literals_4stream(table: &HufTable, data: &[u8], regen_size: usize)
 fn highest_bit(v: u32) -> u32 {
     debug_assert!(v > 0);
     31 - v.leading_zeros()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_huffman_decode_text100() {
+        // FSE-compressed Huffman weights from text_100 level1 zstd stream.
+        let fse_weight_data = [
+            0x80, 0xa9, 0x6d, 0xc0, 0x7f, 0xaf, 0x2c, 0xb6, 0x50, 0xf9, 0x71, 0xad,
+            0x61, 0x52, 0x22, 0x8d, 0xc2, 0x04, 0x3e, 0x83, 0x0b, 0x33, 0xa5, 0x01,
+        ];
+        // Huffman bitstream (56 bytes) for decoding 99 literal bytes.
+        let huf_stream = [
+            0x77, 0x6e, 0x93, 0xce, 0xf4, 0xd4, 0x15, 0xe2, 0x5c, 0xfb, 0xb5, 0x6b,
+            0x42, 0x33, 0x60, 0x8f, 0x88, 0xf7, 0xd4, 0x89, 0x07, 0x8b, 0xd1, 0x52,
+            0x75, 0x46, 0x4f, 0x14, 0x38, 0x60, 0xb0, 0x98, 0xd1, 0x20, 0xc7, 0x3f,
+            0xd6, 0xf9, 0x04, 0x5a, 0x15, 0x5a, 0x06, 0x2f, 0xb0, 0xe0, 0xa4, 0xc0,
+            0x24, 0xf8, 0x60, 0xb7, 0x10, 0xfe, 0x31, 0x08,
+        ];
+
+        // Step 1: Decode weights from FSE data.
+        let weights = decode_weights_fse(&fse_weight_data).unwrap();
+        eprintln!("Decoded {} weights: {:?}", weights.len(), &weights);
+
+        // Step 2: Build Huffman table.
+        let table = HufTable::from_weights(&weights).unwrap();
+        eprintln!("Huffman table: max_bits={}, table_size={}", table.max_bits, table.table.len());
+
+        // Step 3: Decode literals.
+        let literals = decode_literals_1stream(&table, &huf_stream, 99).unwrap();
+        eprintln!("Decoded {} literals, first 20: {:?}", literals.len(), &literals[..20.min(literals.len())]);
+        eprintln!("As string: {:?}", std::str::from_utf8(&literals[..20.min(literals.len())]));
+
+        let expected = b"The quick brown fox jumps over the lazy dog. Lorem ipsum dolor sit amet, consectetur adipiscing eli";
+        assert_eq!(literals, expected, "literals mismatch");
+    }
 }

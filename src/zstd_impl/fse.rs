@@ -75,7 +75,6 @@ impl FseTable {
         for i in 0..table_size {
             let sym = table[i].symbol as usize;
             let s = symbol_next[sym];
-            let w = if weights[sym] == -1 { 1i16 } else { weights[sym] };
             let nb = (accuracy_log - highest_bit(s as u32)) as u8;
             table[i].num_bits = nb;
             table[i].baseline = ((s as u32) << nb) as u16 - table_size as u16;
@@ -91,75 +90,101 @@ impl FseTable {
     /// Decode the FSE table description from a compressed bitstream.
     ///
     /// Returns the table and the number of bytes consumed.
+    /// Decode FSE table description following the exact algorithm from
+    /// the zstd reference (FSE_readNCount).
     pub fn decode_table(reader: &mut ForwardByteReader, max_symbol: u32, max_accuracy_log: u32) -> io::Result<Self> {
         let data = &reader.data[reader.pos..];
-        if data.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "zstd: empty FSE table"));
+        if data.len() < 4 {
+            // Need at least 4 bytes for the LE u32 load.
+            if data.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "zstd: empty FSE table"));
+            }
         }
 
-        let mut bit_pos = 0usize;
-
-        let read_bits_fwd = |data: &[u8], bit_pos: &mut usize, n: u32| -> u32 {
-            let byte_idx = *bit_pos / 8;
-            let bit_idx = *bit_pos % 8;
-            if byte_idx + 4 <= data.len() {
-                let val = u32::from_le_bytes(data[byte_idx..byte_idx + 4].try_into().unwrap());
-                let result = (val >> bit_idx) & ((1u32 << n) - 1);
-                *bit_pos += n as usize;
-                result
-            } else {
-                // Slow path for end of data.
-                let mut val = 0u64;
-                for i in byte_idx..data.len().min(byte_idx + 8) {
-                    val |= (data[i] as u64) << ((i - byte_idx) * 8);
-                }
-                let result = ((val >> bit_idx) & ((1u64 << n) - 1)) as u32;
-                *bit_pos += n as usize;
-                result
-            }
+        // Load the first 4 bytes as LE u32 (zero-padded if < 4 bytes).
+        let load_le32 = |data: &[u8], byte_pos: usize| -> u32 {
+            let mut buf = [0u8; 4];
+            let end = data.len().min(byte_pos + 4);
+            let start = byte_pos.min(end);
+            buf[..end - start].copy_from_slice(&data[start..end]);
+            u32::from_le_bytes(buf)
         };
 
-        let accuracy_log = read_bits_fwd(data, &mut bit_pos, 4) + 5;
+        let mut bit_stream = load_le32(data, 0);
+        let accuracy_log = (bit_stream & 0xF) + 5;
         if accuracy_log > max_accuracy_log {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "zstd: FSE accuracy log exceeds maximum",
             ));
         }
+        bit_stream >>= 4;
+        let mut bit_count = 4u32;
+
         let table_size = 1u32 << accuracy_log;
         let mut remaining = table_size as i32 + 1;
-        let mut weights = Vec::new();
+        let mut threshold = table_size as i32;
+        let mut nb_bits = accuracy_log + 1;
+        #[cfg(test)]
+        eprintln!("[fse_init] accuracy_log={accuracy_log} table_size={table_size} remaining={remaining} threshold={threshold} nb_bits={nb_bits}");
+        let mut weights: Vec<i16> = Vec::new();
         let max_sym = max_symbol as usize + 1;
 
         while remaining > 1 && weights.len() < max_sym {
-            let threshold = highest_bit(remaining as u32) + 1;
-            let mut bits = threshold - 1;
-            let lower_mask = (1i32 << bits) - 1;
-            let upper_mask = (1i32 << threshold) - 1;
+            // Adjust threshold/nbBits for current remaining.
+            while remaining < threshold && nb_bits > 1 {
+                nb_bits -= 1;
+                threshold >>= 1;
+            }
 
-            let small = read_bits_fwd(data, &mut bit_pos, bits) as i32;
+            // Maybe reload bitStream.
+            if bit_count >= 16 {
+                let byte_pos = (bit_count >> 3) as usize;
+                bit_stream = load_le32(data, byte_pos);
+                bit_stream >>= bit_count & 7;
+            }
 
-            // Two-range encoding: small values are `bits` bits, larger values are `threshold` bits.
-            let boundary = upper_mask - remaining;
-            let value = if small < boundary {
-                small
+            let max_val = (2 * threshold - 1) - remaining;
+            let low = bit_stream & (threshold - 1) as u32;
+
+            let count;
+            if (low as i32) < max_val {
+                // Short code: only nb_bits-1 bits consumed.
+                count = low as i32;
+                bit_count += nb_bits - 1;
+                bit_stream >>= nb_bits - 1;
             } else {
-                let extra = read_bits_fwd(data, &mut bit_pos, 1) as i32;
-                let big = (small << 1) + extra;
-                if big < upper_mask {
-                    big - boundary
+                // Long code: nb_bits bits consumed.
+                let full = bit_stream & (2 * threshold as u32 - 1);
+                count = if full as i32 >= threshold {
+                    full as i32 - max_val
                 } else {
-                    big - upper_mask
-                }
-            };
+                    full as i32
+                };
+                bit_count += nb_bits;
+                bit_stream >>= nb_bits;
+            }
 
-            let prob = value - 1; // prob can be -1 (for "less than 1")
+            let prob = count - 1; // -1 means "less than 1"
             weights.push(prob as i16);
 
+            #[cfg(test)]
+            eprintln!("[fse] sym={} remaining={remaining} threshold={threshold} nb_bits={nb_bits} max_val={max_val} low={low} count={count} prob={prob}",
+                weights.len()-1);
+
+            remaining -= if prob < 0 { 1 } else { prob as i32 };
+
+            // Handle repeat-zero encoding.
             if prob == 0 {
-                // Repeat zeros.
                 loop {
-                    let repeat = read_bits_fwd(data, &mut bit_pos, 2) as usize;
+                    if bit_count >= 16 {
+                        let byte_pos = (bit_count >> 3) as usize;
+                        bit_stream = load_le32(data, byte_pos);
+                        bit_stream >>= bit_count & 7;
+                    }
+                    let repeat = (bit_stream & 3) as usize;
+                    bit_stream >>= 2;
+                    bit_count += 2;
                     for _ in 0..repeat {
                         weights.push(0);
                     }
@@ -168,8 +193,6 @@ impl FseTable {
                     }
                 }
             }
-
-            remaining -= if prob < 0 { 1 } else { prob as i32 };
         }
 
         // Fill remaining symbols with 0.
@@ -177,7 +200,7 @@ impl FseTable {
             weights.push(0);
         }
 
-        let bytes_consumed = (bit_pos + 7) / 8;
+        let bytes_consumed = ((bit_count + 7) >> 3) as usize;
         reader.pos += bytes_consumed;
 
         Self::from_weights(&weights, accuracy_log)
@@ -193,7 +216,7 @@ impl FseTable {
     #[inline(always)]
     pub fn next_state(&self, state: u32, bits: &mut ReverseBitReader) -> u32 {
         let entry = &self.table[state as usize];
-        let low_bits = bits.read_bits(entry.num_bits as u32);
+        let low_bits = bits.get_bits(entry.num_bits as u32);
         entry.baseline as u32 + low_bits
     }
 }

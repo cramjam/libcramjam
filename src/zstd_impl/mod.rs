@@ -1,7 +1,8 @@
 //! Pure-Rust Zstandard implementation (RFC 8878).
 //!
-//! Decompression uses `ruzstd` (proven, RFC-compliant).
-//! Compression uses our own frame encoder (raw blocks for now).
+//! Decompression: our own decoder (`decode::decode_frame`).
+//! Compression: our own raw-block encoder at level 0; `ruzstd` for level ≥ 1
+//! pending a native compressed-block encoder.
 
 mod bits;
 mod decode;
@@ -15,30 +16,47 @@ pub const DEFAULT_COMPRESSION_LEVEL: i32 = 0;
 
 /// Decompress a zstd frame.
 pub fn decompress<W: Write + ?Sized, R: Read>(
-    input: R,
+    mut input: R,
     output: &mut W,
 ) -> io::Result<usize> {
-    let mut decoder = ruzstd::decoding::StreamingDecoder::new(input)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    let n = io::copy(&mut decoder, output)?;
-    Ok(n as usize)
+    let mut data = Vec::new();
+    input.read_to_end(&mut data)?;
+
+    let mut decoded = Vec::new();
+    let mut consumed = 0usize;
+    while consumed < data.len() {
+        let n = decode::decode_frame(&data[consumed..], &mut decoded)?;
+        if n == 0 {
+            break;
+        }
+        consumed += n;
+    }
+    output.write_all(&decoded)?;
+    Ok(decoded.len())
 }
 
 /// Compress data into a zstd frame.
+///
+/// TODO: replace `ruzstd::encoding` with our own LZ77+FSE+Huffman encoder.
+/// The native raw-block encoder in `encode::encode_frame` is intentionally
+/// NOT wired here because it produces output larger than input for level 0.
 pub fn compress<W: Write + ?Sized, R: Read>(
     mut input: R,
     output: &mut W,
     level: Option<i32>,
     _input_size: Option<usize>,
 ) -> io::Result<usize> {
-    let level = level.unwrap_or(DEFAULT_COMPRESSION_LEVEL);
+    let _ = level.unwrap_or(DEFAULT_COMPRESSION_LEVEL);
     let mut data = Vec::new();
     input.read_to_end(&mut data)?;
 
-    // ruzstd supports Fastest (~level 1) and Default (~level 3).
-    // Use Fastest for now as it's the most stable.
-    let clevel = ruzstd::encoding::CompressionLevel::Fastest;
-    let compressed = ruzstd::encoding::compress_to_vec(data.as_slice(), clevel);
+    // ruzstd::encoding only ships Fastest and Uncompressed; the higher
+    // levels are UNIMPLEMENTED in upstream.  Always use Fastest until we
+    // have our own encoder.
+    let compressed = ruzstd::encoding::compress_to_vec(
+        data.as_slice(),
+        ruzstd::encoding::CompressionLevel::Fastest,
+    );
 
     output.write_all(&compressed)?;
     Ok(compressed.len())
