@@ -449,6 +449,275 @@ fn distribute_weights(count: usize) -> Vec<u8> {
 }
 
 
+// =========================================================================
+// FSE-compressed Huffman weights encoder
+// =========================================================================
+//
+// The literals header for a Huffman-compressed block uses one of two weight
+// formats: direct (4-bit packed weights, fits up to 128 distinct symbols) or
+// FSE-compressed (the weight stream is itself FSE-encoded with 2 interleaved
+// states).  When the literal pool spans more than 128 distinct byte values
+// the FSE-compressed form is the only option.
+//
+// This encoder mirrors the format produced by the C reference / ruzstd:
+//   1. FSE table description (variable-length packed forward bitstream).
+//   2. 2-stream interleaved FSE encoding of the weight values, written
+//      so the matching decoder in `decode_weights_fse` recovers them.
+// The two pieces are concatenated into a single payload whose length must
+// fit in 7 bits (the literals-section header byte stores it).
+
+/// Encode the Huffman weight stream as an FSE-compressed payload.  Returns
+/// `None` on any failure (e.g. degenerate distribution, payload exceeds 127
+/// bytes).  The caller should fall back to direct encoding or raw literals.
+pub fn encode_weights_fse(weights: &[u8]) -> Option<Vec<u8>> {
+    if weights.len() < 2 {
+        return None;
+    }
+    // Histogram weight values 0..=11 (zstd caps Huffman weights at 11).
+    let mut counts = [0u32; 12];
+    let mut max_weight: usize = 0;
+    for &w in weights {
+        if w as usize > 11 {
+            return None;
+        }
+        counts[w as usize] += 1;
+        if w as usize > max_weight {
+            max_weight = w as usize;
+        }
+    }
+    let nonzero = counts.iter().filter(|&&c| c > 0).count();
+    if nonzero < 2 {
+        // FSE needs at least 2 distinct symbols.
+        return None;
+    }
+
+    // Normalize counts to sum to 2^accuracy_log.
+    let accuracy_log: u32 = 6;
+    let table_size = 1u32 << accuracy_log;
+    let norm = normalize_to_acc_log(&counts[..=max_weight], table_size as usize)?;
+
+    // Build decoder + encoder tables from the normalized distribution.
+    let dec = super::fse::FseTable::from_weights(&norm, accuracy_log).ok()?;
+    let enc = super::fse::FseEncoder::from_decoder(&dec, max_weight + 1);
+
+    // Step 1: serialize the FSE table description into a forward bitstream.
+    let mut desc_bw = super::bits::ForwardBitWriter::new();
+    write_fse_table_description(&mut desc_bw, &norm, accuracy_log);
+    let desc_bytes = desc_bw.finalize_no_sentinel();
+
+    // Step 2: encode the weights with 2 interleaved FSE states (the parity
+    // of `n` determines the order in which the final state values are
+    // written so the decoder reads them in the correct slots).
+    let stream = encode_interleaved_2state(&enc, weights, accuracy_log)?;
+
+    let mut out = Vec::with_capacity(desc_bytes.len() + stream.len());
+    out.extend_from_slice(&desc_bytes);
+    out.extend_from_slice(&stream);
+
+    if out.len() >= 128 {
+        // Header byte must be < 128 (literals-section header stores the size).
+        return None;
+    }
+    Some(out)
+}
+
+/// Two-state interleaved FSE encoding of `weights`, returning the finalized
+/// backward bitstream.  Mirrors ruzstd's `encode_interleaved`.
+///
+/// Layout (encoder time, byte stream forward):
+///   * For n >= 4 the loop emits `state_1` and `state_2` transitions in
+///     pairs, walking from index `n-4` down by 2 each iteration.
+///   * Odd n: one extra `state_1` transition for `weights[0]`, then init
+///     writes `state_2` first then `state_1`.
+///   * Even n: init writes `state_1` first then `state_2`.
+fn encode_interleaved_2state(
+    enc: &super::fse::FseEncoder,
+    weights: &[u8],
+    accuracy_log: u32,
+) -> Option<Vec<u8>> {
+    let n = weights.len();
+    if n < 2 {
+        return None;
+    }
+    let mut bw = super::bits::ForwardBitWriter::new();
+
+    if n == 2 {
+        // No transitions — just the initial states.  Decoder reads state1
+        // first, so we want state for w0 to land there.  In the even-parity
+        // convention, encoder writes state_1 (state for w_{n-1}) first then
+        // state_2 (state for w_{n-2}).  Decoder reads in reverse: state_2
+        // (= state for w0) lands in decoder.state1.
+        let s1 = enc.start_state(weights[1]); // state for w_{n-1}
+        let s2 = enc.start_state(weights[0]); // state for w_{n-2}
+        bw.write_bits(s1 as u64, accuracy_log);
+        bw.write_bits(s2 as u64, accuracy_log);
+        return Some(bw.finalize());
+    }
+
+    let mut state_1 = enc.start_state(weights[n - 1]);
+    let mut state_2 = enc.start_state(weights[n - 2]);
+
+    if n == 3 {
+        // Skip the main loop and go straight to the odd-case finishing.
+        state_1 = enc.encode_symbol(state_1, weights[0], &mut bw);
+        // Odd parity: write state_2 first then state_1.
+        bw.write_bits(state_2 as u64, accuracy_log);
+        bw.write_bits(state_1 as u64, accuracy_log);
+        return Some(bw.finalize());
+    }
+
+    // n >= 4: pair-wise loop.  `idx` walks the input from `n-4` down by 2.
+    // Use isize so the `idx >= 0` termination check is straightforward.
+    let mut idx: isize = (n as isize) - 4;
+    loop {
+        // state_1 transitions to weights[idx + 1]
+        let target1 = weights[(idx + 1) as usize];
+        state_1 = enc.encode_symbol(state_1, target1, &mut bw);
+        // state_2 transitions to weights[idx]
+        let target2 = weights[idx as usize];
+        state_2 = enc.encode_symbol(state_2, target2, &mut bw);
+        if idx < 2 {
+            break;
+        }
+        idx -= 2;
+    }
+
+    if idx == 1 {
+        // Odd n: one more state_1 transition for weights[0].
+        state_1 = enc.encode_symbol(state_1, weights[0], &mut bw);
+        bw.write_bits(state_2 as u64, accuracy_log);
+        bw.write_bits(state_1 as u64, accuracy_log);
+    } else {
+        // Even n (idx == 0): no extra transition.  Init order is swapped.
+        bw.write_bits(state_1 as u64, accuracy_log);
+        bw.write_bits(state_2 as u64, accuracy_log);
+    }
+
+    Some(bw.finalize())
+}
+
+/// Write the FSE table description into a forward bitstream — the inverse of
+/// `FseTable::decode_table` from `fse.rs`.
+fn write_fse_table_description(
+    bw: &mut super::bits::ForwardBitWriter,
+    weights: &[i16],
+    accuracy_log: u32,
+) {
+    bw.write_bits((accuracy_log - 5) as u64, 4);
+
+    let table_size = 1u32 << accuracy_log;
+    let mut remaining: i32 = table_size as i32 + 1;
+    let mut threshold: i32 = table_size as i32;
+    let mut nb_bits: u32 = accuracy_log + 1;
+
+    let mut i = 0usize;
+    while remaining > 1 && i < weights.len() {
+        // Adjust threshold/nb_bits when remaining drops below threshold.
+        while remaining < threshold && nb_bits > 1 {
+            nb_bits -= 1;
+            threshold >>= 1;
+        }
+
+        let prob = weights[i];
+        i += 1;
+        let count = (prob + 1) as i32; // 0 means "less than 1"
+        let max_val = (2 * threshold - 1) - remaining;
+
+        if count < max_val {
+            // Short code: nb_bits - 1 bits.
+            bw.write_bits(count as u64, nb_bits - 1);
+        } else {
+            // Long code: nb_bits bits, with optional adjustment.
+            let value = if count >= threshold {
+                count + max_val
+            } else {
+                count
+            };
+            bw.write_bits(value as u64, nb_bits);
+        }
+
+        remaining -= if prob < 0 { 1 } else { prob as i32 };
+
+        // Repeat-zero handling: count consecutive zeros and emit in groups of 3.
+        if prob == 0 {
+            let mut zeros: u32 = 0;
+            while i < weights.len() && weights[i] == 0 {
+                zeros += 1;
+                i += 1;
+            }
+            while zeros >= 3 {
+                bw.write_bits(3, 2);
+                zeros -= 3;
+            }
+            bw.write_bits(zeros as u64, 2);
+        }
+    }
+}
+
+/// Normalize raw frequency counts so they sum to exactly `target_sum`.
+/// Symbols with count > 0 but rounding to 0 get the special `-1` low-prob
+/// marker.  Returns None for degenerate input.
+///
+/// **Important:** Also caps any single probability at `target_sum / 2` so the
+/// resulting FSE table has no nb=0 slots.  Without this cap a state with 0
+/// transition bits lets the decoder iterate freely without consuming bits,
+/// causing the 2-state interleaved Huffman-weight decoder to over-emit.
+fn normalize_to_acc_log(counts: &[u32], target_sum: usize) -> Option<Vec<i16>> {
+    let total: u32 = counts.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let max_per_symbol = (target_sum / 2) as i16;
+    let mut norm: Vec<i16> = vec![0; counts.len()];
+    let mut allocated: i32 = 0;
+    for (i, &c) in counts.iter().enumerate() {
+        if c == 0 {
+            norm[i] = 0;
+            continue;
+        }
+        let scaled = (c as u64 * target_sum as u64 + (total as u64 / 2)) / total as u64;
+        if scaled == 0 {
+            norm[i] = -1;
+            allocated += 1;
+        } else {
+            let capped = (scaled as i16).min(max_per_symbol);
+            norm[i] = capped;
+            allocated += capped as i32;
+        }
+    }
+    let target = target_sum as i32;
+    while allocated < target {
+        // Add to the largest symbol that's still under the cap.
+        let max_idx = norm
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| v > 0 && v < max_per_symbol)
+            .max_by_key(|(_, &v)| v)
+            .map(|(i, _)| i);
+        match max_idx {
+            Some(idx) => {
+                norm[idx] += 1;
+                allocated += 1;
+            }
+            None => {
+                // Everything is at the cap — give up.
+                return None;
+            }
+        }
+    }
+    while allocated > target {
+        let max_idx = norm
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| v > 1)
+            .max_by_key(|(_, &v)| v)
+            .map(|(i, _)| i)?;
+        norm[max_idx] -= 1;
+        allocated -= 1;
+    }
+    Some(norm)
+}
+
 /// Reduce weight variance until the encoded sum fits in `max_num_bits`.
 /// Mirrors ruzstd's `redistribute_weights`.
 fn redistribute_weights(weights: &mut [u8], max_num_bits: usize) {
@@ -505,6 +774,135 @@ fn redistribute_weights(weights: &mut [u8], max_num_bits: usize) {
 #[cfg(test)]
 mod encoder_tests {
     use super::*;
+
+    /// Round-trip a synthetic weights vector through `encode_weights_fse` and
+    /// `decode_weights_fse`.  Covers both odd and even N to exercise the
+    /// parity branch in the encoder.
+    ///
+    /// Asserts that the decoder produces EXACTLY the same number of weights —
+    /// over-/under-decoding silently changes which symbol gets the implicit
+    /// last weight in the resulting Huffman table.
+    fn weights_fse_roundtrip(weights: Vec<u8>) {
+        let bytes = encode_weights_fse(&weights).expect("encode");
+        let decoded = decode_weights_fse(&bytes).expect("decode");
+        assert_eq!(
+            decoded.len(),
+            weights.len(),
+            "decoder produced {} weights, expected {}",
+            decoded.len(),
+            weights.len()
+        );
+        for (i, &w) in weights.iter().enumerate() {
+            assert_eq!(decoded[i], w, "weight {} mismatch (n={})", i, weights.len());
+        }
+    }
+
+    #[test]
+    fn fse_weights_roundtrip_even_n4() {
+        weights_fse_roundtrip(vec![3, 2, 1, 4]);
+    }
+
+    #[test]
+    fn fse_weights_roundtrip_odd_n5() {
+        weights_fse_roundtrip(vec![3, 2, 1, 4, 2]);
+    }
+
+    #[test]
+    fn fse_weights_roundtrip_n3() {
+        weights_fse_roundtrip(vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn fse_weights_roundtrip_two_distinct_values() {
+        // Many entries, exactly 2 distinct values.
+        let mut w = Vec::new();
+        for _ in 0..30 { w.push(1); }
+        for _ in 0..30 { w.push(8); }
+        for _ in 0..40 { w.push(0); }
+        weights_fse_roundtrip(w);
+    }
+
+    #[test]
+    fn fse_weights_roundtrip_synthetic_160_even() {
+        let mut w: Vec<u8> = Vec::new();
+        for _ in 0..30 { w.push(1); }
+        for _ in 0..30 { w.push(2); }
+        for _ in 0..30 { w.push(3); }
+        for _ in 0..40 { w.push(0); }
+        for _ in 0..30 { w.push(4); }
+        assert_eq!(w.len() % 2, 0);
+        weights_fse_roundtrip(w);
+    }
+
+    #[test]
+    fn fse_weights_roundtrip_mostly_zeros() {
+        // Mimics the real source-code distribution: ~226 weights, mostly 0,
+        // a few 1s and 2s scattered throughout.
+        let mut w = vec![0u8; 226];
+        for i in (10..226).step_by(7) { w[i] = 1; }
+        for i in (15..226).step_by(13) { w[i] = 2; }
+        weights_fse_roundtrip(w);
+    }
+
+    #[test]
+    fn fse_weights_roundtrip_mostly_zeros_small_n() {
+        // Same shape as the real source data but at small N to make
+        // regressions easy to localize.
+        for n in [10, 20, 30, 50, 100, 150, 200, 226] {
+            let mut w = vec![0u8; n];
+            for i in (3..n).step_by(7) { w[i] = 1; }
+            for i in (5..n).step_by(11) { w[i] = 2; }
+            weights_fse_roundtrip(w);
+        }
+    }
+
+    #[test]
+    fn fse_weights_roundtrip_synthetic_161_odd() {
+        let mut w: Vec<u8> = Vec::new();
+        for _ in 0..30 { w.push(1); }
+        for _ in 0..30 { w.push(2); }
+        for _ in 0..30 { w.push(3); }
+        for _ in 0..41 { w.push(0); }
+        for _ in 0..30 { w.push(4); }
+        assert_eq!(w.len() % 2, 1);
+        weights_fse_roundtrip(w);
+    }
+
+    /// Targeted test using REAL weights from a Huffman build over real
+    /// source data — exercises the actual weight distribution our encoder
+    /// produces in production.
+    #[test]
+    fn fse_weights_roundtrip_real_source_weights() {
+        let data = std::fs::read("./src/zstd_impl/encode.rs").unwrap();
+        let enc = HufEncoder::from_data(&data).expect("encoder");
+        let weights_full = enc.weights();
+        let weights_to_emit: Vec<u8> = weights_full[..weights_full.len() - 1].to_vec();
+        weights_fse_roundtrip(weights_to_emit);
+    }
+
+    #[test]
+    fn fse_weights_roundtrip_swept_sizes() {
+        // Sweep N from 4 to 250 with a fixed distribution to exercise
+        // both parities at all sizes.
+        for n in 4..=250 {
+            let mut w: Vec<u8> = Vec::with_capacity(n);
+            for i in 0..n {
+                w.push(((i * 7 + 3) % 5 + 1) as u8); // values 1..5 cycling
+            }
+            let bytes = match encode_weights_fse(&w) {
+                Some(b) => b,
+                None => continue, // some sizes may produce a degenerate distribution
+            };
+            let decoded = decode_weights_fse(&bytes).expect("decode");
+            for (i, &expected) in w.iter().enumerate() {
+                assert_eq!(
+                    decoded[i], expected,
+                    "n={} weight[{}] mismatch (decoded {})",
+                    n, i, decoded[i]
+                );
+            }
+        }
+    }
 
     #[test]
     fn huffman_encode_decode_roundtrip() {

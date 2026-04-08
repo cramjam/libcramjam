@@ -710,10 +710,10 @@ fn find_best_match(
 /// would be larger.
 fn write_literals_section(out: &mut Vec<u8>, literals: &[u8]) {
     // Huffman has overhead (~256 bytes for the table) so it's only worth
-    // it for moderately sized literal pools.
+    // it for moderately sized literal pools.  Below ~1 KiB the raw header
+    // wins.
     if literals.len() >= 1024 {
         if let Some(start) = try_write_huffman_literals(out, literals) {
-            // Compare against the raw alternative cost.
             let huff_size = out.len() - start;
             let raw_size = raw_literals_size(literals.len()) + literals.len();
             if huff_size < raw_size {
@@ -781,15 +781,18 @@ fn try_write_huffman_literals(out: &mut Vec<u8>, literals: &[u8]) -> Option<usiz
     // Drop the implicit last weight — the decoder infers it from leftover.
     let weights_to_emit = &weights[..weights.len() - 1];
 
-    // Direct (<=128 weights) is the only weight encoding we use right now.
-    // FSE-compressed weights are still WIP — when the literal pool spans more
-    // than 128 distinct symbols we fall back to raw literals.
-    if weights_to_emit.len() > 128 {
+    // Choose between direct (<=128 weights) and FSE-compressed weight
+    // encoding.  Direct uses the (header_byte = 127 + N) form with packed
+    // 4-bit weights; FSE uses (header_byte = compressed_size < 128).
+    let (huff_desc, huff_desc_len) = if weights_to_emit.len() <= 128 {
+        let n = weights_to_emit.len();
+        (HuffDesc::Direct(n), 1 + (n + 1) / 2)
+    } else if let Some(fse_bytes) = super::huf::encode_weights_fse(weights_to_emit) {
+        let len = 1 + fse_bytes.len();
+        (HuffDesc::FseCompressed(fse_bytes), len)
+    } else {
         return None;
-    }
-    let n = weights_to_emit.len();
-    let huff_desc = HuffDesc::Direct(n);
-    let huff_desc_len = 1 + (n + 1) / 2;
+    };
     let regen = literals.len();
 
     // Decide stream layout: 1-stream is only allowed when regen < 1024 AND the
@@ -818,7 +821,6 @@ fn try_write_huffman_literals(out: &mut Vec<u8>, literals: &[u8]) -> Option<usiz
     // 4-stream layout — split literals into 4 quarters.  Each stream gets
     // its OWN backward bitstream (sentinel + padding).
     if literals.len() < 4 {
-        eprintln!("[huff dbg] short literals");
         return None;
     }
     let split = (literals.len() + 3) / 4;
@@ -840,12 +842,10 @@ fn try_write_huffman_literals(out: &mut Vec<u8>, literals: &[u8]) -> Option<usiz
     let s3 = streams[2].len();
     let s4 = streams[3].len();
     if s1 > u16::MAX as usize || s2 > u16::MAX as usize || s3 > u16::MAX as usize {
-        eprintln!("[huff dbg] stream too large");
         return None;
     }
     // 6 bytes of jump table + the 4 streams.
     let four_stream_total = huff_desc_len + 6 + s1 + s2 + s3 + s4;
-    eprintln!("[huff dbg] regen={} four_total={} s1={} s2={} s3={} s4={}", regen, four_stream_total, s1, s2, s3, s4);
 
     // Pick the smallest size_format that fits.
     let (size_format, header_bytes): (u8, usize) =
@@ -920,16 +920,22 @@ fn try_write_huffman_literals(out: &mut Vec<u8>, literals: &[u8]) -> Option<usiz
     Some(start)
 }
 
-/// Direct (4-bit packed) Huffman tree descriptor.  FSE-compressed weights
-/// are not implemented yet — when the literal pool spans more than 128
-/// distinct symbols the encoder falls back to raw literals.
+/// Huffman tree descriptor: direct (4-bit packed weights, ≤128 entries) or
+/// FSE-compressed (the weight stream is itself FSE-encoded).
 enum HuffDesc {
     Direct(usize),
+    FseCompressed(Vec<u8>),
 }
 
 fn write_huffman_desc(out: &mut Vec<u8>, desc: &HuffDesc, weights_to_emit: &[u8]) {
     match desc {
         HuffDesc::Direct(_) => write_huffman_table_direct(out, weights_to_emit),
+        HuffDesc::FseCompressed(bytes) => {
+            // Header byte = compressed_size (< 128).
+            debug_assert!(bytes.len() < 128);
+            out.push(bytes.len() as u8);
+            out.extend_from_slice(bytes);
+        }
     }
 }
 

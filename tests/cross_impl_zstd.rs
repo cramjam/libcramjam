@@ -109,6 +109,91 @@ fn c_compress_our_decompress() {
 // =========================================================================
 
 #[test]
+fn our_compress_c_decompress_binary_literals() {
+    // Synthesize a corpus with > 128 distinct byte values in the literal pool
+    // — this exercises the FSE-compressed Huffman weights path that direct
+    // (4-bit packed) encoding can't handle.
+    let mut data = Vec::new();
+    for i in 0..200_000u32 {
+        data.push(((i.wrapping_mul(2654435761) >> 8) & 0xFF) as u8);
+    }
+    let compressed = our_zstd_compress(&data, 1);
+    let decompressed = c_zstd_decompress(&compressed);
+    assert_eq!(decompressed, data, "binary corpus c-decode failed");
+}
+
+#[test]
+fn our_compress_our_decompress_binary_literals() {
+    // Same data as above but round-tripped through OUR decoder.  Catches
+    // bugs in our decoder's FSE-compressed Huffman weight reader.
+    let mut data = Vec::new();
+    for i in 0..200_000u32 {
+        data.push(((i.wrapping_mul(2654435761) >> 8) & 0xFF) as u8);
+    }
+    let compressed = our_zstd_compress(&data, 1);
+    let decompressed = our_zstd_decompress(&compressed);
+    assert_eq!(decompressed, data, "binary corpus our-decode failed");
+}
+
+fn read_src_dir() -> Vec<u8> {
+    fn read_dir_files(dir: std::path::PathBuf) -> Vec<u8> {
+        let mut all = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                all.extend(std::fs::read(entry.path()).unwrap());
+            } else if entry.file_type().unwrap().is_dir() {
+                all.extend(read_dir_files(entry.path()));
+            }
+        }
+        all
+    }
+    use std::str::FromStr;
+    let mut bytes = read_dir_files(std::path::PathBuf::from_str("./src").unwrap());
+    while bytes.len() < 5_000_000 {
+        bytes.extend(bytes.clone());
+    }
+    bytes
+}
+
+#[test]
+fn our_roundtrip_src_dir() {
+    let bytes = read_src_dir();
+    let compressed = our_zstd_compress(&bytes, 1);
+    let decompressed = our_zstd_decompress(&compressed);
+    assert_eq!(decompressed.len(), bytes.len(), "size mismatch");
+    assert_eq!(decompressed, bytes, "src corpus our-decode failed");
+}
+
+#[test]
+fn our_compress_c_decompress_src_dir() {
+    // Same data through C decoder — if this passes but our_roundtrip_src_dir
+    // fails, the bug is in OUR decoder not the encoder.
+    let bytes = read_src_dir();
+    let compressed = our_zstd_compress(&bytes, 1);
+    let decompressed = c_zstd_decompress(&compressed);
+    assert_eq!(decompressed.len(), bytes.len(), "size mismatch");
+    assert_eq!(decompressed, bytes, "src corpus c-decode failed");
+}
+
+#[test]
+fn our_compress_c_decompress_single_file() {
+    // Read just one source file to find a smaller failing case.
+    let bytes = std::fs::read("./src/zstd_impl/encode.rs").unwrap();
+    let compressed = our_zstd_compress(&bytes, 1);
+    let decompressed = c_zstd_decompress(&compressed);
+    assert_eq!(decompressed, bytes, "single file c-decode failed");
+}
+
+#[test]
+fn our_compress_our_decompress_single_file() {
+    let bytes = std::fs::read("./src/zstd_impl/encode.rs").unwrap();
+    let compressed = our_zstd_compress(&bytes, 1);
+    let decompressed = our_zstd_decompress(&compressed);
+    assert_eq!(decompressed, bytes, "single file ours-decode failed");
+}
+
+#[test]
 fn our_compress_c_decompress() {
     for (name, data) in [
         ("empty", vec![]),
