@@ -37,6 +37,10 @@ pub(crate) mod lz4_impl;
 #[cfg(feature = "bzip2")]
 pub mod bzip2_impl;
 
+// Pure-Rust XZ / LZMA implementation (no C dependencies).
+#[cfg(any(feature = "xz", feature = "xz-static", feature = "xz-shared"))]
+pub mod xz_impl;
+
 #[cfg(any(
     feature = "deflate",
     feature = "deflate-static",
