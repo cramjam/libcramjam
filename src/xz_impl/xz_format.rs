@@ -347,40 +347,82 @@ fn decode_block(
         None
     };
 
-    // Filter flags.  We only support a single LZMA2 filter for now.
-    if num_filters != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!(
-                "xz: filter chains with {} filters not yet supported",
-                num_filters
-            ),
-        ));
-    }
+    // ----- Filter chain -----
+    //
+    // The chain is at most 4 entries.  By spec the LAST entry is always
+    // LZMA1/LZMA2; preceding entries are "simple" (BCJ) filters or
+    // Delta.  We support BCJ + LZMA2 here; Delta is rejected as
+    // unimplemented.
+    //
+    // For each entry we capture (filter_id, properties); the LZMA2 entry
+    // contributes the dict_size byte, and BCJ entries contribute an
+    // optional 4-byte `start_offset` that liblzma stores when the
+    // properties length is 4 (otherwise the offset defaults to 0).
     let mut h = hp;
-    let filter_id = read_multibyte_int(header, &mut h)?;
-    if filter_id != 0x21 {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!("xz: unsupported filter id 0x{:x} (only LZMA2 = 0x21 is supported)", filter_id),
-        ));
+    let mut bcj_filters: Vec<(u64, u32)> = Vec::new();
+    let mut dict_size: Option<u32> = None;
+
+    for filter_idx in 0..num_filters {
+        let filter_id = read_multibyte_int(header, &mut h)?;
+        let props_size = read_multibyte_int(header, &mut h)? as usize;
+        if h + props_size > header.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "xz: filter properties truncated",
+            ));
+        }
+        let props = &header[h..h + props_size];
+        h += props_size;
+
+        let is_last = filter_idx + 1 == num_filters;
+        if is_last {
+            // The last entry must be LZMA2.
+            if filter_id != 0x21 {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "xz: last filter in chain must be LZMA2 (0x21), got 0x{:x}",
+                        filter_id
+                    ),
+                ));
+            }
+            if props_size != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "xz: LZMA2 properties size must be 1",
+                ));
+            }
+            dict_size = Some(decode_lzma2_dict_size(props[0])?);
+        } else {
+            // Pre-filter: must be a BCJ filter.
+            if !super::bcj::is_bcj(filter_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "xz: pre-filter id 0x{:x} not supported (only BCJ filters are)",
+                        filter_id
+                    ),
+                ));
+            }
+            // BCJ properties are either empty (start_offset = 0) or a
+            // 4-byte little-endian u32 start_offset.
+            let start_offset = match props_size {
+                0 => 0u32,
+                4 => u32::from_le_bytes([props[0], props[1], props[2], props[3]]),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "xz: BCJ filter 0x{:x} has unsupported properties size {}",
+                            filter_id, props_size
+                        ),
+                    ))
+                }
+            };
+            bcj_filters.push((filter_id, start_offset));
+        }
     }
-    let props_size = read_multibyte_int(header, &mut h)? as usize;
-    if props_size != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "xz: LZMA2 properties size must be 1",
-        ));
-    }
-    if h + 1 > header.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "xz: missing LZMA2 dict_size byte",
-        ));
-    }
-    let dict_size_byte = header[h];
-    h += 1;
-    let dict_size = decode_lzma2_dict_size(dict_size_byte)?;
+    let dict_size = dict_size.expect("LZMA2 entry must be the last filter (verified above)");
     hp = h;
 
     // Header padding zeros up to block_header_size - 4.
@@ -423,6 +465,18 @@ fn decode_block(
                     want, produced
                 ),
             ));
+        }
+    }
+
+    // ----- Apply BCJ filters in reverse chain order -----
+    //
+    // The encoder applied filters left-to-right (BCJ first, then LZMA2),
+    // so the decoder undoes them right-to-left: LZMA2 first (above),
+    // then each BCJ filter from the LZMA2-adjacent side outwards.
+    if !bcj_filters.is_empty() {
+        let plain = &mut output[unc_start..];
+        for &(filter_id, start_offset) in bcj_filters.iter().rev() {
+            super::bcj::apply(filter_id, plain, start_offset, false);
         }
     }
 

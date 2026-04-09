@@ -28,6 +28,7 @@
 //! from liblzma's `range_common.h` / `lzma_common.h`.
 
 pub mod alone;
+pub mod bcj;
 pub mod check;
 pub mod options;
 pub mod range_coder;

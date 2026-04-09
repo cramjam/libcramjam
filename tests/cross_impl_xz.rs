@@ -504,3 +504,132 @@ fn ratio_check() {
     let src = read_dir_files(std::path::PathBuf::from("./src"));
     report("src_dir", &src, &[1, 6]);
 }
+
+// =========================================================================
+// BCJ filter cross-impl tests
+//
+// Each test compresses a synthetic "executable-ish" buffer with C xz2 using
+// a custom filter chain (BCJ + LZMA2) and verifies our pure-Rust decoder
+// recovers the bytes.  The buffer mixes random bytes with embedded
+// branch-target patterns so the BCJ encoder actually has something to
+// transform.
+// =========================================================================
+
+fn gen_bcj_corpus(seed: u32, size: usize) -> Vec<u8> {
+    let mut s = seed;
+    let mut out = Vec::with_capacity(size);
+    while out.len() < size {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        // Sprinkle x86-style CALL/JMP opcodes (E8/E9) plus some ARM-BL
+        // (last byte 0xEB), PowerPC branch (top 6 bits = 0x12), SPARC
+        // CALL (top byte 0x40), and a benign IA-64 bundle every so often
+        // — none of which need to encode meaningfully, just to give the
+        // BCJ filters something to chew on.
+        let r = (s >> 16) as u8;
+        match r & 0x07 {
+            0 => {
+                out.extend_from_slice(&[0xE8, 0x12, 0x34, 0x56, 0x00]);
+            }
+            1 => {
+                out.extend_from_slice(&[0xE9, 0x78, 0x9A, 0xBC, 0xFF]);
+            }
+            2 => {
+                // ARM BL (4 bytes ending in 0xEB).
+                out.extend_from_slice(&[0x10, 0x20, 0x30, 0xEB]);
+            }
+            3 => {
+                // PowerPC bl (top byte = 0x48 → 0x12 << 2, low byte LK=1).
+                out.extend_from_slice(&[0x48, 0x00, 0x10, 0x01]);
+            }
+            4 => {
+                // SPARC CALL.
+                out.extend_from_slice(&[0x40, 0x00, 0x00, 0x10]);
+            }
+            5 => {
+                // IA-64 instruction bundle (16 bytes).
+                out.extend_from_slice(&[
+                    0x12, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                ]);
+            }
+            _ => {
+                out.push(r);
+            }
+        }
+    }
+    out.truncate(size);
+    out
+}
+
+fn c_xz_compress_with_filter<F>(data: &[u8], build: F) -> Vec<u8>
+where
+    F: FnOnce(&mut xz2::stream::Filters),
+{
+    use xz2::stream::{Check, Filters, LzmaOptions, Stream};
+    let mut filters = Filters::new();
+    build(&mut filters);
+    // Always end with LZMA2 (the dev-dep API requires it).
+    let opts = LzmaOptions::new_preset(6).unwrap();
+    filters.lzma2(&opts);
+    let stream = Stream::new_stream_encoder(&filters, Check::Crc64).unwrap();
+    let mut enc = xz2::write::XzEncoder::new_stream(Vec::new(), stream);
+    enc.write_all(data).unwrap();
+    enc.finish().unwrap()
+}
+
+fn run_bcj_test(name: &str, build: fn(&mut xz2::stream::Filters)) {
+    for size in [256usize, 4096, 64 * 1024] {
+        let data = gen_bcj_corpus(0xC0DE_F00D, size);
+        let compressed = c_xz_compress_with_filter(&data, build);
+        let decompressed = our_decompress(&compressed);
+        assert_eq!(
+            decompressed, data,
+            "BCJ filter {name} failed at size {size}: produced {} bytes",
+            decompressed.len()
+        );
+    }
+}
+
+#[test]
+fn bcj_x86_cross_impl() {
+    run_bcj_test("x86", |f| {
+        f.x86();
+    });
+}
+
+#[test]
+fn bcj_arm_cross_impl() {
+    run_bcj_test("arm", |f| {
+        f.arm();
+    });
+}
+
+#[test]
+fn bcj_arm_thumb_cross_impl() {
+    run_bcj_test("arm_thumb", |f| {
+        f.arm_thumb();
+    });
+}
+
+#[test]
+fn bcj_powerpc_cross_impl() {
+    run_bcj_test("powerpc", |f| {
+        f.powerpc();
+    });
+}
+
+#[test]
+fn bcj_sparc_cross_impl() {
+    run_bcj_test("sparc", |f| {
+        f.sparc();
+    });
+}
+
+#[test]
+fn bcj_ia64_cross_impl() {
+    run_bcj_test("ia64", |f| {
+        f.ia64();
+    });
+}
