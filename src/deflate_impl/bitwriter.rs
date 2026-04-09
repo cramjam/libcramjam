@@ -8,14 +8,6 @@ pub struct BitWriter {
 }
 
 impl BitWriter {
-    pub fn new() -> Self {
-        Self {
-            buf: Vec::new(),
-            bit_buf: 0,
-            bit_count: 0,
-        }
-    }
-
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             buf: Vec::with_capacity(cap),
@@ -73,16 +65,6 @@ impl BitWriter {
         self.align_to_byte();
         self.buf
     }
-
-    /// Current output byte count (not counting partial byte in bit buffer).
-    pub fn byte_len(&self) -> usize {
-        self.buf.len()
-    }
-
-    /// Total bits written so far (including partial byte in buffer).
-    pub fn bit_len(&self) -> usize {
-        self.buf.len() * 8 + self.bit_count as usize
-    }
 }
 
 #[cfg(test)]
@@ -91,7 +73,7 @@ mod tests {
 
     #[test]
     fn test_write_bits() {
-        let mut w = BitWriter::new();
+        let mut w = BitWriter::with_capacity(8);
         w.write_bits(0b101, 3); // bits 0-2: 1,0,1
         w.write_bits(0b11, 2); // bits 3-4: 1,1
         w.write_bits(0b010, 3); // bits 5-7: 0,1,0
@@ -102,7 +84,7 @@ mod tests {
 
     #[test]
     fn test_write_u16_le() {
-        let mut w = BitWriter::new();
+        let mut w = BitWriter::with_capacity(2);
         w.write_u16_le(0x0201);
         let out = w.finish();
         assert_eq!(out, vec![0x01, 0x02]);

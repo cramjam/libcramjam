@@ -35,13 +35,6 @@ pub fn inflate_into(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
     Ok(reader.bytes_consumed())
 }
 
-/// Convenience wrapper: decompress into a new Vec.
-pub fn inflate(input: &[u8]) -> io::Result<(Vec<u8>, usize)> {
-    let mut output = Vec::with_capacity(input.len().saturating_mul(3));
-    let consumed = inflate_into(input, &mut output)?;
-    Ok((output, consumed))
-}
-
 // ---------------------------------------------------------------------------
 // Block type 0: stored (no compression)
 // ---------------------------------------------------------------------------
@@ -220,7 +213,8 @@ mod tests {
         ];
 
         let expected = b"The quick brown fox jumps over the lazy dog. Lorem ipsum dolor sit amet, consectetur adipiscing elit";
-        let (output, _) = inflate(&compressed).unwrap();
+        let mut output = Vec::new();
+        inflate_into(&compressed, &mut output).unwrap();
         assert_eq!(&output, expected);
     }
 }

@@ -8,8 +8,6 @@ use std::io;
 use super::bits::ReverseBitReader;
 use super::fse;
 
-/// Maximum number of Huffman symbols.
-const HUF_MAX_SYMBOLS: usize = 256;
 /// Maximum Huffman table log (number of bits for table lookup).
 const HUF_MAX_TABLE_LOG: u32 = 12;
 

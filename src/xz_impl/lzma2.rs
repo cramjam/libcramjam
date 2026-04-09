@@ -274,22 +274,6 @@ fn seed_dict_from_output(dict: &mut Dict, output: &[u8]) {
     // push() lands at index `take % cap`.  `total` already encodes this.
 }
 
-/// Bulk-copy a byte slice into a `Dict`'s cyclic buffer, splitting at the
-/// wrap point if necessary.  Replaces the per-byte `dict.push(b)` loop.
-fn extend_dict(dict: &mut Dict, bytes: &[u8]) {
-    let cap = dict.buf.len();
-    let mut start = (dict.total as usize) % cap;
-    let mut remaining = bytes;
-    while !remaining.is_empty() {
-        let space = cap - start;
-        let take = space.min(remaining.len());
-        dict.buf[start..start + take].copy_from_slice(&remaining[..take]);
-        remaining = &remaining[take..];
-        start = (start + take) % cap;
-    }
-    dict.total += bytes.len() as u64;
-}
-
 /// Decode the LZMA properties byte: `(pb * 5 + lp) * 9 + lc`.
 fn decode_props(props: u8) -> io::Result<(u32, u32, u32)> {
     if props >= 9 * 5 * 5 {

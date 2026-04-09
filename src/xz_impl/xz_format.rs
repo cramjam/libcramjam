@@ -93,15 +93,6 @@ fn write_multibyte_int(out: &mut Vec<u8>, mut value: u64) {
     out.push(value as u8);
 }
 
-fn multibyte_int_size(mut value: u64) -> usize {
-    let mut n = 1usize;
-    while value >= 0x80 {
-        value >>= 7;
-        n += 1;
-    }
-    n
-}
-
 // =========================================================================
 // Stream-level decode
 // =========================================================================
@@ -667,7 +658,6 @@ mod tests {
             let mut pos = 0;
             assert_eq!(read_multibyte_int(&buf, &mut pos).unwrap(), v);
             assert_eq!(pos, buf.len());
-            assert_eq!(multibyte_int_size(v), buf.len());
         }
     }
 

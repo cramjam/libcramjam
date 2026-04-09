@@ -3,15 +3,12 @@ use std::io::prelude::*;
 use std::io::Error;
 
 pub const DEFAULT_COMPRESSION_LEVEL: u32 = 6;
-pub const GZIP_FOOTER_SIZE: usize = 8;
-pub const GZIP_MIN_HEADER_SIZE: usize = 10;
-pub const GZIP_MIN_OVERHEAD: usize = GZIP_MIN_HEADER_SIZE + GZIP_FOOTER_SIZE;
 
 pub use crate::deflate_impl::GzipStreamCompressor;
 
 /// Compression upper bound
 pub fn compress_bound(input_len: usize) -> usize {
-    GZIP_MIN_OVERHEAD + crate::deflate::compress_bound(input_len)
+    crate::deflate_impl::gzip_compress_bound(input_len)
 }
 
 /// Decompress gzip data

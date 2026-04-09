@@ -8,9 +8,6 @@ use std::io;
 
 use super::bits::{ForwardBitWriter, ForwardByteReader, ReverseBitReader};
 
-/// Maximum accuracy log for FSE tables.
-pub const FSE_MAX_ACCURACY_LOG: u32 = 9;
-
 /// A single entry in an FSE decoding table.
 #[derive(Clone, Copy, Default)]
 pub struct FseEntry {
@@ -366,11 +363,6 @@ impl FseEncoder {
             slots,
             accuracy_log: acc_log,
         }
-    }
-
-    /// Number of distinct slots for `sym` — equal to the FSE probability.
-    pub fn symbol_count(&self, sym: u8) -> usize {
-        self.slots[sym as usize].len()
     }
 
     /// Initial encoder state for the FIRST symbol to be encoded (which is

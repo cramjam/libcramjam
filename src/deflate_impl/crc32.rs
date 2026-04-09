@@ -11,26 +11,6 @@ pub fn crc32(data: &[u8]) -> u32 {
     h.finalize()
 }
 
-/// Incremental CRC-32 computation.
-pub struct Crc32(crc32fast::Hasher);
-
-impl Crc32 {
-    #[inline]
-    pub fn new() -> Self {
-        Self(crc32fast::Hasher::new())
-    }
-
-    #[inline]
-    pub fn update(&mut self, data: &[u8]) {
-        self.0.update(data);
-    }
-
-    #[inline]
-    pub fn finalize(self) -> u32 {
-        self.0.finalize()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,15 +23,5 @@ mod tests {
     #[test]
     fn test_crc32_known() {
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
-    }
-
-    #[test]
-    fn test_crc32_incremental() {
-        let data = b"Hello, world!";
-        let expected = crc32(data);
-        let mut c = Crc32::new();
-        c.update(&data[..5]);
-        c.update(&data[5..]);
-        assert_eq!(c.finalize(), expected);
     }
 }

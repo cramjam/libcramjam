@@ -66,9 +66,8 @@ const GZIP_HEADER: [u8; 10] = [
     0x00, // XFL
     0xFF, // OS = unknown
 ];
-const GZIP_FOOTER_SIZE: usize = 8;
-const GZIP_MIN_HEADER_SIZE: usize = 10;
-pub const GZIP_MIN_OVERHEAD: usize = GZIP_MIN_HEADER_SIZE + GZIP_FOOTER_SIZE;
+/// Minimum gzip framing overhead: 10-byte header + 8-byte footer.
+pub const GZIP_MIN_OVERHEAD: usize = 10 + 8;
 
 /// Compress gzip.
 pub fn gzip_compress<W: Write + ?Sized, R: Read>(
@@ -216,8 +215,8 @@ pub fn gzip_compress_bound(input_len: usize) -> usize {
 // ---------------------------------------------------------------------------
 
 const ZLIB_HEADER_SIZE: usize = 2;
-const ZLIB_FOOTER_SIZE: usize = 4; // Adler-32
-pub const ZLIB_MIN_OVERHEAD: usize = ZLIB_HEADER_SIZE + ZLIB_FOOTER_SIZE;
+/// Minimum zlib framing overhead: 2-byte header + 4-byte Adler-32 footer.
+pub const ZLIB_MIN_OVERHEAD: usize = ZLIB_HEADER_SIZE + 4;
 
 /// Compute a valid 2-byte zlib header.
 fn zlib_header(level: u32) -> [u8; 2] {

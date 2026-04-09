@@ -2,17 +2,13 @@
 use std::io::prelude::*;
 use std::io::Error;
 
-const DEFAULT_COMPRESSION_LEVEL: u32 = 6;
-
-pub const ZLIB_MIN_HEADER_SIZE: usize = 2;
-pub const ZLIB_FOOTER_SIZE: usize = 4;
-pub const ZLIB_MIN_OVERHEAD: usize = ZLIB_MIN_HEADER_SIZE + ZLIB_FOOTER_SIZE;
+pub const DEFAULT_COMPRESSION_LEVEL: u32 = 6;
 
 pub use crate::deflate_impl::ZlibStreamCompressor;
 
 /// Compression upper bound
 pub fn compress_bound(len: usize) -> usize {
-    ZLIB_MIN_OVERHEAD + crate::deflate::compress_bound(len)
+    crate::deflate_impl::zlib_compress_bound(len)
 }
 
 /// Decompress zlib data

@@ -786,7 +786,7 @@ fn try_write_huffman_literals(out: &mut Vec<u8>, literals: &[u8]) -> Option<usiz
     // 4-bit weights; FSE uses (header_byte = compressed_size < 128).
     let (huff_desc, huff_desc_len) = if weights_to_emit.len() <= 128 {
         let n = weights_to_emit.len();
-        (HuffDesc::Direct(n), 1 + (n + 1) / 2)
+        (HuffDesc::Direct, 1 + (n + 1) / 2)
     } else if let Some(fse_bytes) = super::huf::encode_weights_fse(weights_to_emit) {
         let len = 1 + fse_bytes.len();
         (HuffDesc::FseCompressed(fse_bytes), len)
@@ -923,13 +923,13 @@ fn try_write_huffman_literals(out: &mut Vec<u8>, literals: &[u8]) -> Option<usiz
 /// Huffman tree descriptor: direct (4-bit packed weights, ≤128 entries) or
 /// FSE-compressed (the weight stream is itself FSE-encoded).
 enum HuffDesc {
-    Direct(usize),
+    Direct,
     FseCompressed(Vec<u8>),
 }
 
 fn write_huffman_desc(out: &mut Vec<u8>, desc: &HuffDesc, weights_to_emit: &[u8]) {
     match desc {
-        HuffDesc::Direct(_) => write_huffman_table_direct(out, weights_to_emit),
+        HuffDesc::Direct => write_huffman_table_direct(out, weights_to_emit),
         HuffDesc::FseCompressed(bytes) => {
             // Header byte = compressed_size (< 128).
             debug_assert!(bytes.len() < 128);

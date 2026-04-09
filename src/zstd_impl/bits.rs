@@ -203,12 +203,6 @@ impl ForwardBitWriter {
         }
     }
 
-    /// Total bits written so far (including unflushed).
-    #[inline]
-    pub fn bit_len(&self) -> usize {
-        self.output.len() * 8 + self.bits_in_partial as usize
-    }
-
     /// Write the low `n` bits of `bits` (n ≤ 56).  Caller must ensure that
     /// the upper bits beyond `n` are zero.
     #[inline]
@@ -272,11 +266,6 @@ pub struct ForwardByteReader<'a> {
 impl<'a> ForwardByteReader<'a> {
     pub fn new(data: &'a [u8]) -> Self {
         Self { data, pos: 0 }
-    }
-
-    #[inline]
-    pub fn remaining(&self) -> usize {
-        self.data.len() - self.pos
     }
 
     #[inline]
