@@ -27,13 +27,21 @@ use std::io;
 
 const MIN_MATCH: usize = 4;
 const MAX_OFFSET: usize = 65_535;
-/// Lookback distance for the LAST possible match — last 12 bytes of any
-/// block must be literals (RFC requirement).
-const MIN_TRAILING_LITERALS: usize = 12;
+/// Search-bound margin: the LAST 12 bytes of the block can't START a
+/// match.  (Spec: `mflimit = blockEnd - 12`.)
+const MFLIMIT: usize = 12;
+/// Match-extension bound: matches can extend to within 5 bytes of the
+/// block end, but the LAST 5 bytes must remain literals.
+const LAST_LITERALS: usize = 5;
 const HASH_BITS: usize = 14;
 const HASH_SIZE: usize = 1 << HASH_BITS;
 const HASH_MASK: usize = HASH_SIZE - 1;
 const NONE: u32 = u32::MAX;
+/// Skip-step shift: after every `1 << SKIP_TRIGGER` (= 64) consecutive
+/// search misses the parser bumps `step` by 1, exponentially skipping
+/// ahead through incompressible regions.  Mirrors `LZ4_skipTrigger` in
+/// `lz4.c`.
+const SKIP_TRIGGER: u32 = 6;
 
 // =========================================================================
 // Decoder
@@ -199,61 +207,117 @@ pub fn compress_bound(n: usize) -> usize {
     n + n / 255 + 16
 }
 
-/// Compress `input` as an LZ4 block.  Always falls back to a single
-/// literal-only sequence if the input is too small for any match.
+/// Compress `input` as an LZ4 block.  Falls back to a single literal-only
+/// sequence if the input is too small for any match.
+///
+/// The parser mirrors `LZ4_compress_generic` in `lz4.c`:
+///
+/// * Hash table is a flat 14-bit `u32` array (`u32::MAX` sentinel = empty).
+/// * On a search miss the parser advances by `step` bytes; `step` starts at
+///   1 and grows by 1 every 64 consecutive misses (the `LZ4_skipTrigger`
+///   pattern).  This is what makes LZ4 fast on incompressible data — we
+///   don't probe every byte.
+/// * Prefix-check is a single 32-bit load.
+/// * Match extension walks 8 bytes at a time via XOR + `trailing_zeros`.
 pub fn compress_block(input: &[u8], output: &mut Vec<u8>) -> usize {
     let start_out = output.len();
+    let len = input.len();
 
-    if input.len() < MIN_TRAILING_LITERALS + MIN_MATCH {
+    // Pre-reserve worst-case bytes so the per-byte writes inside the
+    // emit helpers can skip the realloc check.
+    output.reserve(compress_bound(len));
+
+    if len < MFLIMIT + MIN_MATCH {
         emit_literal_only(output, input);
         return output.len() - start_out;
     }
 
-    let mut head = vec![NONE; HASH_SIZE];
+    let mut head: Vec<u32> = vec![NONE; HASH_SIZE];
+    let mflimit = len - MFLIMIT;
+    let matchlimit = len - LAST_LITERALS;
+
     let mut ip = 0usize;
     let mut anchor = 0usize;
-    let len = input.len();
-    let last_match_pos = len - MIN_TRAILING_LITERALS;
 
-    while ip < last_match_pos {
-        let h = hash4_lz4(&input[ip..]);
-        let cand = head[h];
-        head[h] = ip as u32;
+    // SAFETY: throughout this block we maintain `ip < mflimit` and
+    // `mp < ip` whenever we read from `input` or `head`.  All reads
+    // therefore stay strictly within the bounds checked at function entry.
+    unsafe {
+        let head_ptr = head.as_mut_ptr();
 
-        if cand == NONE {
+        // Seed: the very first byte never produces a back-reference.
+        let h0 = hash4_lz4_at(input, ip);
+        *head_ptr.add(h0) = ip as u32;
+        ip += 1;
+
+        'outer: while ip < mflimit {
+            // ----- Search phase: find a 4-byte match with skip-step -----
+            let mut forward_ip = ip;
+            let mut search_match_nb: u32 = 1u32 << SKIP_TRIGGER;
+            let mut match_pos: usize;
+
+            loop {
+                ip = forward_ip;
+                let step = (search_match_nb >> SKIP_TRIGGER) as usize;
+                search_match_nb += 1;
+                forward_ip = ip + step;
+                if forward_ip > mflimit {
+                    // No more candidates.  Encode the trailing literals and exit.
+                    break 'outer;
+                }
+
+                let h = hash4_lz4_at(input, ip);
+                let cand = *head_ptr.add(h);
+                *head_ptr.add(h) = ip as u32;
+                if cand == NONE {
+                    continue;
+                }
+                let mp = cand as usize;
+                // ip > mp by construction (we just stored ip and read the
+                // PREVIOUS slot value), so dist > 0 always.
+                let dist = ip - mp;
+                if dist > MAX_OFFSET {
+                    continue;
+                }
+                // Single 32-bit prefix check.
+                if read_u32(input, mp) == read_u32(input, ip) {
+                    match_pos = mp;
+                    break;
+                }
+            }
+
+            // ----- Walk back: extend match leftward into the literal run -----
+            // (Catches matches that start one or more bytes earlier than the
+            //  hashed position.)
+            while ip > anchor
+                && match_pos > 0
+                && *input.get_unchecked(match_pos - 1) == *input.get_unchecked(ip - 1)
+            {
+                ip -= 1;
+                match_pos -= 1;
+            }
+            let dist = ip - match_pos;
+
+            // ----- Forward match extension (8 bytes at a time) -----
+            let mlen = MIN_MATCH
+                + count_match(input, match_pos + MIN_MATCH, ip + MIN_MATCH, matchlimit);
+
+            // ----- Emit sequence -----
+            let lit_len = ip - anchor;
+            emit_sequence(output, &input[anchor..ip], lit_len, dist as u16, mlen);
+
+            ip += mlen;
+            anchor = ip;
+            if ip >= mflimit {
+                break;
+            }
+
+            // Hash the position right after the match — improves match
+            // discovery for the next iteration without extra cost.
+            let h = hash4_lz4_at(input, ip);
+            *head_ptr.add(h) = ip as u32;
             ip += 1;
-            continue;
         }
-        let mp = cand as usize;
-        let dist = ip - mp;
-        if dist == 0 || dist > MAX_OFFSET {
-            ip += 1;
-            continue;
-        }
-
-        // 4-byte prefix check.
-        if input[mp] != input[ip]
-            || input[mp + 1] != input[ip + 1]
-            || input[mp + 2] != input[ip + 2]
-            || input[mp + 3] != input[ip + 3]
-        {
-            ip += 1;
-            continue;
-        }
-
-        // Found a 4-byte (or longer) match.  Extend forward.
-        let mut mlen = MIN_MATCH;
-        let max_extend = last_match_pos - ip;
-        while mlen < max_extend && input[mp + mlen] == input[ip + mlen] {
-            mlen += 1;
-        }
-
-        // Emit the sequence (literal run + match).
-        let lit_len = ip - anchor;
-        emit_sequence(output, &input[anchor..ip], lit_len, dist as u16, mlen);
-
-        ip += mlen;
-        anchor = ip;
     }
 
     // Trailing literals (always at least LAST_LITERALS bytes).
@@ -262,6 +326,50 @@ pub fn compress_block(input: &[u8], output: &mut Vec<u8>) -> usize {
     }
 
     output.len() - start_out
+}
+
+/// Read a little-endian u32 from `buf` starting at byte position `pos`
+/// using a single unaligned load.
+///
+/// SAFETY: caller must guarantee `pos + 4 <= buf.len()`.
+#[inline(always)]
+unsafe fn read_u32(buf: &[u8], pos: usize) -> u32 {
+    debug_assert!(pos + 4 <= buf.len());
+    std::ptr::read_unaligned(buf.as_ptr().add(pos) as *const u32).to_le()
+}
+
+/// Read a little-endian u64 from `buf` starting at byte position `pos`
+/// using a single unaligned load.
+///
+/// SAFETY: caller must guarantee `pos + 8 <= buf.len()`.
+#[inline(always)]
+unsafe fn read_u64(buf: &[u8], pos: usize) -> u64 {
+    debug_assert!(pos + 8 <= buf.len());
+    std::ptr::read_unaligned(buf.as_ptr().add(pos) as *const u64).to_le()
+}
+
+/// Count how many consecutive bytes starting at `(input[ms..], input[is..])`
+/// are equal, stopping at `limit` (exclusive bound on `is`).  Reads 8 bytes
+/// at a time and finds the first differing byte via XOR + trailing-zero.
+#[inline(always)]
+fn count_match(input: &[u8], mut ms: usize, mut is: usize, limit: usize) -> usize {
+    let start = is;
+    // 8-byte chunks.
+    while is + 8 <= limit {
+        let diff = unsafe { read_u64(input, ms) ^ read_u64(input, is) };
+        if diff == 0 {
+            ms += 8;
+            is += 8;
+        } else {
+            return (is - start) + (diff.trailing_zeros() as usize >> 3);
+        }
+    }
+    // Tail: byte-at-a-time.
+    while is < limit && unsafe { *input.get_unchecked(ms) == *input.get_unchecked(is) } {
+        ms += 1;
+        is += 1;
+    }
+    is - start
 }
 
 /// Emit a "literal-only" sequence (no match) — used for the trailing data and
@@ -317,9 +425,10 @@ fn emit_sequence(output: &mut Vec<u8>, literals: &[u8], lit_len: usize, offset: 
     }
 }
 
-#[inline]
-fn hash4_lz4(b: &[u8]) -> usize {
-    let v = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+/// SAFETY: caller must guarantee `pos + 4 <= input.len()`.
+#[inline(always)]
+unsafe fn hash4_lz4_at(input: &[u8], pos: usize) -> usize {
+    let v = read_u32(input, pos);
     (v.wrapping_mul(2654435761) >> (32 - HASH_BITS)) as usize & HASH_MASK
 }
 
