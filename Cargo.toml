@@ -44,9 +44,9 @@ deflate           = ["deflate-static"]
 deflate-static    = []
 deflate-shared    = []
 
-xz                = ["xz-static"]
-xz-static         = ["dep:xz2", "xz2/static"]  # builds from vendored source of xz
-xz-shared         = ["dep:xz2"]  # _maybe_ uses system xz; probes for it but falls back to building static lib
+xz                = []
+xz-static         = []  # kept for API compatibility; xz/lzma is now pure Rust
+xz-shared         = []  # kept for API compatibility; xz/lzma is now pure Rust
 
 blosc2            = ["blosc2-static"]
 blosc2-static     = ["dep:blosc2-rs", "blosc2-rs/static"]
@@ -63,7 +63,7 @@ crc32fast       = "^1"
 simd-adler32    = "^0.3"
 # flate2 and libdeflate-sys removed: gzip/deflate/zlib are now pure Rust
 blosc2-rs      = { version = "0.4.0+2.15.2", optional = true, default-features = false }
-xz2            = { version = "0.1.7", optional = true }
+# xz2 removed: xz / lzma is now pure Rust (kept as a dev-dep for benches/tests below)
 
 # ISA-L not supported on 32-bit; Cargo doesn't offer a way to disable a single feature
 [target.'cfg(target_pointer_width = "64")'.dependencies]
@@ -85,6 +85,7 @@ flate2 = "^1"
 zstd = "^0.13"
 lz4 = "^1"
 bzip2 = ">=0.4,<0.6"
+xz2 = "0.1.7"  # only for cross-impl testing + benches against the pure-Rust xz_impl
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
@@ -101,6 +102,10 @@ harness = false
 
 [[bench]]
 name = "bzip2_bench"
+harness = false
+
+[[bench]]
+name = "xz_bench"
 harness = false
 
 [profile.release]

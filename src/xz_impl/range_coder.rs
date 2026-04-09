@@ -86,7 +86,7 @@ impl<'a> RangeDecoder<'a> {
     }
 
     /// Refill the top bits of `range` if it has shrunk below `RC_TOP_VALUE`.
-    #[inline]
+    #[inline(always)]
     fn normalize(&mut self) -> io::Result<()> {
         if self.range < RC_TOP_VALUE {
             if self.pos >= self.input.len() {
@@ -104,7 +104,7 @@ impl<'a> RangeDecoder<'a> {
 
     /// Decode a single binary symbol against probability `prob`, updating
     /// `prob` in place.  Returns the decoded bit (0 or 1).
-    #[inline]
+    #[inline(always)]
     pub fn decode_bit(&mut self, prob: &mut Prob) -> io::Result<u32> {
         self.normalize()?;
         let bound = (self.range >> RC_BIT_MODEL_TOTAL_BITS) * (*prob as u32);
@@ -118,6 +118,78 @@ impl<'a> RangeDecoder<'a> {
             *prob = (*prob as u32 - (*prob as u32 >> RC_MOVE_BITS)) as Prob;
             Ok(1)
         }
+    }
+
+    /// "Fast path" bit decode used inside a hot loop where the caller has
+    /// already verified there's enough input padding to refill the range
+    /// coder without going past the end.  No `Result`, no `?`-overhead.
+    /// `pos < input.len()` is a debug invariant.
+    #[inline(always)]
+    pub fn decode_bit_fast(&mut self, prob: &mut Prob) -> u32 {
+        // Inline normalize() but skip the EOF check.
+        if self.range < RC_TOP_VALUE {
+            debug_assert!(self.pos < self.input.len(), "decode_bit_fast called with empty input");
+            self.range <<= RC_SHIFT_BITS;
+            // SAFETY: caller guarantees padding.
+            self.code = (self.code << RC_SHIFT_BITS)
+                | unsafe { *self.input.get_unchecked(self.pos) } as u32;
+            self.pos += 1;
+        }
+        let bound = (self.range >> RC_BIT_MODEL_TOTAL_BITS) * (*prob as u32);
+        if self.code < bound {
+            self.range = bound;
+            *prob = (*prob as u32 + ((RC_BIT_MODEL_TOTAL - *prob as u32) >> RC_MOVE_BITS)) as Prob;
+            0
+        } else {
+            self.range -= bound;
+            self.code -= bound;
+            *prob = (*prob as u32 - (*prob as u32 >> RC_MOVE_BITS)) as Prob;
+            1
+        }
+    }
+
+    /// Forward bit-tree decode (fast path).  Caller must have padding.
+    #[inline(always)]
+    pub fn decode_bittree_fast(&mut self, probs: &mut [Prob], num_bits: u32) -> u32 {
+        let mut symbol: u32 = 1;
+        for _ in 0..num_bits {
+            let bit = self.decode_bit_fast(&mut probs[symbol as usize]);
+            symbol = (symbol << 1) | bit;
+        }
+        symbol - (1 << num_bits)
+    }
+
+    /// Reverse bit-tree decode (fast path).  Caller must have padding.
+    #[inline(always)]
+    pub fn decode_bittree_reverse_fast(&mut self, probs: &mut [Prob], num_bits: u32) -> u32 {
+        let mut symbol: u32 = 1;
+        let mut result: u32 = 0;
+        for i in 0..num_bits {
+            let bit = self.decode_bit_fast(&mut probs[symbol as usize]);
+            symbol = (symbol << 1) | bit;
+            result |= bit << i;
+        }
+        result
+    }
+
+    /// Direct (uniform) bits decode (fast path).  Caller must have padding.
+    #[inline(always)]
+    pub fn decode_direct_bits_fast(&mut self, num_bits: u32) -> u32 {
+        let mut result: u32 = 0;
+        for _ in 0..num_bits {
+            if self.range < RC_TOP_VALUE {
+                debug_assert!(self.pos < self.input.len());
+                self.range <<= RC_SHIFT_BITS;
+                self.code = (self.code << RC_SHIFT_BITS)
+                    | unsafe { *self.input.get_unchecked(self.pos) } as u32;
+                self.pos += 1;
+            }
+            self.range >>= 1;
+            let t: u32 = (self.code.wrapping_sub(self.range) as i32 >> 31) as u32;
+            self.code = self.code.wrapping_sub(self.range & !t);
+            result = (result << 1) | (t.wrapping_add(1) & 1);
+        }
+        result
     }
 
     /// Decode `num_bits` from a bit-tree of size `2^num_bits` (forward —

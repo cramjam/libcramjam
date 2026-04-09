@@ -40,12 +40,14 @@ use super::range_coder::RangeDecoder;
 /// in liblzma).  Returns the number of input bytes consumed, including the
 /// terminating END marker (0x00).
 pub fn decode_lzma2(input: &[u8], dict_size: u32, output: &mut Vec<u8>) -> io::Result<usize> {
-    // Decoder is created lazily on the first LZMA chunk that carries
-    // properties — until then we don't know lc/lp/pb.  An uncompressed
-    // dict-reset chunk can come first; in that case we still need a dict
-    // ready, so allocate one with default 3/0/2 properties.
+    // We allocate the LzmaDecoder LAZILY — many .xz streams (e.g. random
+    // / incompressible data) consist entirely of uncompressed LZMA2
+    // chunks, in which case we never need to pay for the (potentially
+    // multi-MiB) dict allocation.  The decoder is built on the first LZMA
+    // chunk that supplies properties; if a later LZMA chunk follows
+    // earlier uncompressed chunks, we seed the decoder's dict from the
+    // tail of `output` so back-references still work.
     let mut decoder: Option<LzmaDecoder> = None;
-    let mut dict = Dict::new(dict_size as usize);
     let mut need_dict_reset = true;
     let mut need_props = true;
 
@@ -63,13 +65,11 @@ pub fn decode_lzma2(input: &[u8], dict_size: u32, output: &mut Vec<u8>) -> io::R
             // Uncompressed dict-reset chunk.
             need_props = true;
             need_dict_reset = false;
-            // Reset dict.
-            dict = Dict::new(dict_size as usize);
             if let Some(d) = decoder.as_mut() {
                 d.dict = Dict::new(dict_size as usize);
                 d.reset_state();
             }
-            pos = decode_uncompressed_chunk(input, pos, &mut dict, output)?;
+            pos = decode_uncompressed_chunk_to_output(input, pos, output)?;
             continue;
         }
 
@@ -81,11 +81,7 @@ pub fn decode_lzma2(input: &[u8], dict_size: u32, output: &mut Vec<u8>) -> io::R
                     "lzma2: uncompressed chunk before dict reset",
                 ));
             }
-            pos = decode_uncompressed_chunk(input, pos, &mut dict, output)?;
-            // Mirror our scratch dict into the LzmaDecoder's dict.
-            if let Some(d) = decoder.as_mut() {
-                d.dict = clone_dict(&dict);
-            }
+            pos = decode_uncompressed_chunk_to_output(input, pos, output)?;
             continue;
         }
 
@@ -127,7 +123,6 @@ pub fn decode_lzma2(input: &[u8], dict_size: u32, output: &mut Vec<u8>) -> io::R
         if dict_reset {
             need_dict_reset = false;
             need_props = true;
-            dict = Dict::new(dict_size as usize);
             if let Some(d) = decoder.as_mut() {
                 d.dict = Dict::new(dict_size as usize);
             }
@@ -149,12 +144,31 @@ pub fn decode_lzma2(input: &[u8], dict_size: u32, output: &mut Vec<u8>) -> io::R
             let props = input[pos];
             pos += 1;
             let (lc, lp, pb) = decode_props(props)?;
-            // Build a fresh decoder; carry over the existing dict bytes.
-            let prior = std::mem::replace(&mut dict, Dict::new(dict_size as usize));
-            let mut d = LzmaDecoder::new(lc, lp, pb, dict_size)?;
-            d.dict = prior;
-            decoder = Some(d);
+            // Build a fresh decoder.  If there's an existing decoder its
+            // dict bytes carry over (assuming no dict reset above).  If
+            // this is the FIRST LZMA chunk after some uncompressed
+            // chunks, seed the new decoder's dict from the tail of
+            // `output` so back-references work.
+            let new_decoder = match decoder.take() {
+                Some(prior) => {
+                    let mut d = LzmaDecoder::new(lc, lp, pb, dict_size)?;
+                    d.dict = prior.dict;
+                    d
+                }
+                None => {
+                    let mut d = LzmaDecoder::new(lc, lp, pb, dict_size)?;
+                    seed_dict_from_output(&mut d.dict, output);
+                    d
+                }
+            };
+            decoder = Some(new_decoder);
         } else {
+            let d = decoder.as_mut().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "lzma2: LZMA chunk requires properties but none have been set",
+                )
+            })?;
             if need_props {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -162,17 +176,7 @@ pub fn decode_lzma2(input: &[u8], dict_size: u32, output: &mut Vec<u8>) -> io::R
                 ));
             }
             if state_reset {
-                if let Some(d) = decoder.as_mut() {
-                    d.reset_state();
-                }
-            }
-            // Move our scratch dict into the existing decoder so it has the
-            // latest bytes from any preceding uncompressed chunks.
-            if let Some(d) = decoder.as_mut() {
-                let bytes_to_copy = dict.total;
-                if bytes_to_copy > d.dict.total {
-                    d.dict = clone_dict(&dict);
-                }
+                d.reset_state();
             }
         }
 
@@ -186,7 +190,7 @@ pub fn decode_lzma2(input: &[u8], dict_size: u32, output: &mut Vec<u8>) -> io::R
         let chunk_in = &input[pos..pos + compressed_size as usize];
         pos += compressed_size as usize;
 
-        let d = decoder.as_mut().expect("decoder must exist by now");
+        let d = decoder.as_mut().expect("decoder must exist on LZMA chunk");
         let prev_total = d.dict.total;
         let mut rd = RangeDecoder::new(chunk_in)?;
         let (produced, hit_marker) = d.decode_to_dict(&mut rd, uncompressed_size as usize)?;
@@ -205,13 +209,16 @@ pub fn decode_lzma2(input: &[u8], dict_size: u32, output: &mut Vec<u8>) -> io::R
         }
 
         // Append the bytes the decoder just wrote into its dict to the
-        // user output, and mirror them into our scratch dict.
+        // user output.  Bulk memcpy (one or two slices, depending on
+        // whether the cyclic buffer wraps).
         let cap = d.dict.buf.len();
-        for i in 0..produced {
-            let p = ((prev_total as usize + i) % cap) as usize;
-            let b = d.dict.buf[p];
-            output.push(b);
-            dict.push(b);
+        let start = (prev_total as usize) % cap;
+        if start + produced <= cap {
+            output.extend_from_slice(&d.dict.buf[start..start + produced]);
+        } else {
+            let first = cap - start;
+            output.extend_from_slice(&d.dict.buf[start..cap]);
+            output.extend_from_slice(&d.dict.buf[..produced - first]);
         }
     }
 
@@ -223,10 +230,12 @@ pub fn decode_lzma2(input: &[u8], dict_size: u32, output: &mut Vec<u8>) -> io::R
     ))
 }
 
-fn decode_uncompressed_chunk(
+/// Decode an uncompressed LZMA2 chunk into `output` only.  Used when no
+/// LzmaDecoder has been allocated yet (i.e. there are no LZMA chunks in
+/// the stream so far) — skips the dict-allocation cost entirely.
+fn decode_uncompressed_chunk_to_output(
     input: &[u8],
     mut pos: usize,
-    dict: &mut Dict,
     output: &mut Vec<u8>,
 ) -> io::Result<usize> {
     if pos + 2 > input.len() {
@@ -245,13 +254,40 @@ fn decode_uncompressed_chunk(
             "lzma2: uncompressed chunk truncated",
         ));
     }
-    let bytes = &input[pos..pos + size];
-    pos += size;
-    output.extend_from_slice(bytes);
-    for &b in bytes {
-        dict.push(b);
+    output.extend_from_slice(&input[pos..pos + size]);
+    Ok(pos + size)
+}
+
+/// Seed an LzmaDecoder's freshly-allocated `Dict` with the tail of
+/// `output`, so that LZMA chunks following uncompressed chunks can do
+/// back-references into the bytes the uncompressed chunks emitted.
+fn seed_dict_from_output(dict: &mut Dict, output: &[u8]) {
+    if output.is_empty() {
+        return;
     }
-    Ok(pos)
+    let cap = dict.buf.len();
+    let take = output.len().min(cap);
+    let src = &output[output.len() - take..];
+    dict.buf[..take].copy_from_slice(src);
+    dict.total = take as u64;
+    // The dict's "current write position" should equal `take` so the next
+    // push() lands at index `take % cap`.  `total` already encodes this.
+}
+
+/// Bulk-copy a byte slice into a `Dict`'s cyclic buffer, splitting at the
+/// wrap point if necessary.  Replaces the per-byte `dict.push(b)` loop.
+fn extend_dict(dict: &mut Dict, bytes: &[u8]) {
+    let cap = dict.buf.len();
+    let mut start = (dict.total as usize) % cap;
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        let space = cap - start;
+        let take = space.min(remaining.len());
+        dict.buf[start..start + take].copy_from_slice(&remaining[..take]);
+        remaining = &remaining[take..];
+        start = (start + take) % cap;
+    }
+    dict.total += bytes.len() as u64;
 }
 
 /// Decode the LZMA properties byte: `(pb * 5 + lp) * 9 + lc`.
@@ -273,14 +309,4 @@ fn decode_props(props: u8) -> io::Result<(u32, u32, u32)> {
         ));
     }
     Ok((lc, lp, pb))
-}
-
-/// Clone helper for `Dict` (the struct doesn't derive Clone to keep the
-/// API surface small, but the LZMA2 driver needs to share dict bytes
-/// across the scratch buffer used for uncompressed chunks).
-fn clone_dict(d: &Dict) -> Dict {
-    Dict {
-        buf: d.buf.clone(),
-        total: d.total,
-    }
 }

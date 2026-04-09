@@ -1,105 +1,89 @@
-//! LZMA / XZ de/compression interface
-//! Note this is still a bit of a work in progress, especially when it comes
-//! to filter chain support.
-use std::io::{self, BufRead, BufReader};
-use std::io::{Read, Result, Write};
-pub use xz2;
-use xz2::read::{XzDecoder, XzEncoder};
-use xz2::stream::{Check as xz2Check, Stream, TELL_ANY_CHECK};
-pub use xz2::stream::{Filters, LzmaOptions, MatchFinder, Mode};
+//! XZ / LZMA / LZMA-Alone de/compression interface — pure-Rust backend.
+//!
+//! All public types and the function shapes match what the Python `cramjam`
+//! crate expects from `libcramjam::xz::*` so the wrapper compiles unchanged
+//! after the migration.  The internals call into `crate::xz_impl` instead
+//! of `xz2`.
+use std::io::{self, Read, Result, Write};
 
-/// Possible formats
-#[derive(Clone, Debug, Copy)]
-pub enum Format {
-    /// Auto select the format, for compression this is XZ,
-    /// for decompression it will be determined by the compressed input.
-    AUTO,
-    /// The `.xz` format (default)
-    XZ,
-    /// Legacy `.lzma` format.
-    ALONE,
-    /// Raw data stream
-    RAW,
+// Re-export the pure-Rust API types so cramjam-python's `libcramjam::xz::Format`
+// (etc.) imports keep working.
+pub use crate::xz_impl::options::{
+    Check, Filter, Filters, Format, LzmaOptions, MatchFinder, Mode,
+};
+pub use crate::xz_impl::{XzStreamCompressor, XzStreamDecompressor};
+
+/// Compatibility shim: the cramjam Python wrapper currently imports its
+/// streaming encoder type as `libcramjam::xz::write::XzEncoder`.  We map
+/// that to the pure-Rust `XzStreamCompressor` so the wrapper compiles
+/// after the migration without renaming the field.
+pub mod write {
+    pub use crate::xz_impl::XzStreamCompressor as XzEncoder;
 }
 
-impl Default for Format {
-    fn default() -> Self {
-        Format::XZ
-    }
+/// Same compatibility shim for the read side.  `XzDecoder` is a
+/// `Read`-shaped wrapper that drains its source and decodes once on the
+/// first read.
+pub mod read {
+    pub use crate::xz_impl::XzStreamDecompressor as XzDecoder;
 }
 
-/// Possible Check configurations
-#[derive(Debug, Clone, Copy)]
-pub enum Check {
-    Crc64,
-    Crc32,
-    Sha256,
-    None,
-}
+const DEFAULT_PRESET: u32 = 6;
 
-impl Into<xz2Check> for Check {
-    fn into(self) -> xz2Check {
-        match self {
-            Self::Crc64 => xz2Check::Crc64,
-            Self::Crc32 => xz2Check::Crc32,
-            Self::Sha256 => xz2Check::Sha256,
-            Self::None => xz2Check::None,
-        }
-    }
-}
-
-/// Decompress snappy data framed
+/// Decompress an XZ / LZMA stream from `input` into `output`.
 #[inline(always)]
-pub fn decompress<W: Write + ?Sized, R: Read>(input: R, output: &mut W) -> Result<usize> {
-    let xz_magicbytes = b"\xfd7zXZ\x00";
-    let mut input = BufReader::new(input);
-    let stream = {
-        let innerbuf = input.fill_buf()?;
-        if innerbuf.len() >= xz_magicbytes.len() && &innerbuf[..xz_magicbytes.len()] == xz_magicbytes {
-            Stream::new_auto_decoder(u64::MAX, TELL_ANY_CHECK)?
-        } else {
-            Stream::new_lzma_decoder(u64::MAX)?
-        }
-    };
-    let mut decoder = XzDecoder::new_stream(input, stream);
-    let n_bytes = io::copy(&mut decoder, output)?;
-    Ok(n_bytes as usize)
+pub fn decompress<W: Write + ?Sized, R: Read>(mut input: R, output: &mut W) -> Result<usize> {
+    let mut data = Vec::new();
+    input.read_to_end(&mut data)?;
+    let decoded = crate::xz_impl::decode_xz(&data)?;
+    output.write_all(&decoded)?;
+    Ok(decoded.len())
 }
 
-/// Decompress snappy data framed
+/// Compress an input stream as `.xz`.
+///
+/// `preset` is the LZMA compression preset (0..=9, default 6).
+/// `format`, `check`, `filters` and `options` are accepted for API
+/// compatibility with the previous xz2-backed version; the current
+/// pure-Rust encoder honours `preset` and `check` and uses LZMA2 with
+/// the preset's default options.  Filter chains and custom `LzmaOptions`
+/// fall back to the preset for now (a TODO covered by the migration).
 #[inline(always)]
 pub fn compress<W: Write + ?Sized, R: Read>(
-    data: R,
+    mut input: R,
     output: &mut W,
     preset: Option<u32>,
     format: Option<impl Into<Format>>,
     check: Option<impl Into<Check>>,
-    filters: Option<impl Into<Filters>>,
-    options: Option<impl Into<LzmaOptions>>,
+    _filters: Option<impl Into<Filters>>,
+    _options: Option<impl Into<LzmaOptions>>,
 ) -> Result<usize> {
-    let preset = preset.unwrap_or(6); // same as python default
-    let stream = match format.map(Into::into).unwrap_or_default() {
+    let preset = preset.unwrap_or(DEFAULT_PRESET);
+    let format = format.map(Into::into).unwrap_or_default();
+    let check = check.map(Into::into).unwrap_or_default();
+
+    let mut data = Vec::new();
+    input.read_to_end(&mut data)?;
+
+    let compressed = match format {
         Format::AUTO | Format::XZ => {
-            let check = check.map(Into::into).unwrap_or(Check::Crc64); // default for xz
-            let stream = Stream::new_easy_encoder(preset, check.into())?;
-            stream
+            let mut out = Vec::with_capacity(data.len() / 2);
+            crate::xz_impl::xz_format::encode_xz_stream(&data, preset, check, &mut out)?;
+            out
         }
         Format::ALONE => {
-            let opts = match options {
-                Some(opts) => opts.into(),
-                None => LzmaOptions::new_preset(preset)?,
-            };
-            let stream = Stream::new_lzma_encoder(&opts)?;
-            stream
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "xz: ALONE (.lzma) format encoder not yet implemented in the pure-Rust backend",
+            ));
         }
         Format::RAW => {
-            let check = check.map(Into::into).unwrap_or(Check::None); // default for Alone and Raw formats
-            let filters = filters.map(Into::into).unwrap_or_else(|| Filters::new());
-            let stream = Stream::new_stream_encoder(&filters, check.into())?;
-            stream
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "xz: RAW filter-chain encoder not yet implemented in the pure-Rust backend",
+            ));
         }
     };
-    let mut encoder = XzEncoder::new_stream(data, stream);
-    let n_bytes = io::copy(&mut encoder, output)?;
-    Ok(n_bytes as usize)
+    output.write_all(&compressed)?;
+    Ok(compressed.len())
 }

@@ -13,17 +13,24 @@ use std::sync::OnceLock;
 
 const CRC32_POLY: u32 = 0xEDB88320;
 
-static CRC32_TABLE: OnceLock<[u32; 256]> = OnceLock::new();
+/// Slice-by-8 tables for CRC32 — same idea as CRC64 above.
+static CRC32_SLICE_TABLES: OnceLock<[[u32; 256]; 8]> = OnceLock::new();
 
-fn crc32_table() -> &'static [u32; 256] {
-    CRC32_TABLE.get_or_init(|| {
-        let mut t = [0u32; 256];
-        for (i, slot) in t.iter_mut().enumerate() {
+fn crc32_slice_tables() -> &'static [[u32; 256]; 8] {
+    CRC32_SLICE_TABLES.get_or_init(|| {
+        let mut t = [[0u32; 256]; 8];
+        for (i, slot) in t[0].iter_mut().enumerate() {
             let mut c = i as u32;
             for _ in 0..8 {
                 c = if c & 1 != 0 { (c >> 1) ^ CRC32_POLY } else { c >> 1 };
             }
             *slot = c;
+        }
+        for k in 1..8 {
+            for i in 0..256 {
+                let prev = t[k - 1][i];
+                t[k][i] = (prev >> 8) ^ t[0][(prev & 0xff) as usize];
+            }
         }
         t
     })
@@ -40,11 +47,26 @@ impl Crc32 {
     }
 
     pub fn update(&mut self, data: &[u8]) {
-        let tbl = crc32_table();
+        let tables = crc32_slice_tables();
         let mut c = self.state;
-        for &b in data {
+        let mut chunks = data.chunks_exact(8);
+        for chunk in &mut chunks {
+            let word = u64::from_le_bytes(chunk.try_into().unwrap());
+            let v_low = (c as u64) ^ (word & 0xFFFFFFFF);
+            let v_high = word >> 32;
+            c = tables[7][(v_low & 0xff) as usize]
+                ^ tables[6][((v_low >> 8) & 0xff) as usize]
+                ^ tables[5][((v_low >> 16) & 0xff) as usize]
+                ^ tables[4][((v_low >> 24) & 0xff) as usize]
+                ^ tables[3][(v_high & 0xff) as usize]
+                ^ tables[2][((v_high >> 8) & 0xff) as usize]
+                ^ tables[1][((v_high >> 16) & 0xff) as usize]
+                ^ tables[0][((v_high >> 24) & 0xff) as usize];
+        }
+        let tail = chunks.remainder();
+        for &b in tail {
             let idx = ((c ^ b as u32) & 0xff) as usize;
-            c = (c >> 8) ^ tbl[idx];
+            c = (c >> 8) ^ tables[0][idx];
         }
         self.state = c;
     }
@@ -72,17 +94,29 @@ pub fn crc32(data: &[u8]) -> u32 {
 
 const CRC64_POLY: u64 = 0xC96C5795D7870F42;
 
-static CRC64_TABLE: OnceLock<[u64; 256]> = OnceLock::new();
+/// Slice-by-8 CRC64 — eight precomputed lookup tables, processes 8 input
+/// bytes per iteration of the inner loop with 8 parallel table reads that
+/// the CPU can pipeline.  Single-table fallback is used for the trailing
+/// bytes that don't fill a full 8-byte block.
+static CRC64_SLICE_TABLES: OnceLock<[[u64; 256]; 8]> = OnceLock::new();
 
-fn crc64_table() -> &'static [u64; 256] {
-    CRC64_TABLE.get_or_init(|| {
-        let mut t = [0u64; 256];
-        for (i, slot) in t.iter_mut().enumerate() {
+fn crc64_slice_tables() -> &'static [[u64; 256]; 8] {
+    CRC64_SLICE_TABLES.get_or_init(|| {
+        let mut t = [[0u64; 256]; 8];
+        // Table[0] is the standard reflected CRC64 table.
+        for (i, slot) in t[0].iter_mut().enumerate() {
             let mut c = i as u64;
             for _ in 0..8 {
                 c = if c & 1 != 0 { (c >> 1) ^ CRC64_POLY } else { c >> 1 };
             }
             *slot = c;
+        }
+        // Each subsequent table[k] = (table[k-1] >> 8) ^ table[0][bottom byte].
+        for k in 1..8 {
+            for i in 0..256 {
+                let prev = t[k - 1][i];
+                t[k][i] = (prev >> 8) ^ t[0][(prev & 0xff) as usize];
+            }
         }
         t
     })
@@ -99,11 +133,29 @@ impl Crc64 {
     }
 
     pub fn update(&mut self, data: &[u8]) {
-        let tbl = crc64_table();
+        let tables = crc64_slice_tables();
         let mut c = self.state;
-        for &b in data {
+        // Slice-by-8 main loop.
+        let mut chunks = data.chunks_exact(8);
+        for chunk in &mut chunks {
+            // Read 8 bytes as a little-endian u64, XOR with the current
+            // state, and look up each byte in the corresponding table.
+            let word = u64::from_le_bytes(chunk.try_into().unwrap());
+            let v = c ^ word;
+            c = tables[7][(v & 0xff) as usize]
+                ^ tables[6][((v >> 8) & 0xff) as usize]
+                ^ tables[5][((v >> 16) & 0xff) as usize]
+                ^ tables[4][((v >> 24) & 0xff) as usize]
+                ^ tables[3][((v >> 32) & 0xff) as usize]
+                ^ tables[2][((v >> 40) & 0xff) as usize]
+                ^ tables[1][((v >> 48) & 0xff) as usize]
+                ^ tables[0][((v >> 56) & 0xff) as usize];
+        }
+        // Trailing bytes via the slow per-byte path using table[0].
+        let tail = chunks.remainder();
+        for &b in tail {
             let idx = ((c ^ b as u64) & 0xff) as usize;
-            c = (c >> 8) ^ tbl[idx];
+            c = (c >> 8) ^ tables[0][idx];
         }
         self.state = c;
     }
