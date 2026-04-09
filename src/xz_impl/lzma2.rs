@@ -35,6 +35,15 @@ use std::io;
 use super::lzma::{Dict, LzmaDecoder, LZMA_LCLP_MAX, LZMA_PB_MAX};
 use super::range_coder::RangeDecoder;
 
+/// Padding bytes appended to each LZMA chunk before handing it to the
+/// `RangeDecoder`.  The fast-path range decoder uses unchecked reads
+/// (`get_unchecked(pos)`) and may over-read by a few bytes when an
+/// over-eager refill happens at the very end of a chunk.  Padding the
+/// chunk with zero bytes makes those over-reads benign — the range
+/// coder reads zero bits which match the LZMA stream's natural
+/// terminator behaviour.
+const RC_PADDING: usize = 16;
+
 /// Decode an LZMA2 stream from `input` into `output`.  `dict_size` is taken
 /// from the surrounding xz block header (one byte: see `lzma2_props_decode`
 /// in liblzma).  Returns the number of input bytes consumed, including the
@@ -50,6 +59,9 @@ pub fn decode_lzma2(input: &[u8], dict_size: u32, output: &mut Vec<u8>) -> io::R
     let mut decoder: Option<LzmaDecoder> = None;
     let mut need_dict_reset = true;
     let mut need_props = true;
+    // Reusable padded scratch buffer for chunk decoding.  Avoids one
+    // allocation per chunk.
+    let mut chunk_scratch: Vec<u8> = Vec::new();
 
     let mut pos = 0usize;
     while pos < input.len() {
@@ -69,7 +81,7 @@ pub fn decode_lzma2(input: &[u8], dict_size: u32, output: &mut Vec<u8>) -> io::R
                 d.dict = Dict::new(dict_size as usize);
                 d.reset_state();
             }
-            pos = decode_uncompressed_chunk_to_output(input, pos, output)?;
+            pos = decode_uncompressed_chunk(input, pos, decoder.as_mut(), output)?;
             continue;
         }
 
@@ -81,7 +93,7 @@ pub fn decode_lzma2(input: &[u8], dict_size: u32, output: &mut Vec<u8>) -> io::R
                     "lzma2: uncompressed chunk before dict reset",
                 ));
             }
-            pos = decode_uncompressed_chunk_to_output(input, pos, output)?;
+            pos = decode_uncompressed_chunk(input, pos, decoder.as_mut(), output)?;
             continue;
         }
 
@@ -187,12 +199,20 @@ pub fn decode_lzma2(input: &[u8], dict_size: u32, output: &mut Vec<u8>) -> io::R
                 "lzma2: LZMA payload exceeds remaining input",
             ));
         }
-        let chunk_in = &input[pos..pos + compressed_size as usize];
-        pos += compressed_size as usize;
+        // Copy the chunk into a padded scratch buffer so the fast
+        // range decoder's `get_unchecked` over-reads (up to 4 bytes
+        // per refill at the tail of a chunk) land on zero bytes
+        // instead of unrelated memory.
+        let chunk_len = compressed_size as usize;
+        chunk_scratch.clear();
+        chunk_scratch.reserve(chunk_len + RC_PADDING);
+        chunk_scratch.extend_from_slice(&input[pos..pos + chunk_len]);
+        chunk_scratch.resize(chunk_len + RC_PADDING, 0);
+        pos += chunk_len;
 
         let d = decoder.as_mut().expect("decoder must exist on LZMA chunk");
         let prev_total = d.dict.total;
-        let mut rd = RangeDecoder::new(chunk_in)?;
+        let mut rd = RangeDecoder::new(&chunk_scratch)?;
         let (produced, hit_marker) = d.decode_to_dict(&mut rd, uncompressed_size as usize)?;
 
         if hit_marker {
@@ -230,12 +250,17 @@ pub fn decode_lzma2(input: &[u8], dict_size: u32, output: &mut Vec<u8>) -> io::R
     ))
 }
 
-/// Decode an uncompressed LZMA2 chunk into `output` only.  Used when no
-/// LzmaDecoder has been allocated yet (i.e. there are no LZMA chunks in
-/// the stream so far) — skips the dict-allocation cost entirely.
-fn decode_uncompressed_chunk_to_output(
+/// Decode an uncompressed LZMA2 chunk.  Writes the bytes to `output` and
+/// — if an `LzmaDecoder` already exists — also mirrors them into its
+/// `Dict` so that following LZMA chunks see the correct back-reference
+/// history.  When no decoder exists yet (no LZMA chunk has been seen so
+/// far) the dict update is skipped entirely; if a later LZMA chunk
+/// arrives, `seed_dict_from_output` re-syncs the freshly-allocated dict
+/// from the tail of `output`.
+fn decode_uncompressed_chunk(
     input: &[u8],
     mut pos: usize,
+    decoder: Option<&mut LzmaDecoder>,
     output: &mut Vec<u8>,
 ) -> io::Result<usize> {
     if pos + 2 > input.len() {
@@ -254,7 +279,26 @@ fn decode_uncompressed_chunk_to_output(
             "lzma2: uncompressed chunk truncated",
         ));
     }
-    output.extend_from_slice(&input[pos..pos + size]);
+    let bytes = &input[pos..pos + size];
+    output.extend_from_slice(bytes);
+
+    if let Some(d) = decoder {
+        // Mirror the bytes into the cyclic dict buffer so the next LZMA
+        // chunk's back-references resolve correctly.  Two-segment memcpy
+        // when the write wraps the end of the buffer.
+        let dict = &mut d.dict;
+        let cap = dict.buf.len();
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let dst = (dict.total as usize) % cap;
+            let chunk = (cap - dst).min(bytes.len() - written);
+            dict.buf[dst..dst + chunk]
+                .copy_from_slice(&bytes[written..written + chunk]);
+            dict.total += chunk as u64;
+            written += chunk;
+        }
+    }
+
     Ok(pos + size)
 }
 

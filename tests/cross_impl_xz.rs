@@ -233,24 +233,43 @@ fn c_xz_compress_our_decompress_mozilla() {
     }
 }
 
-/// Find the smallest mozilla slice that triggers the decoder bug.
+/// Find where our decoder diverges from xz2 on the mozilla benchmark.
+/// Inspects partial output by reaching into the LZMA2 driver directly.
 #[test]
-fn c_xz_compress_our_decompress_mozilla_bisect() {
+fn mozilla_decoder_divergence() {
     let raw = match std::fs::read("/tmp/mozilla.raw") {
         Ok(r) => r,
         Err(_) => return,
     };
-    for &kb in &[400, 410, 420, 430, 440, 450, 460, 470, 480, 490, 500] {
-        let sub = &raw[..kb * 1024];
-        let compressed = c_xz_compress(sub, 6);
-        match libcramjam::xz_impl::decode_xz(&compressed) {
-            Ok(d) => {
-                let ok = d == sub;
-                eprintln!("[bisect] {}KB: OK={} ({} compressed)", kb, ok, compressed.len());
-            }
-            Err(e) => {
-                eprintln!("[bisect] {}KB: FAIL ({} compressed): {}", kb, compressed.len(), e);
-                return;
+    let sub = &raw[..460 * 1024];
+    let compressed = c_xz_compress(sub, 6);
+    eprintln!("[divergence] input={} compressed={}", sub.len(), compressed.len());
+
+    let c_decoded = c_xz_decompress(&compressed);
+    assert_eq!(c_decoded, sub, "xz2 decoded mismatch");
+
+    // Decode-with-partial-capture: try our decoder and capture whatever
+    // it manages to produce before erroring.
+    let mut our_partial = Vec::new();
+    let _ = libcramjam::xz_impl::xz_format::decode_xz_stream(&compressed, &mut our_partial);
+    eprintln!("[divergence] ours produced {} bytes before error", our_partial.len());
+
+    // Find first divergence.
+    let n = our_partial.len().min(c_decoded.len());
+    let first_diff = (0..n).find(|&i| our_partial[i] != c_decoded[i]);
+    match first_diff {
+        Some(idx) => {
+            eprintln!("[divergence] first mismatch at offset {} (chunk-relative {})",
+                idx, idx as i64 - 402409);
+            let lo = idx.saturating_sub(16);
+            let hi = (idx + 16).min(n);
+            eprintln!("  ours[{}..{}]:   {:02x?}", lo, hi, &our_partial[lo..hi]);
+            eprintln!("  xz2 [{}..{}]:   {:02x?}", lo, hi, &c_decoded[lo..hi]);
+        }
+        None => {
+            eprintln!("[divergence] all {} bytes match before our decoder errored", n);
+            if our_partial.len() < c_decoded.len() {
+                eprintln!("  next expected byte = 0x{:02x}", c_decoded[n]);
             }
         }
     }
