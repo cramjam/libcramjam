@@ -26,6 +26,13 @@ const MAX_SELECTORS: usize = 18002;
 pub fn encode_stream(input: &[u8], level: u32) -> Vec<u8> {
     let level = level.clamp(1, 9);
     let block_size = (level as usize) * 100_000;
+    // bzip2's decoder allocates a post-RLE1 buffer of `100000 * level - 19`
+    // bytes (`nblockMAX` in bzlib_private.h).  We must split blocks so the
+    // post-RLE1 size never exceeds that, otherwise the reference decoder
+    // rejects the stream with "invalid data" — and crucially, *RLE1 can
+    // expand* (a 4-run becomes 5 bytes), so capping the raw input at
+    // `block_size` is not enough on its own.
+    let nblock_max = block_size - 19;
 
     let mut bw = BitWriter::new();
     // File header: BZh<level>
@@ -37,17 +44,19 @@ pub fn encode_stream(input: &[u8], level: u32) -> Vec<u8> {
     let mut combined_crc: u32 = 0;
     let mut pos = 0usize;
     while pos < input.len() {
-        // Pre-RLE1, the block input is at most block_size bytes.  In a smarter
-        // encoder we'd target a post-RLE1 size of block_size; this MVP just
-        // splits the raw input.
-        let take = (input.len() - pos).min(block_size);
-        let block = &input[pos..pos + take];
-        pos += take;
+        // Drive RLE1 over the remaining input but stop as soon as the
+        // post-RLE1 byte count would exceed `nblock_max`.  The function
+        // returns how many *raw* input bytes it consumed.
+        let (rle1_out, consumed) = forward_rle1_capped(&input[pos..], nblock_max);
 
-        let block_crc = compute_block_crc(block);
+        // CRC is computed over the *raw* input bytes (pre-RLE1) per the
+        // bzip2 spec — see `BZ2_bsW` / `s->blockCRC` in bzlib's compress.c.
+        let raw_block = &input[pos..pos + consumed];
+        let block_crc = compute_block_crc(raw_block);
         combined_crc = combined_crc.rotate_left(1) ^ block_crc;
 
-        encode_block(&mut bw, block, block_crc);
+        encode_block_from_rle1(&mut bw, rle1_out, block_crc);
+        pos += consumed;
     }
 
     // End-of-stream marker.
@@ -63,10 +72,7 @@ fn compute_block_crc(block: &[u8]) -> u32 {
     c.finalize()
 }
 
-fn encode_block(bw: &mut BitWriter, block: &[u8], block_crc: u32) {
-    // -- 1. RLE1 --
-    let rle1_out = forward_rle1(block);
-
+fn encode_block_from_rle1(bw: &mut BitWriter, rle1_out: Vec<u8>, block_crc: u32) {
     // -- 2. BWT --
     let (bwt_out, origin) = forward_bwt(&rle1_out);
 
@@ -271,14 +277,31 @@ fn emit_zero_run(symbols: &mut Vec<u16>, mut n: u32) {
 // =========================================================================
 // Forward RLE1
 // =========================================================================
+#[cfg(test)]
 fn forward_rle1(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len() + input.len() / 8);
+    let (out, _consumed) = forward_rle1_capped(input, usize::MAX);
+    out
+}
+
+/// RLE1 with a hard cap on the output size in bytes.  Returns the encoded
+/// output and the number of *input* bytes consumed.  Stops early if the
+/// next run wouldn't fit within `max_out` — this is what lets the encoder
+/// guarantee a post-RLE1 block size ≤ `block_size`, which is the bzip2
+/// decoder's hard buffer limit.  Worst-case expansion: a 4-run encodes as
+/// 5 bytes, so the largest output any single step adds is 5 bytes.
+fn forward_rle1_capped(input: &[u8], max_out: usize) -> (Vec<u8>, usize) {
+    let mut out = Vec::with_capacity(input.len().min(max_out) + 8);
     let mut i = 0usize;
     while i < input.len() {
         let b = input[i];
         let mut run = 1usize;
         while i + run < input.len() && input[i + run] == b && run < 255 {
             run += 1;
+        }
+        // Bytes this step will append.
+        let step_out = if run >= 4 { 5 } else { run };
+        if out.len() + step_out > max_out {
+            break;
         }
         if run >= 4 {
             out.push(b);
@@ -293,7 +316,7 @@ fn forward_rle1(input: &[u8]) -> Vec<u8> {
         }
         i += run;
     }
-    out
+    (out, i)
 }
 
 // =========================================================================

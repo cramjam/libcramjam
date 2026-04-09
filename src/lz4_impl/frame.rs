@@ -37,7 +37,18 @@ const UNCOMPRESSED_BIT: u32 = 1 << 31;
 // Encoder
 // =========================================================================
 
+#[cfg(test)]
 pub fn encode_frame(input: &[u8]) -> Vec<u8> {
+    encode_frame_at(input, None)
+}
+
+/// Encode an LZ4 frame at the requested level.
+///
+/// `level == None` or `Some(0..=2)` uses the fast hash-table parser
+/// (`block::compress_block`).  `Some(3..=12)` selects the HC parser
+/// (`block::compress_block_hc`) — matching the lz4 frame format's
+/// "compression level" semantics.
+pub fn encode_frame_at(input: &[u8], level: Option<u32>) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len() + 32);
 
     // Magic.
@@ -54,6 +65,9 @@ pub fn encode_frame(input: &[u8]) -> Vec<u8> {
     let hc = xxhash32(&out[4..6], 0);
     out.push(((hc >> 8) & 0xFF) as u8);
 
+    let use_hc = matches!(level, Some(l) if l >= 3);
+    let hc_level = level.unwrap_or(0);
+
     // Blocks.
     let mut pos = 0;
     while pos < input.len() {
@@ -62,7 +76,11 @@ pub fn encode_frame(input: &[u8]) -> Vec<u8> {
 
         // Compress the block; if the compressed payload >= raw size, emit raw.
         let mut compressed = Vec::with_capacity(block::compress_bound(chunk.len()));
-        block::compress_block(chunk, &mut compressed);
+        if use_hc {
+            block::compress_block_hc(chunk, &mut compressed, hc_level);
+        } else {
+            block::compress_block(chunk, &mut compressed);
+        }
 
         if compressed.len() < chunk.len() {
             let size = compressed.len() as u32;

@@ -77,12 +77,11 @@ fn corpus_subset() {
     }
 }
 
-/// Full-corpus run.  Currently surfaces a real decoder bug:
-///   - `xml` at level 1 panics in `src/xz_impl/lzma2.rs` with
-///     "range end index 1072571 out of range for slice of length 1048576"
-///     while decoding C xz output.  See the project_xz_lzma2_oob memory.
+/// Full-corpus run.  Slow (~5 min release build, all 24 files × 3 levels)
+/// so it's `#[ignore]`d by default — invoke explicitly with
+/// `cargo test --release --test corpus_xz -- --ignored`.
 #[test]
-#[ignore = "full corpus exposes a known lzma2 OOB bug; run with --ignored"]
+#[ignore = "full corpus is slow; run with --ignored"]
 fn corpus_full() {
     for (name, data) in common::load_all() {
         check_corpus(name, data);

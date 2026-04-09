@@ -27,9 +27,8 @@ impl<W: Write> Lz4StreamCompressor<W> {
     }
 
     pub fn finish(mut self) -> io::Result<W> {
-        let frame = frame::encode_frame(&self.input);
+        let frame = frame::encode_frame_at(&self.input, Some(self.level));
         self.output.write_all(&frame)?;
-        let _ = self.level; // level reserved for a future tunable encoder
         Ok(self.output)
     }
 }
@@ -46,14 +45,18 @@ impl<W: Write> Write for Lz4StreamCompressor<W> {
 }
 
 /// Compress an input stream as an LZ4 frame and write it to `output`.
+///
+/// `level` follows the lz4 frame-format convention: `0..=2` use the fast
+/// hash-table parser, `3..=12` use the HC parser (chained hash table +
+/// lazy match) — higher levels search deeper chains for better ratios.
 pub fn compress<W: Write + ?Sized, R: Read>(
     mut input: R,
     output: &mut W,
-    _level: Option<u32>,
+    level: Option<u32>,
 ) -> io::Result<usize> {
     let mut data = Vec::new();
     input.read_to_end(&mut data)?;
-    let frame = frame::encode_frame(&data);
+    let frame = frame::encode_frame_at(&data, level);
     output.write_all(&frame)?;
     Ok(frame.len())
 }

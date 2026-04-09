@@ -33,7 +33,7 @@ struct Config {
 
 const CONFIGS: [Config; 10] = [
     Config { good_length: 0, nice_length: 0, max_chain: 0, insert_step: 0, use_fixed: false },        // 0: stored
-    Config { good_length: 4, nice_length: 8, max_chain: 4, insert_step: 0, use_fixed: true },         // 1
+    Config { good_length: 4, nice_length: 8, max_chain: 4, insert_step: 1, use_fixed: true },         // 1
     Config { good_length: 4, nice_length: 16, max_chain: 8, insert_step: 4, use_fixed: true },        // 2
     Config { good_length: 4, nice_length: 32, max_chain: 32, insert_step: 4, use_fixed: true },       // 3
     Config { good_length: 4, nice_length: 16, max_chain: 16, insert_step: 2, use_fixed: false },      // 4
@@ -108,92 +108,17 @@ fn compress_with_huffman(input: &[u8], level: usize) -> Vec<u8> {
     let config = &CONFIGS[level];
     let mut w = BitWriter::with_capacity(input.len());
 
-    if level <= 1 {
-        // Fast path: single hash lookup, no chains, larger blocks.
-        compress_fast(input, &mut w, config);
-    } else {
-        let mut offset = 0;
-        while offset < input.len() {
-            let end = std::cmp::min(offset + BLOCK_SIZE, input.len());
-            let is_final = end >= input.len();
-
-            let tokens = lz77(input, offset, end, config);
-            write_best_block(&mut w, &input[offset..end], &tokens, is_final, config.use_fixed);
-
-            offset = end;
-        }
-    }
-    w.finish()
-}
-
-/// Fast compression for level 1: greedy first-match, no chain walking,
-/// single allocation of hash table for the entire input.
-fn compress_fast(input: &[u8], w: &mut BitWriter, config: &Config) {
-    // Use a larger block size to reduce per-block overhead.
-    const FAST_BLOCK: usize = 65536;
-
-    // Single hash table allocation, reused across blocks.
-    let mut head = vec![NONE; HASH_SIZE];
-
     let mut offset = 0;
     while offset < input.len() {
-        let end = std::cmp::min(offset + FAST_BLOCK, input.len());
+        let end = std::cmp::min(offset + BLOCK_SIZE, input.len());
         let is_final = end >= input.len();
 
-        let tokens = lz77_fast(input, offset, end, &mut head);
-        write_best_block(w, &input[offset..end], &tokens, is_final, config.use_fixed);
+        let tokens = lz77(input, offset, end, config);
+        write_best_block(&mut w, &input[offset..end], &tokens, is_final, config.use_fixed);
 
         offset = end;
     }
-}
-
-/// Greedy first-match LZ77 for level 1.
-/// Uses only the `head` table (no chain). Checks a single candidate per position.
-fn lz77_fast(input: &[u8], start: usize, end: usize, head: &mut [u32]) -> Vec<Token> {
-    let mut tokens = Vec::with_capacity(end - start);
-    let mut pos = start;
-
-    while pos < end {
-        let remaining = end - pos;
-        if remaining < MIN_MATCH {
-            tokens.push(Token::Literal(input[pos]));
-            pos += 1;
-            continue;
-        }
-
-        let h = hash3(&input[pos..]);
-        let match_pos = head[h];
-
-        // Update head immediately (before checking match).
-        head[h] = pos as u32;
-
-        // Check single candidate.
-        if match_pos != NONE {
-            let mp = match_pos as usize;
-            let dist = pos.wrapping_sub(mp);
-            if dist > 0 && dist <= WINDOW_SIZE && mp + 2 < input.len() && input[mp] == input[pos] {
-                let max_len = std::cmp::min(MAX_MATCH, remaining);
-                let mut len = 0;
-                while len < max_len && mp + len < input.len() && input[mp + len] == input[pos + len] {
-                    len += 1;
-                }
-                if len >= MIN_MATCH {
-                    tokens.push(Token::Match {
-                        length: len as u16,
-                        distance: dist as u16,
-                    });
-                    // Don't insert intermediate positions — just advance.
-                    pos += len;
-                    continue;
-                }
-            }
-        }
-
-        tokens.push(Token::Literal(input[pos]));
-        pos += 1;
-    }
-
-    tokens
+    w.finish()
 }
 
 /// Choose the smallest block encoding and write it.

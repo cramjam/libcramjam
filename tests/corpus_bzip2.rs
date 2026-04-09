@@ -68,17 +68,11 @@ fn corpus_subset() {
     }
 }
 
-/// Full-corpus run.  Currently surfaces a real encoder bug:
-///   - Several files fail with "bzip2: invalid data" when the C bzip2 decoder
-///     tries to parse our output, specifically when the input is large
-///     enough to span multiple bzip2 blocks at the chosen level (L1 = 100KB,
-///     L6 = 600KB, L9 = 900KB).  Known triggers in the corpus: urls_10k
-///     (L1, L6), xml (L1), ooffice (L1), x_ray (L1, L6, L9 — fails at every
-///     level, so the bug isn't purely about block boundaries).
-///   - See the project_bzip2_multiblock_bug memory for the active
-///     investigation.
+/// Full-corpus run.  Slow (~2 min release build, all 24 files × 3 levels)
+/// so it's `#[ignore]`d by default — invoke explicitly with
+/// `cargo test --release --test corpus_bzip2 -- --ignored`.
 #[test]
-#[ignore = "full corpus exposes a known multi-block encoder bug; run with --ignored"]
+#[ignore = "full corpus is slow; run with --ignored"]
 fn corpus_full() {
     for (name, data) in common::load_all() {
         check_corpus(name, data);

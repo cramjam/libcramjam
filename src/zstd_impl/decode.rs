@@ -453,7 +453,15 @@ fn decode_lit_size_compressed(
             let b2 = r.read_u8()?;
             let b3 = r.read_u8()?;
             let b4 = r.read_u8()?;
-            let combined = (byte0 as u32 >> 4) | ((b1 as u32) << 4) | ((b2 as u32) << 12) | ((b3 as u32) << 20) | ((b4 as u32) << 28);
+            // 18-bit regen + 18-bit compressed = 36 bits total — must be a
+            // u64 because a u32 silently drops the top 4 bits of `b4`,
+            // which corrupts compressed_size for any block where it's
+            // ≥ 16384 (i.e. essentially every text-heavy L1 block).
+            let combined = (byte0 as u64 >> 4)
+                | ((b1 as u64) << 4)
+                | ((b2 as u64) << 12)
+                | ((b3 as u64) << 20)
+                | ((b4 as u64) << 28);
             let regen = (combined & 0x3FFFF) as usize;
             let compressed = ((combined >> 18) & 0x3FFFF) as usize;
             Ok((regen, compressed, true))

@@ -13,12 +13,10 @@ use std::io::{Cursor, Read, Write};
 mod common;
 
 const LEVELS: &[u32] = &[1, 6, 9];
-/// Allowed ratio gap vs flate2 in percentage points of input size.  Bumped
-/// from the user's "5–10%" target to 20pp because our deflate level-1 path
-/// uses a fast greedy encoder (no lazy match, no chains — see
-/// `compress_fast` in `src/deflate_impl/compress.rs`) which is intentionally
-/// looser than miniz_oxide's level 1.  L6/L9 are usually within 1-2pp.
-const TOL_PP: f64 = 20.0;
+/// Allowed ratio gap vs flate2 in percentage points of input size.
+/// Matches the user's "≤10%" target.  L6/L9 are typically within 1-2pp;
+/// L1 is within ~9pp on the worst (tiny text) corpus file.
+const TOL_PP: f64 = 10.0;
 
 // ---------- ours ----------
 fn ours_def_c(d: &[u8], l: u32) -> Vec<u8> {

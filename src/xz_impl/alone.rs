@@ -65,7 +65,10 @@ pub fn decode_alone(input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
     // we'll typically stop earlier than the cap.
     let cap = target_size.unwrap_or(1usize << 30);
 
-    let (produced, hit_marker) = decoder.decode_to_dict(&mut rd, cap)?;
+    // `decode_to_dict` streams produced bytes directly into `output` as it
+    // decodes, so payloads larger than the dict size work correctly even
+    // when the size header is "unknown".
+    let (produced, hit_marker) = decoder.decode_to_dict(&mut rd, cap, output)?;
 
     if let Some(want) = target_size {
         if produced != want {
@@ -83,18 +86,6 @@ pub fn decode_alone(input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
             "lzma-alone: stream lacks both an uncompressed-size header AND \
              an end-of-payload marker — can't tell where to stop",
         ));
-    }
-
-    // Mirror the decoded bytes (currently inside `decoder.dict.buf`) to the
-    // user's `output`.  Same cyclic-buffer copy pattern as in lzma2.rs.
-    let cap_buf = decoder.dict.buf.len();
-    let start = ((decoder.dict.total - produced as u64) as usize) % cap_buf;
-    if start + produced <= cap_buf {
-        output.extend_from_slice(&decoder.dict.buf[start..start + produced]);
-    } else {
-        let first = cap_buf - start;
-        output.extend_from_slice(&decoder.dict.buf[start..cap_buf]);
-        output.extend_from_slice(&decoder.dict.buf[..produced - first]);
     }
 
     Ok(())

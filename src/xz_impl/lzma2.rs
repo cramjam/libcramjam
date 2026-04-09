@@ -211,9 +211,13 @@ pub fn decode_lzma2(input: &[u8], dict_size: u32, output: &mut Vec<u8>) -> io::R
         pos += chunk_len;
 
         let d = decoder.as_mut().expect("decoder must exist on LZMA chunk");
-        let prev_total = d.dict.total;
         let mut rd = RangeDecoder::new(&chunk_scratch)?;
-        let (produced, hit_marker) = d.decode_to_dict(&mut rd, uncompressed_size as usize)?;
+        // `decode_to_dict` writes the produced bytes directly into `output`
+        // as it goes — no post-call dict-to-output wrap copy is needed,
+        // and chunks larger than the dict size (LZMA2 allows up to 2 MiB
+        // per chunk) decode correctly.
+        let (produced, hit_marker) =
+            d.decode_to_dict(&mut rd, uncompressed_size as usize, output)?;
 
         if hit_marker {
             return Err(io::Error::new(
@@ -226,19 +230,6 @@ pub fn decode_lzma2(input: &[u8], dict_size: u32, output: &mut Vec<u8>) -> io::R
                 io::ErrorKind::InvalidData,
                 "lzma2: chunk produced wrong number of bytes",
             ));
-        }
-
-        // Append the bytes the decoder just wrote into its dict to the
-        // user output.  Bulk memcpy (one or two slices, depending on
-        // whether the cyclic buffer wraps).
-        let cap = d.dict.buf.len();
-        let start = (prev_total as usize) % cap;
-        if start + produced <= cap {
-            output.extend_from_slice(&d.dict.buf[start..start + produced]);
-        } else {
-            let first = cap - start;
-            output.extend_from_slice(&d.dict.buf[start..cap]);
-            output.extend_from_slice(&d.dict.buf[..produced - first]);
         }
     }
 

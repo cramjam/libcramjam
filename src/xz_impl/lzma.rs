@@ -383,8 +383,10 @@ impl LzmaDecoder {
         &mut self,
         rd: &mut RangeDecoder,
         uncompressed_remaining: usize,
+        output: &mut Vec<u8>,
     ) -> io::Result<(usize, bool)> {
         let mut produced = 0usize;
+        let dict_cap = self.dict.buf.len();
         while produced < uncompressed_remaining {
             let pos_state = (self.dict.position() as u32 & self.pb_mask) as usize;
             let is_match_idx = self.state as usize * POS_STATES_MAX + pos_state;
@@ -393,6 +395,10 @@ impl LzmaDecoder {
             if bit == 0 {
                 // Literal.
                 self.decode_literal(rd)?;
+                // Mirror the freshly-written byte into the user output so
+                // we never have to read it back out of the cyclic dict
+                // (which may have wrapped on a long enough chunk).
+                output.push(self.dict.byte_at(1));
                 produced += 1;
                 continue;
             }
@@ -410,6 +416,7 @@ impl LzmaDecoder {
                         self.state = update_short_rep(self.state);
                         let b = self.dict.byte_at(self.reps[0] as usize + 1);
                         self.dict.push(b);
+                        output.push(b);
                         produced += 1;
                         continue;
                     }
@@ -451,6 +458,19 @@ impl LzmaDecoder {
             // Copy `len` bytes from the dictionary at offset `reps[0] + 1`.
             let copy_len = (len as usize).min(uncompressed_remaining - produced);
             self.dict.repeat(self.reps[0] as usize + 1, copy_len)?;
+            // Mirror the freshly-written copy_len bytes into output.  Since
+            // copy_len ≤ MATCH_LEN_MAX (273) ≤ dict_cap (xz min 4 KiB),
+            // the just-written bytes are guaranteed to all still live in
+            // the dict's cyclic buffer — at most a 2-slice wrap.
+            let total_after = self.dict.total as usize;
+            let start = (total_after - copy_len) % dict_cap;
+            if start + copy_len <= dict_cap {
+                output.extend_from_slice(&self.dict.buf[start..start + copy_len]);
+            } else {
+                let first = dict_cap - start;
+                output.extend_from_slice(&self.dict.buf[start..dict_cap]);
+                output.extend_from_slice(&self.dict.buf[..copy_len - first]);
+            }
             produced += copy_len;
             if (copy_len as u32) < len {
                 return Err(io::Error::new(
