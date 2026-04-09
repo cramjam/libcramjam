@@ -162,6 +162,117 @@ fn c_compress_our_decompress_empty() {
     assert_eq!(decompressed, data);
 }
 
+// =========================================================================
+// Legacy LZMA "Alone" (.lzma) format
+// =========================================================================
+//
+// The xz2 crate exposes the alone format via Stream::new_lzma_encoder /
+// LzmaOptions::new_preset.  Our decoder is supposed to auto-detect ALONE
+// vs XZ from the leading bytes and route appropriately.
+
+fn c_alone_compress(data: &[u8], preset: u32) -> Vec<u8> {
+    use std::io::Write;
+    let opts = xz2::stream::LzmaOptions::new_preset(preset).unwrap();
+    let stream = xz2::stream::Stream::new_lzma_encoder(&opts).unwrap();
+    let mut enc = xz2::write::XzEncoder::new_stream(Vec::new(), stream);
+    enc.write_all(data).unwrap();
+    enc.finish().unwrap()
+}
+
+#[test]
+fn c_alone_compress_our_decompress_tiny() {
+    let data = b"hello world".to_vec();
+    let compressed = c_alone_compress(&data, 6);
+    // First byte should NOT be the xz magic 0xFD.
+    assert_ne!(compressed[0], 0xFD, "expected ALONE format, not xz");
+    let decompressed = our_decompress(&compressed);
+    assert_eq!(decompressed, data);
+}
+
+/// Regression: the 2-byte input `b"x\0"` compressed in ALONE format
+/// crashed our decoder with "bad stream header magic" because the
+/// stream had no end-of-payload marker AND no known size beyond what
+/// the alone header declares.
+#[test]
+fn c_alone_compress_our_decompress_x_null() {
+    let data = b"x\0".to_vec();
+    let compressed = c_alone_compress(&data, 6);
+    eprintln!("[x_null] compressed = {:02x?}", compressed);
+    let decompressed = our_decompress(&compressed);
+    assert_eq!(decompressed, data);
+}
+
+#[test]
+fn c_alone_compress_our_decompress_text() {
+    for level in [1u32, 6, 9] {
+        let data = gen_text(100_000);
+        let compressed = c_alone_compress(&data, level);
+        assert_ne!(compressed[0], 0xFD);
+        let decompressed = our_decompress(&compressed);
+        assert_eq!(decompressed, data, "level={}", level);
+    }
+}
+
+#[test]
+fn c_xz_compress_our_decompress_mozilla() {
+    let raw = match std::fs::read("/tmp/mozilla.raw") {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("[skip] /tmp/mozilla.raw missing");
+            return;
+        }
+    };
+    eprintln!("[mozilla xz] input: {} MB", raw.len() / 1024 / 1024);
+    let compressed = c_xz_compress(&raw, 6);
+    eprintln!("[mozilla xz] compressed: {} MB", compressed.len() / 1024 / 1024);
+    let decompressed = our_decompress(&compressed);
+    assert_eq!(decompressed.len(), raw.len(), "length mismatch");
+    if decompressed != raw {
+        let first = decompressed.iter().zip(raw.iter()).position(|(a, b)| a != b).unwrap();
+        panic!("byte mismatch at offset {}", first);
+    }
+}
+
+/// Find the smallest mozilla slice that triggers the decoder bug.
+#[test]
+fn c_xz_compress_our_decompress_mozilla_bisect() {
+    let raw = match std::fs::read("/tmp/mozilla.raw") {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for &kb in &[400, 410, 420, 430, 440, 450, 460, 470, 480, 490, 500] {
+        let sub = &raw[..kb * 1024];
+        let compressed = c_xz_compress(sub, 6);
+        match libcramjam::xz_impl::decode_xz(&compressed) {
+            Ok(d) => {
+                let ok = d == sub;
+                eprintln!("[bisect] {}KB: OK={} ({} compressed)", kb, ok, compressed.len());
+            }
+            Err(e) => {
+                eprintln!("[bisect] {}KB: FAIL ({} compressed): {}", kb, compressed.len(), e);
+                return;
+            }
+        }
+    }
+}
+
+#[test]
+fn c_alone_compress_our_decompress_random() {
+    let mut s: u32 = 0xCAFE_BABE;
+    let data: Vec<u8> = (0..50_000)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            (s >> 16) as u8
+        })
+        .collect();
+    let compressed = c_alone_compress(&data, 6);
+    assert_ne!(compressed[0], 0xFD);
+    let decompressed = our_decompress(&compressed);
+    assert_eq!(decompressed, data);
+}
+
 #[test]
 fn c_compress_our_decompress_single_byte() {
     let data = vec![0x42u8];

@@ -119,7 +119,7 @@ fn encode_compressed_blocks(out: &mut Vec<u8>, input: &[u8], level: i32) {
     // Match finding is done over the ENTIRE input so block N can back-reference
     // any earlier byte (zstd's window covers the whole input when single_segment).
     // The resulting sequence list is then sliced into ≤128 KB output chunks.
-    let parsed = lz77_parse(input, level);
+    let mut parsed = lz77_parse(input, level);
 
     // Walk sequences, grouping them into output chunks.  A "chunk" here is one
     // zstd compressed block consuming up to MAX_BLOCK_SIZE bytes of output.
@@ -137,18 +137,37 @@ fn encode_compressed_blocks(out: &mut Vec<u8>, input: &[u8], level: i32) {
         let block_first_lit = lit_pos;
 
         // Pull sequences whose entire footprint fits in this chunk.
-        // INVARIANT: every emitted sequence has lit_len + match_len <=
-        // MAX_BLOCK_SIZE (enforced by the LZ77 cap on MAX_MATCH).
         while seq_idx < parsed.sequences.len() {
             let s = parsed.sequences[seq_idx];
             let cost = s.lit_len as usize + s.match_len as usize;
-            debug_assert!(cost <= MAX_BLOCK_SIZE, "sequence overflows block size");
             if chunk_end + cost > chunk_target {
                 break;
             }
             chunk_end += cost;
             lit_pos += s.lit_len as usize;
             seq_idx += 1;
+        }
+
+        // If no sequence fit in this chunk AND we have sequences left,
+        // the next sequence's `lit_len + match_len > MAX_BLOCK_SIZE`.
+        // Split it: emit up to MAX_BLOCK_SIZE bytes as a literals-only
+        // block (consuming part of the sequence's lit_len) and shrink
+        // the sequence's `lit_len` for the next iteration.
+        //
+        // This guarantees forward progress.  Without this, the level-1
+        // fast parser's skip-ahead can produce sequences with huge
+        // lit_len in incompressible regions and the block-emit loop
+        // would spin forever emitting empty blocks.
+        if seq_idx == block_first_seq && seq_idx < parsed.sequences.len() {
+            let s = parsed.sequences[seq_idx];
+            let take = (s.lit_len as usize).min(MAX_BLOCK_SIZE);
+            debug_assert!(take > 0, "lit_len 0 sequence shouldn't be in the parser output");
+            chunk_end += take;
+            lit_pos += take;
+            // Shrink the sequence's lit_len so the next iteration starts
+            // with the residual literals (or directly with the match if
+            // we consumed all the literals).
+            parsed.sequences[seq_idx].lit_len -= take as u32;
         }
 
         // Trailing literals (after the last sequence) — only on the final chunk
@@ -563,12 +582,16 @@ fn lz77_parse_fast(input: &[u8], scratch: &mut EncoderScratch) -> ParsedBlock {
                     let mut mlen = 4 + count_common_bytes(input, mp + 4, pos + 4, max - 4);
 
                     // Back-up: extend the match into preceding literal bytes
-                    // when they also match.  This loop is short on average so
-                    // a byte-at-a-time scan is fine.
+                    // when they also match.  Stop AS SOON as mlen would
+                    // exceed MAX_MATCH — otherwise the post-loop cap can
+                    // shrink mlen below the forward match length and the
+                    // resulting `pos = start + mlen` walks backward,
+                    // causing an infinite loop.
                     let mut start = pos;
                     let mut back_mp = mp;
                     while start > lit_run_start
                         && back_mp > 0
+                        && mlen < MAX_MATCH
                         && unsafe { *input.get_unchecked(back_mp - 1) }
                             == unsafe { *input.get_unchecked(start - 1) }
                     {
@@ -576,9 +599,8 @@ fn lz77_parse_fast(input: &[u8], scratch: &mut EncoderScratch) -> ParsedBlock {
                         back_mp -= 1;
                         mlen += 1;
                     }
-                    if mlen > MAX_MATCH {
-                        mlen = MAX_MATCH;
-                    }
+                    debug_assert!(mlen <= MAX_MATCH);
+                    debug_assert!(start + mlen > pos, "back-up cap violated: start={}, mlen={}, pos={}", start, mlen, pos);
 
                     let lit_len = (start - lit_run_start) as u32;
                     literals.extend_from_slice(&input[lit_run_start..start]);

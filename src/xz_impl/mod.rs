@@ -27,6 +27,7 @@
 //! All numeric constants and probability-update rules are taken straight
 //! from liblzma's `range_common.h` / `lzma_common.h`.
 
+pub mod alone;
 pub mod check;
 pub mod options;
 pub mod range_coder;
@@ -45,10 +46,17 @@ pub fn encode_xz(input: &[u8], preset: u32) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// One-shot decode of a `.xz` stream into a Vec.
+/// One-shot decode of a compressed stream into a Vec.  Auto-detects
+/// `.xz` (the modern framed format, magic `FD 37 7A 58 5A 00`) vs the
+/// legacy `.lzma` "Alone" format (13-byte header followed by a raw LZMA
+/// stream — what `lzma.compress(..., format=FORMAT_ALONE)` produces).
 pub fn decode_xz(input: &[u8]) -> io::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(input.len() * 4);
-    xz_format::decode_xz_stream(input, &mut out)?;
+    if alone::looks_like_alone(input) {
+        alone::decode_alone(input, &mut out)?;
+    } else {
+        xz_format::decode_xz_stream(input, &mut out)?;
+    }
     Ok(out)
 }
 

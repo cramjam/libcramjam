@@ -237,3 +237,35 @@ fn our_roundtrip_large() {
         }
     }
 }
+
+/// Regression: a level-1 input that mixes long incompressible runs with
+/// short matches used to make the block-emit loop spin forever.  The
+/// level-1 fast parser's skip-ahead can produce a sequence with
+/// `lit_len + match_len > MAX_BLOCK_SIZE`, which the block packer would
+/// fail to fit in any chunk and re-emit empty blocks indefinitely.
+///
+/// We synthesize the pathological pattern instead of pulling in a binary
+/// fixture: a long stretch of pseudo-random bytes followed by a short
+/// repeat that the parser will pick up as a match.
+#[test]
+fn our_roundtrip_long_literal_run_then_match() {
+    let mut data: Vec<u8> = Vec::with_capacity(800_000);
+    // 700 KiB of incompressible data — forces a long literal run.
+    data.extend_from_slice(&gen_random(0xC0FFEE_42, 700_000));
+    // 100 KiB of repeated text — forces a long match (and thus a single
+    // sequence with huge lit_len from the preceding random region).
+    let phrase = b"the quick brown fox jumps over the lazy dog ";
+    while data.len() < 800_000 {
+        data.extend_from_slice(phrase);
+    }
+    data.truncate(800_000);
+
+    for level in [1, 3] {
+        let compressed = our_zstd_compress(&data, level);
+        let decompressed = our_zstd_decompress(&compressed);
+        assert_eq!(
+            decompressed, data,
+            "ours->ours failed: long-literal-run-then-match level={level}"
+        );
+    }
+}
