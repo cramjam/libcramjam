@@ -3,6 +3,8 @@ use std::io::{Error, Read, Write};
 
 const DEFAULT_COMPRESSION_LEVEL: i32 = 0;
 
+pub use crate::zstd_impl::ZstdStreamCompressor;
+
 /// Get the max compressed length for a single pass
 pub fn compress_bound(len: usize) -> usize {
     crate::zstd_impl::compress_bound(len)

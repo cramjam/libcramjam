@@ -13,21 +13,6 @@ pub use crate::xz_impl::options::{
 };
 pub use crate::xz_impl::{XzStreamCompressor, XzStreamDecompressor};
 
-/// Compatibility shim: the cramjam Python wrapper currently imports its
-/// streaming encoder type as `libcramjam::xz::write::XzEncoder`.  We map
-/// that to the pure-Rust `XzStreamCompressor` so the wrapper compiles
-/// after the migration without renaming the field.
-pub mod write {
-    pub use crate::xz_impl::XzStreamCompressor as XzEncoder;
-}
-
-/// Same compatibility shim for the read side.  `XzDecoder` is a
-/// `Read`-shaped wrapper that drains its source and decodes once on the
-/// first read.
-pub mod read {
-    pub use crate::xz_impl::XzStreamDecompressor as XzDecoder;
-}
-
 const DEFAULT_PRESET: u32 = 6;
 
 /// Decompress an XZ / LZMA stream from `input` into `output`.

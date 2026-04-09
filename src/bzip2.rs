@@ -3,6 +3,8 @@ use std::io::{Error, Read, Write};
 
 const DEFAULT_COMPRESSION_LEVEL: u32 = 6;
 
+pub use crate::bzip2_impl::Bzip2StreamCompressor;
+
 /// Decompress via bzip2.
 #[inline(always)]
 pub fn decompress<W: Write + ?Sized, R: Read>(mut input: R, output: &mut W) -> Result<usize, Error> {

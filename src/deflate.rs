@@ -5,6 +5,8 @@ use std::io::Error;
 pub const DEFAULT_COMPRESSION_LEVEL: u32 = 6;
 pub const MIN_BLOCK_LENGTH: usize = 5_000;
 
+pub use crate::deflate_impl::DeflateStreamCompressor;
+
 /// Compression upper bound
 pub fn compress_bound(input_len: usize) -> usize {
     crate::deflate_impl::deflate_compress_bound(input_len)

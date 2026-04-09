@@ -5,6 +5,8 @@ use std::io::{Error, Read, Write};
 pub const DEFAULT_COMPRESSION_LEVEL: u32 = 4;
 pub const LZ4_ACCELERATION_MAX: u32 = 65537;
 
+pub use crate::lz4_impl::Lz4StreamCompressor;
+
 /// Decompress lz4 frame data.
 #[inline(always)]
 pub fn decompress<W: Write + ?Sized, R: Read>(input: R, output: &mut W) -> Result<usize, Error> {

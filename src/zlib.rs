@@ -8,6 +8,8 @@ pub const ZLIB_MIN_HEADER_SIZE: usize = 2;
 pub const ZLIB_FOOTER_SIZE: usize = 4;
 pub const ZLIB_MIN_OVERHEAD: usize = ZLIB_MIN_HEADER_SIZE + ZLIB_FOOTER_SIZE;
 
+pub use crate::deflate_impl::ZlibStreamCompressor;
+
 /// Compression upper bound
 pub fn compress_bound(len: usize) -> usize {
     ZLIB_MIN_OVERHEAD + crate::deflate::compress_bound(len)

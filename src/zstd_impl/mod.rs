@@ -61,15 +61,16 @@ pub fn compress_bound(len: usize) -> usize {
     encode::compress_bound(len)
 }
 
-/// Streaming compressor (Write-adapter for the C API).
-pub struct ZstdStreamCompressor {
+/// Streaming compressor (Write-adapter for the C API).  Generic over
+/// `W: Write` so callers can pass either a `Vec<u8>` or `Cursor<Vec<u8>>`.
+pub struct ZstdStreamCompressor<W: Write = Vec<u8>> {
     input: Vec<u8>,
-    output: Vec<u8>,
+    output: W,
     level: i32,
 }
 
-impl ZstdStreamCompressor {
-    pub fn new(output: Vec<u8>, level: i32) -> io::Result<Self> {
+impl<W: Write> ZstdStreamCompressor<W> {
+    pub fn new(output: W, level: i32) -> io::Result<Self> {
         Ok(Self {
             input: Vec::new(),
             output,
@@ -77,23 +78,24 @@ impl ZstdStreamCompressor {
         })
     }
 
-    pub fn get_ref(&self) -> &Vec<u8> {
+    pub fn get_ref(&self) -> &W {
         &self.output
     }
 
-    pub fn finish(self) -> io::Result<Vec<u8>> {
-        let mut output = self.output;
+    pub fn finish(mut self) -> io::Result<W> {
+        let mut buf = Vec::with_capacity(self.input.len() / 2);
         compress(
             &mut std::io::Cursor::new(self.input),
-            &mut output,
+            &mut buf,
             Some(self.level),
             None,
         )?;
-        Ok(output)
+        self.output.write_all(&buf)?;
+        Ok(self.output)
     }
 }
 
-impl Write for ZstdStreamCompressor {
+impl<W: Write> Write for ZstdStreamCompressor<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.input.extend_from_slice(buf);
         Ok(buf.len())

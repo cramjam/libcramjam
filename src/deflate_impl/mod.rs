@@ -337,24 +337,25 @@ pub fn zlib_compress_bound(input_len: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Streaming gzip compressor (Write-adapter for the C API)
+// Streaming Write-adapters for the C API
 // ---------------------------------------------------------------------------
+//
+// Each of these is a `Write`-shaped wrapper that buffers all input then
+// compresses on `finish`.  They're generic over `W: Write` so callers can
+// pass either a `Vec<u8>` directly or a `Cursor<Vec<u8>>` (the cramjam
+// Python wrapper does the latter so it can call `into_inner()` to recover
+// the raw vec from the returned cursor).
 
-/// A Write-adapter that accumulates input and produces gzip output on
+/// Write-adapter that accumulates input and produces gzip output on
 /// [`finish`](GzipStreamCompressor::finish).
-///
-/// This provides API compatibility with the `flate2::write::GzEncoder`
-/// pattern used by the C API.  Intermediate calls to
-/// [`get_ref`](GzipStreamCompressor::get_ref) return an empty buffer
-/// until `finish` is called.
-pub struct GzipStreamCompressor {
+pub struct GzipStreamCompressor<W: Write = Vec<u8>> {
     input: Vec<u8>,
-    output: Vec<u8>,
+    output: W,
     level: u32,
 }
 
-impl GzipStreamCompressor {
-    pub fn new(output: Vec<u8>, level: u32) -> Self {
+impl<W: Write> GzipStreamCompressor<W> {
+    pub fn new(output: W, level: u32) -> Self {
         Self {
             input: Vec::new(),
             output,
@@ -362,29 +363,101 @@ impl GzipStreamCompressor {
         }
     }
 
-    /// Peek at the output buffer.
-    pub fn get_ref(&self) -> &Vec<u8> {
+    pub fn get_ref(&self) -> &W {
         &self.output
     }
 
-    /// Finalize compression and return the gzip output.
-    pub fn finish(self) -> io::Result<Vec<u8>> {
-        let mut output = self.output;
-        gzip_compress(
-            &mut std::io::Cursor::new(self.input),
-            &mut output,
-            Some(self.level),
-        )?;
-        Ok(output)
+    pub fn finish(mut self) -> io::Result<W> {
+        let mut buf = Vec::with_capacity(self.input.len() / 2);
+        gzip_compress(&mut std::io::Cursor::new(self.input), &mut buf, Some(self.level))?;
+        self.output.write_all(&buf)?;
+        Ok(self.output)
     }
 }
 
-impl Write for GzipStreamCompressor {
+impl<W: Write> Write for GzipStreamCompressor<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.input.extend_from_slice(buf);
         Ok(buf.len())
     }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
+/// Write-adapter that accumulates input and produces raw deflate output
+/// on [`finish`](DeflateStreamCompressor::finish).
+pub struct DeflateStreamCompressor<W: Write = Vec<u8>> {
+    input: Vec<u8>,
+    output: W,
+    level: u32,
+}
+
+impl<W: Write> DeflateStreamCompressor<W> {
+    pub fn new(output: W, level: u32) -> Self {
+        Self {
+            input: Vec::new(),
+            output,
+            level,
+        }
+    }
+
+    pub fn get_ref(&self) -> &W {
+        &self.output
+    }
+
+    pub fn finish(mut self) -> io::Result<W> {
+        let mut buf = Vec::with_capacity(self.input.len() / 2);
+        deflate_compress(&mut std::io::Cursor::new(self.input), &mut buf, Some(self.level))?;
+        self.output.write_all(&buf)?;
+        Ok(self.output)
+    }
+}
+
+impl<W: Write> Write for DeflateStreamCompressor<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.input.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Write-adapter that accumulates input and produces zlib output on
+/// [`finish`](ZlibStreamCompressor::finish).
+pub struct ZlibStreamCompressor<W: Write = Vec<u8>> {
+    input: Vec<u8>,
+    output: W,
+    level: u32,
+}
+
+impl<W: Write> ZlibStreamCompressor<W> {
+    pub fn new(output: W, level: u32) -> Self {
+        Self {
+            input: Vec::new(),
+            output,
+            level,
+        }
+    }
+
+    pub fn get_ref(&self) -> &W {
+        &self.output
+    }
+
+    pub fn finish(mut self) -> io::Result<W> {
+        let mut buf = Vec::with_capacity(self.input.len() / 2);
+        zlib_compress(&mut std::io::Cursor::new(self.input), &mut buf, Some(self.level))?;
+        self.output.write_all(&buf)?;
+        Ok(self.output)
+    }
+}
+
+impl<W: Write> Write for ZlibStreamCompressor<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.input.extend_from_slice(buf);
+        Ok(buf.len())
+    }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
