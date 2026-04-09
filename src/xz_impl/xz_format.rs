@@ -523,10 +523,24 @@ pub(crate) fn decode_lzma2_dict_size(b: u8) -> io::Result<u32> {
 // =========================================================================
 
 /// Encode `input` as a complete .xz stream at the given preset and check.
-/// Currently emits a single block with a single LZMA2 filter.
+/// Convenience wrapper for callers that don't need fine-grained
+/// `LzmaOptions` control.
 pub fn encode_xz_stream(
     input: &[u8],
     preset: u32,
+    check: Check,
+    output: &mut Vec<u8>,
+) -> io::Result<()> {
+    let opts = super::options::LzmaOptions::new_preset(preset)?;
+    encode_xz_stream_with_options(input, &opts, check, output)
+}
+
+/// Encode `input` as a complete .xz stream using the given fully-resolved
+/// LZMA options + check.  Currently emits a single block with a single
+/// LZMA2 filter.
+pub fn encode_xz_stream_with_options(
+    input: &[u8],
+    opts: &super::options::LzmaOptions,
     check: Check,
     output: &mut Vec<u8>,
 ) -> io::Result<()> {
@@ -537,9 +551,8 @@ pub fn encode_xz_stream(
     output.extend_from_slice(&crc32(&stream_flags).to_le_bytes());
 
     // Encode the LZMA2 payload first; we need its size for the index.
-    let opts = super::options::LzmaOptions::new_preset(preset)?;
     let mut payload = Vec::new();
-    super::lzma::encode_lzma_to_lzma2(input, &opts, &mut payload)?;
+    super::lzma::encode_lzma_to_lzma2(input, opts, &mut payload)?;
 
     // ----- Block Header -----
     let dict_size_byte = encode_lzma2_dict_size(opts.dict_size);
