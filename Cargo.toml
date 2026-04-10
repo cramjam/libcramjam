@@ -112,6 +112,10 @@ harness = false
 name = "xz_bench"
 harness = false
 
+[[bench]]
+name = "summary"
+harness = false
+
 [profile.release]
 strip = true
 lto = "fat"
