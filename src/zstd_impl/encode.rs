@@ -272,9 +272,9 @@ const MAX_MATCH: usize = 65_536;
 const HASH_BITS: usize = 15;
 const HASH_SIZE: usize = 1 << HASH_BITS;
 const HASH_MASK: usize = HASH_SIZE - 1;
-/// Smaller hash table for the level-1 fast path — fewer collisions matter less
-/// when there's no chain to walk and the reset cost dominates a tiny call.
-const FAST_HASH_BITS: usize = 13;
+/// Level-1 fast path hash table.  Bigger = fewer collisions = more matches
+/// found.  128 KiB (2^15 × 4 bytes) is the same order as C zstd's level-1.
+const FAST_HASH_BITS: usize = 15;
 const FAST_HASH_SIZE: usize = 1 << FAST_HASH_BITS;
 const NONE: u32 = u32::MAX;
 /// Max distance for back references.
@@ -412,6 +412,43 @@ impl EncoderScratch {
     }
 }
 
+/// Update the parser's repeat-offset state after emitting a sequence.
+/// Mirrors the logic in `encode_offset` but only performs the state
+/// mutation — the return value is the zstd-encoded offset (not used by
+/// the parser, but useful for assertions).
+#[inline]
+fn update_rep(rep: &mut [u32; 3], offset: u32, lit_len: u32) {
+    // Delegate to encode_offset for the state mutation; discard the
+    // encoded value — we only want the side-effect on `rep`.
+    let _ = encode_offset(offset, lit_len, rep);
+}
+
+/// Try to match at `pos` using a repeat offset.  Returns (match_len, rep_index)
+/// of the best repeat match, or (0, 0) if none reaches MIN_MATCH.
+#[inline]
+fn try_rep_match(input: &[u8], pos: usize, rep: &[u32; 3]) -> (usize, usize) {
+    let len = input.len();
+    let max = MAX_MATCH.min(len - pos);
+    let mut best_len = 0usize;
+    let mut best_idx = 0usize;
+    for (ri, &r) in rep.iter().enumerate() {
+        let d = r as usize;
+        if d == 0 || d > pos {
+            continue;
+        }
+        let mp = pos - d;
+        // Quick 4-byte prefix test.
+        if pos + 4 <= len && mp + 4 <= len && u32_at(input, mp) == u32_at(input, pos) {
+            let mlen = 4 + count_common_bytes(input, mp + 4, pos + 4, max - 4);
+            if mlen > best_len {
+                best_len = mlen;
+                best_idx = ri;
+            }
+        }
+    }
+    (best_len, best_idx)
+}
+
 /// LZ77 parse over the entire input with per-level tuning.
 fn lz77_parse(input: &[u8], level: i32) -> ParsedBlock {
     if level <= 1 {
@@ -435,11 +472,26 @@ fn lz77_parse_general(input: &[u8], level: i32, scratch: &mut EncoderScratch) ->
     let head = &mut scratch.head;
     let prev = &mut scratch.prev;
     let chain_depth = cfg.chain_depth;
+    let mut rep = [1u32, 4, 8];
 
     let mut pos = 0usize;
     let mut lit_run_start = 0usize;
 
     while pos + 4 <= len {
+        // Check repeat offsets first — they're very cheap to encode.
+        let (rep_len, rep_idx) = try_rep_match(input, pos, &rep);
+        if rep_len >= MIN_MATCH {
+            let lit_len = (pos - lit_run_start) as u32;
+            let d = rep[rep_idx];
+            literals.extend_from_slice(&input[lit_run_start..pos]);
+            sequences.push(Sequence { lit_len, match_len: rep_len as u32, offset: d });
+            insert_hash(head, prev, input, pos);
+            update_rep(&mut rep, d, lit_len);
+            pos += rep_len;
+            lit_run_start = pos;
+            continue;
+        }
+
         // Find the best match at `pos`.
         let (best_off, best_len) = find_best_match(input, pos, head, prev, chain_depth);
 
@@ -468,6 +520,7 @@ fn lz77_parse_general(input: &[u8], level: i32, scratch: &mut EncoderScratch) ->
                 match_len: best_len as u32,
                 offset: best_off as u32,
             });
+            update_rep(&mut rep, best_off as u32, lit_len);
             let match_end = pos + best_len;
             // Make sure pos itself is hashed (lazy peek already did this).
             if !cfg.lazy {
@@ -526,13 +579,10 @@ fn insert_hash(head: &mut [u32], prev: &mut [u32], input: &[u8], pos: usize) {
 /// regions are O(N/step) instead of O(N).
 fn lz77_parse_fast(input: &[u8], scratch: &mut EncoderScratch) -> ParsedBlock {
     let len = input.len();
-    // Heuristic: at level 1 the literal stream is typically ~25% of input
-    // (depends on data), and we want to avoid the worst-case 100% allocation.
     let lit_cap = (len / 4).max(64);
     let mut sequences: Vec<Sequence> = Vec::with_capacity((len / 32).max(8));
     let mut literals: Vec<u8> = Vec::with_capacity(lit_cap);
 
-    // Need enough bytes for a 4-byte hash + lookahead.
     if len < MIN_MATCH + 4 {
         literals.extend_from_slice(input);
         return ParsedBlock { literals, sequences };
@@ -543,10 +593,13 @@ fn lz77_parse_fast(input: &[u8], scratch: &mut EncoderScratch) -> ParsedBlock {
     let head = scratch.fast_head.as_mut_slice();
     let gen = scratch.fast_gen.as_mut_slice();
 
+    // Parser-local repeat-offset state (mirrors the decoder's initial state).
+    let mut rep = [1u32, 4, 8];
+
     let mut lit_run_start = 0usize;
     let stop = len - 4;
 
-    // Seed position 0 so that position can be a back-reference target.
+    // Seed position 0.
     let v0 = u32_at(input, 0);
     let h0 = hash4_fast(v0);
     unsafe {
@@ -554,14 +607,64 @@ fn lz77_parse_fast(input: &[u8], scratch: &mut EncoderScratch) -> ParsedBlock {
         *gen.get_unchecked_mut(h0) = gen_now;
     }
 
+    /// Emit a repeat-offset continuation chain: keep matching at the current
+    /// position using rep offsets and emit lit_len=0 sequences.
+    ///
+    /// IMPORTANT: for lit_len=0 sequences, the zstd offset encoding is
+    /// shifted — code 1 means rep[1] (not rep[0]).  So we probe rep[1]
+    /// here: a match at rep[1] encodes as code 1 (cheapest), which also
+    /// swaps rep[0]/rep[1], putting the new match's offset into rep[0]
+    /// for the next iteration.
+    #[inline]
+    fn emit_rep_continuations(
+        input: &[u8], pos: &mut usize, stop: usize,
+        rep: &mut [u32; 3], sequences: &mut Vec<Sequence>,
+        lit_run_start: &mut usize,
+    ) {
+        while *pos <= stop {
+            // For lit_len == 0: code 1 → rep[1], code 2 → rep[2].
+            // Check rep[1] first (cheapest encoding).
+            let d = rep[1] as usize;
+            if d > 0 && d <= *pos && *pos + 4 <= input.len() {
+                let mp = *pos - d;
+                if u32_at(input, mp) == u32_at(input, *pos) {
+                    let max = MAX_MATCH.min(input.len() - *pos);
+                    let cont_len = 4 + count_common_bytes(input, mp + 4, *pos + 4, max - 4);
+                    if cont_len >= MIN_MATCH {
+                        let offset = d as u32;
+                        sequences.push(Sequence { lit_len: 0, match_len: cont_len as u32, offset });
+                        update_rep(rep, offset, 0);
+                        *pos += cont_len;
+                        *lit_run_start = *pos;
+                        continue;
+                    }
+                }
+            }
+            break;
+        }
+    }
+
     let mut pos = 1usize;
 
     while pos <= stop {
+        // --- 1. Check repeat offsets FIRST (they encode very cheaply) ---
+        let (rep_len, rep_idx) = try_rep_match(input, pos, &rep);
+        if rep_len >= MIN_MATCH {
+            let lit_len = (pos - lit_run_start) as u32;
+            let d = rep[rep_idx];
+            literals.extend_from_slice(&input[lit_run_start..pos]);
+            sequences.push(Sequence { lit_len, match_len: rep_len as u32, offset: d });
+            update_rep(&mut rep, d, lit_len);
+            pos += rep_len;
+            lit_run_start = pos;
+            emit_rep_continuations(input, &mut pos, stop, &mut rep, &mut sequences, &mut lit_run_start);
+            continue;
+        }
+
+        // --- 2. Hash lookup ---
         let v = u32_at(input, pos);
         let h = hash4_fast(v);
 
-        // Read the existing slot AND its generation.  If gen != gen_now the
-        // entry is stale and treated as empty.
         let (cand_pos, cand_gen) = unsafe {
             (*head.get_unchecked(h), *gen.get_unchecked(h))
         };
@@ -574,19 +677,11 @@ fn lz77_parse_fast(input: &[u8], scratch: &mut EncoderScratch) -> ParsedBlock {
             let mp = cand_pos as usize;
             let dist = pos - mp;
             if dist <= MAX_OFFSET && dist > 0 {
-                // u32 prefix compare — the bytes we just hashed.
                 let a = u32_at(input, mp);
                 if a == v {
-                    // Extend forward 8 bytes at a time using u64 XOR.
                     let max = MAX_MATCH.min(len - pos);
                     let mut mlen = 4 + count_common_bytes(input, mp + 4, pos + 4, max - 4);
 
-                    // Back-up: extend the match into preceding literal bytes
-                    // when they also match.  Stop AS SOON as mlen would
-                    // exceed MAX_MATCH — otherwise the post-loop cap can
-                    // shrink mlen below the forward match length and the
-                    // resulting `pos = start + mlen` walks backward,
-                    // causing an infinite loop.
                     let mut start = pos;
                     let mut back_mp = mp;
                     while start > lit_run_start
@@ -600,37 +695,49 @@ fn lz77_parse_fast(input: &[u8], scratch: &mut EncoderScratch) -> ParsedBlock {
                         mlen += 1;
                     }
                     debug_assert!(mlen <= MAX_MATCH);
-                    debug_assert!(start + mlen > pos, "back-up cap violated: start={}, mlen={}, pos={}", start, mlen, pos);
+                    debug_assert!(start + mlen > pos);
 
                     let lit_len = (start - lit_run_start) as u32;
                     literals.extend_from_slice(&input[lit_run_start..start]);
-                    sequences.push(Sequence {
-                        lit_len,
-                        match_len: mlen as u32,
-                        offset: dist as u32,
-                    });
+                    let d = (start - back_mp) as u32;
+                    sequences.push(Sequence { lit_len, match_len: mlen as u32, offset: d });
+                    update_rep(&mut rep, d, lit_len);
                     pos = start + mlen;
                     lit_run_start = pos;
+                    emit_rep_continuations(input, &mut pos, stop, &mut rep, &mut sequences, &mut lit_run_start);
                     continue;
                 }
             }
         }
 
-        // Skip-ahead: the longer the current literal run, the bigger the step.
+        // Skip-ahead with rep0 check at every visited position.  The hash
+        // lookup is skipped (that's the "fast" part) but the rep0 probe is
+        // just one 4-byte compare — nearly free.
         let miss_count = pos - lit_run_start;
         let step = 1 + (miss_count >> 6);
         pos += step;
+
+        // Check rep0 at the new (skipped-to) position.
+        if pos <= stop {
+            let (rep_len, rep_idx) = try_rep_match(input, pos, &rep);
+            if rep_len >= MIN_MATCH {
+                let lit_len = (pos - lit_run_start) as u32;
+                let d = rep[rep_idx];
+                literals.extend_from_slice(&input[lit_run_start..pos]);
+                sequences.push(Sequence { lit_len, match_len: rep_len as u32, offset: d });
+                update_rep(&mut rep, d, lit_len);
+                pos += rep_len;
+                lit_run_start = pos;
+                emit_rep_continuations(input, &mut pos, stop, &mut rep, &mut sequences, &mut lit_run_start);
+            }
+        }
     }
 
-    // Tail literals (no trailing sequence).
     if lit_run_start < len {
         literals.extend_from_slice(&input[lit_run_start..len]);
     }
 
-    ParsedBlock {
-        literals,
-        sequences,
-    }
+    ParsedBlock { literals, sequences }
 }
 
 #[inline(always)]

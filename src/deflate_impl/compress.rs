@@ -290,10 +290,32 @@ fn write_dynamic_block(
     while hlit > 257 && lit_lengths[hlit - 1] == 0 {
         hlit -= 1;
     }
+
+    // RFC 1951 requires the dist alphabet to encode at least one valid code.
+    // When a block has zero matches every dist length is 0 — that produces
+    // a degenerate canonical Huffman table that strict decoders (zlib,
+    // flate2) reject as "corrupt deflate stream", though our own decoder
+    // happens to accept it.  zlib's encoder sidesteps this by emitting two
+    // synthetic 1-bit dist codes that never get used in the bitstream
+    // (`zlib/trees.c::send_all_trees`).  Mirror that here: copy
+    // `dist_lengths` into a local buffer and patch positions 0 and 1 to 1
+    // when the original is all-zero.
+    let dist_owned: Vec<u8>;
+    let dist_lengths: &[u8] = if dist_lengths.iter().all(|&l| l == 0) {
+        let mut buf = vec![0u8; dist_lengths.len().max(2)];
+        buf[0] = 1;
+        buf[1] = 1;
+        dist_owned = buf;
+        &dist_owned
+    } else {
+        dist_lengths
+    };
+
     let mut hdist = dist_lengths.len();
     while hdist > 1 && dist_lengths[hdist - 1] == 0 {
         hdist -= 1;
     }
+
 
     // RLE-encode the combined code-length sequence.
     let mut combined: Vec<u8> = Vec::with_capacity(hlit + hdist);
