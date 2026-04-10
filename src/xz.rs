@@ -13,7 +13,8 @@ pub use crate::xz_impl::options::{
 };
 pub use crate::xz_impl::{XzStreamCompressor, XzStreamDecompressor};
 
-const DEFAULT_PRESET: u32 = 6;
+/// Default compression preset, matching C xz's `LZMA_PRESET_DEFAULT` = 6.
+pub const DEFAULT_COMPRESSION_LEVEL: u32 = 6;
 
 /// Decompress an XZ / LZMA stream from `input` into `output`.
 #[inline(always)]
@@ -49,7 +50,7 @@ pub fn compress<W: Write + ?Sized, R: Read>(
     filters: Option<impl Into<Filters>>,
     options: Option<impl Into<LzmaOptions>>,
 ) -> Result<usize> {
-    let preset = preset.unwrap_or(DEFAULT_PRESET);
+    let preset = preset.unwrap_or(DEFAULT_COMPRESSION_LEVEL);
     let format = format.map(Into::into).unwrap_or_default();
     let check = check.map(Into::into).unwrap_or_default();
 

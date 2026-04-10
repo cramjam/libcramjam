@@ -12,9 +12,9 @@ mod huf;
 
 use std::io::{self, Read, Write};
 
-/// Default zstd compression level — `1` means "use the entropy-coded path".
-/// Level 0 is reserved for raw-block (store-only) output.
-pub const DEFAULT_COMPRESSION_LEVEL: i32 = 1;
+/// Default zstd compression level, matching C zstd's `ZSTD_defaultCLevel()` = 3.
+/// Level 0 emits raw blocks (store-only); levels >= 1 use entropy coding.
+pub const DEFAULT_COMPRESSION_LEVEL: i32 = 3;
 
 /// Decompress a zstd frame.
 pub fn decompress<W: Write + ?Sized, R: Read>(

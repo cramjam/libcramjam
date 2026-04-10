@@ -1,7 +1,8 @@
 //! bzip2 de/compression interface — pure Rust implementation.
 use std::io::{Error, Read, Write};
 
-const DEFAULT_COMPRESSION_LEVEL: u32 = 6;
+/// Default compression level, matching C bzip2's default blockSize100k = 6.
+pub const DEFAULT_COMPRESSION_LEVEL: u32 = 6;
 
 pub use crate::bzip2_impl::Bzip2StreamCompressor;
 

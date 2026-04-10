@@ -1,7 +1,8 @@
 //! zstd de/compression interface
 use std::io::{Error, Read, Write};
 
-pub const DEFAULT_COMPRESSION_LEVEL: i32 = 0;
+/// Default compression level, matching C zstd's `ZSTD_defaultCLevel()` = 3.
+pub const DEFAULT_COMPRESSION_LEVEL: i32 = 3;
 
 pub use crate::zstd_impl::ZstdStreamCompressor;
 
