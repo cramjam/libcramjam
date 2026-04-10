@@ -7,7 +7,7 @@ use std::io::{Cursor, Read, Write};
 #[path = "../benches/common.rs"]
 mod common;
 
-const LEVELS: &[u32] = &[1, 6, 9];
+const LEVELS: &[u32] = &[1, 3, 6, 9];
 const TOL_PP: f64 = 10.0;
 
 fn ours_compress(data: &[u8], level: u32) -> Vec<u8> {

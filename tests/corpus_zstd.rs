@@ -19,12 +19,10 @@ mod common;
 const LEVELS: &[i32] = &[1, 3, 6, 9];
 
 /// Allowed gap between our compressed-ratio and C zstd's, in percentage
-/// points of the input size.  Bumped from the user's "5–10%" target to 25pp
-/// because our pure-Rust zstd has a known ratio gap — worst case so far is
-/// kppkn at level 1 (~21 pp).  See the project_zstd_ratio_gap memory.
-/// These tests are a regression net for catastrophic regressions; the gap
-/// itself is the subject of separate cleanup work.
-const TOL_PP: f64 = 25.0;
+/// points of the input size.  Worst case after custom-FSE + package-merge +
+/// hash/chain tuning is kppkn at level 1 (~8.2 pp).  Keep 10 pp as a
+/// regression net with headroom.
+const TOL_PP: f64 = 10.0;
 
 fn ours_compress(data: &[u8], level: i32) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());

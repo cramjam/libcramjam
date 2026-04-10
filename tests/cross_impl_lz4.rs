@@ -54,11 +54,32 @@ fn c_lz4_decompress(data: &[u8]) -> Vec<u8> {
     out
 }
 
+// --- C-backed lz4 at a specific level ---
+
+fn c_lz4_compress_at(data: &[u8], level: u32) -> Vec<u8> {
+    let mut enc = lz4::EncoderBuilder::new()
+        .level(level)
+        .auto_flush(true)
+        .build(Vec::new())
+        .unwrap();
+    use std::io::Write;
+    enc.write_all(data).unwrap();
+    let (out, r) = enc.finish();
+    r.unwrap();
+    out
+}
+
 // --- Our pure-Rust lz4 ---
 
 fn our_lz4_compress(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     libcramjam::lz4::compress(&mut Cursor::new(data), &mut out, None).unwrap();
+    out
+}
+
+fn our_lz4_compress_at(data: &[u8], level: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    libcramjam::lz4::compress(&mut Cursor::new(data), &mut out, Some(level)).unwrap();
     out
 }
 
@@ -133,5 +154,48 @@ fn our_compress_c_decompress() {
         let compressed = our_lz4_compress(&data);
         let decompressed = c_lz4_decompress(&compressed);
         assert_eq!(decompressed, data, "ours→c failed: corpus={name}");
+    }
+}
+
+// =========================================================================
+// Cross: level variation — both fast (L1) and HC (L3, L6, L9, L12)
+// =========================================================================
+
+#[test]
+fn our_compress_c_decompress_all_levels() {
+    let data = gen_text(100_000);
+    for level in [1, 3, 6, 9, 12] {
+        let compressed = our_lz4_compress_at(&data, level);
+        let decompressed = c_lz4_decompress(&compressed);
+        assert_eq!(
+            decompressed, data,
+            "ours(L{level})→c failed: text_100k"
+        );
+    }
+}
+
+#[test]
+fn c_compress_our_decompress_all_levels() {
+    let data = gen_text(100_000);
+    for level in [1, 4, 6, 9, 12] {
+        let compressed = c_lz4_compress_at(&data, level);
+        let decompressed = our_lz4_decompress(&compressed);
+        assert_eq!(
+            decompressed, data,
+            "c(L{level})→ours failed: text_100k"
+        );
+    }
+}
+
+#[test]
+fn self_roundtrip_all_levels() {
+    let data = gen_text(100_000);
+    for level in [1, 3, 6, 9, 12] {
+        let compressed = our_lz4_compress_at(&data, level);
+        let decompressed = our_lz4_decompress(&compressed);
+        assert_eq!(
+            decompressed, data,
+            "ours(L{level})→ours failed: text_100k"
+        );
     }
 }

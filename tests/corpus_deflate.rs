@@ -12,7 +12,10 @@ use std::io::{Cursor, Read, Write};
 #[path = "../benches/common.rs"]
 mod common;
 
-const LEVELS: &[u32] = &[1, 6, 9];
+/// L4 is the first level with dynamic Huffman blocks in our encoder.
+/// L2-3 use fixed Huffman (by design — simpler, faster) and have a
+/// known ~18pp gap vs flate2 which uses dynamic at every level.
+const LEVELS: &[u32] = &[1, 4, 6, 9];
 /// Allowed ratio gap vs flate2 in percentage points of input size.
 /// Matches the user's "≤10%" target.  L6/L9 are typically within 1-2pp;
 /// L1 is within ~9pp on the worst (tiny text) corpus file.

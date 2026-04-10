@@ -17,7 +17,7 @@ use std::io::{Cursor, Read, Write};
 #[path = "../benches/common.rs"]
 mod common;
 
-const LEVELS: &[u32] = &[1, 6, 9];
+const LEVELS: &[u32] = &[1, 3, 6, 9];
 /// Allowed ratio gap vs C lz4, in percentage points of input size.  Bumped
 /// from the user's "5–10%" target because our HC encoder doesn't yet
 /// implement match-finder optimizations like the second-chance / smaller
