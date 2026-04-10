@@ -304,27 +304,24 @@ impl HufEncoder {
             return None;
         }
 
-        // Distribute weights using ruzstd's "trivial" scheme: assign weights
-        // by rank (smallest count gets smallest weight) and limit to 11 bits.
-        let mut weights = distribute_weights(nonzero);
         const HUF_TABLELOG_MAX: usize = 11;
-        // Length-limit so that the resulting Huffman codes never exceed
-        // HUF_TABLELOG_MAX bits.  `redistribute_weights` is a no-op when the
-        // distribution already fits.
-        let length_limit = HUF_TABLELOG_MAX.min(highest_bit(nonzero as u32) as usize + 1).max(2);
-        redistribute_weights(&mut weights, length_limit);
 
-        // Sort the symbols by count ASCENDING — lowest frequency takes the
-        // longest code (smallest weight).  Stable secondary sort by symbol
-        // index makes the encode deterministic.
+        // Sort symbols by (frequency ascending, symbol ascending).
         let mut indexed: Vec<(usize, u32)> =
             counts.iter().copied().enumerate().filter(|(_, c)| *c > 0).collect();
         indexed.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
 
-        // Lay out symbol weights according to the sorted order.
+        // Compute optimal length-limited code lengths via package-merge.
+        let sorted_freqs: Vec<u32> = indexed.iter().map(|(_, f)| *f).collect();
+        let bit_lengths = package_merge_code_lengths(&sorted_freqs, HUF_TABLELOG_MAX);
+
+        // Convert bit lengths to zstd weights: weight = max_bits + 1 - bit_length.
+        let max_bits = *bit_lengths.iter().max().unwrap();
         let mut sym_weight = [0u8; 256];
-        for ((sym, _), w) in indexed.iter().zip(weights.iter()) {
-            sym_weight[*sym] = *w as u8;
+        for (i, &(sym, _)) in indexed.iter().enumerate() {
+            if bit_lengths[i] > 0 {
+                sym_weight[sym] = max_bits + 1 - bit_lengths[i];
+            }
         }
 
         Self::from_symbol_weights(&sym_weight, counts.len() - 1)
@@ -418,32 +415,101 @@ impl HufEncoder {
     }
 }
 
-/// Distribute weights for `count` distinct symbols such that the sum of
-/// `2^(weight - 1)` is a clean power of two.  Mirrors ruzstd's
-/// `distribute_weights`.
-fn distribute_weights(count: usize) -> Vec<u8> {
-    debug_assert!(count >= 2);
-    debug_assert!(count <= 256);
-    let mut weights: Vec<u8> = Vec::with_capacity(count);
-    weights.push(1);
-    weights.push(1);
+/// Compute optimal length-limited Huffman code lengths using the package-merge
+/// algorithm (Larmore & Hirschberg, 1990).
+///
+/// `sorted_freqs`: symbol frequencies sorted ascending, all > 0.
+/// `max_length`: maximum allowed code length (bits).
+///
+/// Returns bit lengths in the same order as `sorted_freqs`.
+/// The resulting code is complete (Kraft sum = 1) and optimal (minimum
+/// weighted path length subject to the length constraint).
+fn package_merge_code_lengths(sorted_freqs: &[u32], max_length: usize) -> Vec<u8> {
+    let n = sorted_freqs.len();
+    debug_assert!(n >= 2);
+    debug_assert!(n <= (1 << max_length), "too many symbols for max_length");
 
-    let mut target_weight: u8 = 1;
-    let mut weight_counter: u8 = 2;
+    let fresh: Vec<u64> = sorted_freqs.iter().map(|&f| f as u64).collect();
 
-    while weights.len() < count {
-        let mut add_new: usize = 1 << (weight_counter - target_weight);
-        let available = count - weights.len();
-        if add_new > available {
-            target_weight = weight_counter;
-            add_new = 1;
+    // Build sorted item lists at each level.
+    //
+    // Level 0 contains only the n fresh (single-symbol) items.  Each
+    // subsequent level merges n fresh items with *packages* formed by
+    // pairing consecutive items from the previous level.  Both sources
+    // are already sorted, so we merge in O(n).
+    let mut levels: Vec<Vec<(u64, bool)>> = Vec::with_capacity(max_length);
+
+    levels.push(fresh.iter().map(|&f| (f, false)).collect());
+
+    for l in 1..max_length {
+        let prev = &levels[l - 1];
+        let num_pkg = prev.len() / 2;
+
+        // Packages: pair items [0]+[1], [2]+[3], … from the previous level.
+        // Because `prev` is sorted, packages are also sorted (a[i]+a[i+1] is
+        // non-decreasing for non-decreasing a).
+        let mut packages: Vec<(u64, bool)> = Vec::with_capacity(num_pkg);
+        for i in 0..num_pkg {
+            packages.push((prev[2 * i].0 + prev[2 * i + 1].0, true));
         }
-        for _ in 0..add_new {
-            weights.push(target_weight);
+
+        // Two-pointer merge of fresh items (sorted) and packages (sorted).
+        let mut merged = Vec::with_capacity(n + num_pkg);
+        let (mut fi, mut pi) = (0usize, 0usize);
+        while fi < n && pi < num_pkg {
+            if fresh[fi] <= packages[pi].0 {
+                merged.push((fresh[fi], false));
+                fi += 1;
+            } else {
+                merged.push(packages[pi]);
+                pi += 1;
+            }
         }
-        weight_counter += 1;
+        while fi < n {
+            merged.push((fresh[fi], false));
+            fi += 1;
+        }
+        while pi < num_pkg {
+            merged.push(packages[pi]);
+            pi += 1;
+        }
+
+        levels.push(merged);
     }
-    weights
+
+    // Determine code lengths by walking levels from coarsest to finest.
+    //
+    // At the final level we select the 2*(n-1) cheapest items.  For each
+    // selected *fresh* item, the corresponding symbol (in frequency order)
+    // gets +1 to its code length.  For each selected *package*, we recurse:
+    // expand it into 2 items at the next-finer level.
+    let mut bit_lengths = vec![0u8; n];
+    let mut to_select = 2 * (n - 1);
+
+    for l in (0..max_length).rev() {
+        let level = &levels[l];
+        let actual = to_select.min(level.len());
+
+        let mut fresh_count = 0usize;
+        let mut pkg_count = 0usize;
+        for i in 0..actual {
+            if level[i].1 {
+                pkg_count += 1;
+            } else {
+                fresh_count += 1;
+            }
+        }
+
+        // The cheapest `fresh_count` symbols (in sorted order) get +1 bit.
+        for i in 0..fresh_count {
+            bit_lengths[i] += 1;
+        }
+
+        // Each selected package expands to 2 items at the finer level.
+        to_select = 2 * pkg_count;
+    }
+
+    bit_lengths
 }
 
 
@@ -596,7 +662,7 @@ fn encode_interleaved_2state(
 
 /// Write the FSE table description into a forward bitstream — the inverse of
 /// `FseTable::decode_table` from `fse.rs`.
-fn write_fse_table_description(
+pub(crate) fn write_fse_table_description(
     bw: &mut super::bits::ForwardBitWriter,
     weights: &[i16],
     accuracy_log: u32,
@@ -660,7 +726,7 @@ fn write_fse_table_description(
 /// resulting FSE table has no nb=0 slots.  Without this cap a state with 0
 /// transition bits lets the decoder iterate freely without consuming bits,
 /// causing the 2-state interleaved Huffman-weight decoder to over-emit.
-fn normalize_to_acc_log(counts: &[u32], target_sum: usize) -> Option<Vec<i16>> {
+pub(crate) fn normalize_to_acc_log(counts: &[u32], target_sum: usize) -> Option<Vec<i16>> {
     let total: u32 = counts.iter().sum();
     if total == 0 {
         return None;
@@ -716,58 +782,6 @@ fn normalize_to_acc_log(counts: &[u32], target_sum: usize) -> Option<Vec<i16>> {
     Some(norm)
 }
 
-/// Reduce weight variance until the encoded sum fits in `max_num_bits`.
-/// Mirrors ruzstd's `redistribute_weights`.
-fn redistribute_weights(weights: &mut [u8], max_num_bits: usize) {
-    let weight_sum_log = weights
-        .iter()
-        .copied()
-        .map(|x| 1u32 << x)
-        .sum::<u32>()
-        .ilog2() as usize;
-
-    if weight_sum_log < max_num_bits {
-        return;
-    }
-
-    let decrease_by = weight_sum_log - max_num_bits + 1;
-
-    let mut added: u32 = 0;
-    for w in weights.iter_mut() {
-        if (*w as usize) < decrease_by {
-            for add in (*w as usize)..decrease_by {
-                added += 1u32 << add;
-            }
-            *w = decrease_by as u8;
-        }
-    }
-
-    while added > 0 {
-        let mut current_idx = 0usize;
-        let mut current_weight: u8 = 0;
-        for (idx, &w) in weights.iter().enumerate() {
-            if (1u32 << (w - 1)) > added {
-                break;
-            }
-            if w > current_weight {
-                current_weight = w;
-                current_idx = idx;
-            }
-        }
-        if current_weight == 0 {
-            break;
-        }
-        added -= 1u32 << (current_weight - 1);
-        weights[current_idx] -= 1;
-    }
-
-    if weights[0] > 1 {
-        let off = weights[0] - 1;
-        for w in weights.iter_mut() {
-            *w -= off;
-        }
-    }
-}
 
 #[cfg(test)]
 mod encoder_tests {

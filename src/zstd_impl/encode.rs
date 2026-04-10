@@ -11,8 +11,10 @@ use std::sync::LazyLock;
 
 use super::bits::ForwardBitWriter;
 use super::fse::{
-    self, FseEncoder, LITLEN_TABLE, MATCHLEN_TABLE,
+    self, FseEncoder, FseTable, LITLEN_TABLE, MATCHLEN_TABLE,
+    PREDEFINED_LL_WEIGHTS, PREDEFINED_ML_WEIGHTS, PREDEFINED_OF_WEIGHTS,
 };
+use super::huf::{normalize_to_acc_log, write_fse_table_description};
 
 /// Cache the FSE encoder tables for the predefined LL/OF/ML distributions.
 /// They're constant per the spec, so building them once at first use saves
@@ -269,20 +271,20 @@ const MIN_MATCH: usize = 3;
 /// block whose decompressed size exceeds zstd's 128 KiB block-size limit and
 /// the C reference decoder rejects the frame as corrupted (RFC 8878 §3.1.1.2).
 const MAX_MATCH: usize = 65_536;
-const HASH_BITS: usize = 15;
+const HASH_BITS: usize = 17;
 const HASH_SIZE: usize = 1 << HASH_BITS;
 const HASH_MASK: usize = HASH_SIZE - 1;
 /// Level-1 fast path hash table.  Bigger = fewer collisions = more matches
 /// found.  128 KiB (2^15 × 4 bytes) is the same order as C zstd's level-1.
-const FAST_HASH_BITS: usize = 15;
+const FAST_HASH_BITS: usize = 17;
 const FAST_HASH_SIZE: usize = 1 << FAST_HASH_BITS;
 const NONE: u32 = u32::MAX;
 /// Max distance for back references.
 const MAX_OFFSET: usize = 1 << 20;
-/// Chain table size (must be a power of two).  Smaller than MAX_OFFSET so
-/// distant positions alias in the chain — the encoder verifies bytes anyway,
-/// so aliasing just means slightly less effective chain walking.
-const CHAIN_SIZE: usize = 1 << 16; // 64K entries → 256 KiB
+/// Chain table size (must be a power of two).  Positions that differ by more
+/// than CHAIN_SIZE alias in the table, losing older chain links.  128K entries
+/// covers most useful back-references and matches C zstd's chainLog=17 at L3-6.
+const CHAIN_SIZE: usize = 1 << 17; // 128K entries → 512 KiB
 const CHAIN_MASK: usize = CHAIN_SIZE - 1;
 
 #[inline]
@@ -315,17 +317,17 @@ fn lz_config(level: i32) -> LzConfig {
             insert_inside_match: false,
         },
         2..=3 => LzConfig {
-            chain_depth: 2,
+            chain_depth: 8,
             lazy: false,
             insert_inside_match: true,
         },
         4..=6 => LzConfig {
-            chain_depth: 4,
+            chain_depth: 24,
             lazy: true,
             insert_inside_match: true,
         },
         _ => LzConfig {
-            chain_depth: 8,
+            chain_depth: 64,
             lazy: true,
             insert_inside_match: true,
         },
@@ -454,6 +456,10 @@ fn lz77_parse(input: &[u8], level: i32) -> ParsedBlock {
     if level <= 1 {
         return SCRATCH.with(|s| lz77_parse_fast(input, &mut s.borrow_mut()));
     }
+    // NOTE: lz77_parse_optimal exists but its price model is too rough to
+    // beat the tuned general parser — it needs per-block FSE cost estimates
+    // and rep-offset tracking within the DP window.  Disabled until those
+    // are implemented.
     SCRATCH.with(|s| lz77_parse_general(input, level, &mut s.borrow_mut()))
 }
 
@@ -526,14 +532,17 @@ fn lz77_parse_general(input: &[u8], level: i32, scratch: &mut EncoderScratch) ->
             if !cfg.lazy {
                 insert_hash(head, prev, input, pos);
             }
-            // Insert hashes inside the match.  For long matches we cap the
-            // number of insertions — chasing every byte of a 64 KiB match
-            // costs the bulk of compression time and yields little.
-            if cfg.insert_inside_match && best_len < 64 {
-                let mut p = pos + 1;
-                while p + 4 <= len && p < match_end {
-                    insert_hash(head, prev, input, p);
-                    p += 1;
+            // Insert hashes inside the match so future positions can
+            // chain through them.  Cap insertions to avoid O(N) cost on
+            // very long matches (64 KiB+).
+            if cfg.insert_inside_match {
+                let insert_limit = if chain_depth >= 24 { 512 } else { 64 };
+                if best_len < insert_limit {
+                    let mut p = pos + 1;
+                    while p + 4 <= len && p < match_end {
+                        insert_hash(head, prev, input, p);
+                        p += 1;
+                    }
                 }
             }
             pos = match_end;
@@ -553,6 +562,325 @@ fn lz77_parse_general(input: &[u8], level: i32, scratch: &mut EncoderScratch) ->
         literals,
         sequences,
     }
+}
+
+// =========================================================================
+// Optimal parser — forward DP with limited-window lookahead (L7+)
+// Disabled: the price model needs per-block FSE costs and rep-offset
+// tracking within windows to beat the tuned greedy/lazy parser.
+// =========================================================================
+
+#[allow(dead_code)]
+/// Window size for the forward DP.  Larger = better decisions but slower.
+const OPT_WINDOW: usize = 64;
+#[allow(dead_code)]
+/// Max chain depth for match finding INSIDE the DP.  Kept lower than the
+/// outer encoder's chain_depth to bound DP cost: each window position does
+/// one chain walk of up to this depth.
+const OPT_CHAIN_DEPTH: usize = 16;
+
+/// DP table entry.  Tracks the best known way to reach this position.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct OptNode {
+    /// Total cost (in approximate bits) to encode from the window start.
+    cost: u32,
+    /// How we reached this position: 0 = literal, >0 = match of this length.
+    mlen: u32,
+    /// Offset for the match (valid only when mlen > 0).
+    off: u32,
+    /// Number of literal bytes accumulated before the match at this node.
+    lits: u32,
+}
+
+impl Default for OptNode {
+    fn default() -> Self {
+        Self { cost: u32::MAX, mlen: 0, off: 0, lits: 0 }
+    }
+}
+
+#[allow(dead_code)]
+/// Estimate the cost (in bits) of a sequence header: LL code + OF code + ML code.
+/// This does NOT include the literal bytes themselves (those are accounted for
+/// separately as LIT_COST per byte).
+#[inline]
+fn seq_price(lit_len: u32, offset_value: u32, match_len: u32) -> u32 {
+    // LL: FSE state transition (~5 bits) + extra bits from the code table.
+    let (_, ll_eb, _) = ll_code(lit_len);
+    // OF: FSE state transition (~5 bits) + floor(log2(offset_value)) extra bits.
+    let of_bits = 32 - offset_value.max(1).leading_zeros();
+    // ML: FSE state transition (~5 bits) + extra bits.
+    let (_, ml_eb, _) = ml_code(match_len);
+    // Total: 3 FSE updates (~15 bits) + extra bits.
+    15 + ll_eb as u32 + of_bits + ml_eb as u32
+}
+
+#[allow(dead_code)]
+/// Approximate bits per literal byte.
+const LIT_COST: u32 = 8;
+
+#[allow(dead_code)]
+/// Try a match of length `mlen` at offset `off` from DP position `i`.
+/// Updates the DP table for the full match length and a few shorter lengths.
+#[inline]
+fn opt_try_match(
+    opt: &mut [OptNode], i: usize, wlen: usize, off: u32, mlen: usize,
+    cur_cost: u32, cur_lits: u32, ov: u32,
+) {
+    // Try the full match length and shorter lengths down to MIN_MATCH.
+    // For very long matches, only try a few lengths near the top and bottom
+    // to keep the loop bounded.
+    let min_try = if mlen > 16 { mlen - 8 } else { MIN_MATCH };
+    for ml in (min_try..=mlen).rev() {
+        let end = i + ml;
+        if end > wlen {
+            continue;
+        }
+        let cost = cur_cost + seq_price(cur_lits, ov, ml as u32);
+        if cost < opt[end].cost {
+            opt[end] = OptNode {
+                cost,
+                mlen: ml as u32,
+                off,
+                lits: 0,
+            };
+        }
+    }
+    // Also try MIN_MATCH if we didn't reach it above.
+    if min_try > MIN_MATCH {
+        let end = i + MIN_MATCH;
+        if end <= wlen {
+            let cost = cur_cost + seq_price(cur_lits, ov, MIN_MATCH as u32);
+            if cost < opt[end].cost {
+                opt[end] = OptNode {
+                    cost,
+                    mlen: MIN_MATCH as u32,
+                    off,
+                    lits: 0,
+                };
+            }
+        }
+    }
+}
+
+/// Forward-DP optimal parser.  Processes the input in overlapping windows of
+/// `OPT_WINDOW` positions, selecting minimum-cost parse decisions.
+#[allow(dead_code)]
+fn lz77_parse_optimal(input: &[u8], level: i32, scratch: &mut EncoderScratch) -> ParsedBlock {
+    let len = input.len();
+    let cfg = lz_config(level);
+    let mut sequences: Vec<Sequence> = Vec::with_capacity(len / 16);
+    let mut literals: Vec<u8> = Vec::with_capacity(len);
+
+    if len < MIN_MATCH + 4 {
+        literals.extend_from_slice(input);
+        return ParsedBlock { literals, sequences };
+    }
+
+    scratch.reset_generic(cfg.chain_depth > 1);
+    let head = &mut scratch.head;
+    let prev = &mut scratch.prev;
+    let chain_depth = cfg.chain_depth;
+    let mut rep = [1u32, 4, 8];
+
+    let mut pos = 0usize;
+    let mut lit_run_start = 0usize;
+    let mut opt_buf = vec![OptNode::default(); OPT_WINDOW + 1];
+
+    while pos + 4 <= len {
+        // Quick check: is there any match here at all?
+        // Search BEFORE hashing pos — if we hash first, pos itself
+        // becomes the chain head and find_best_match breaks immediately.
+        let (_, best_len) = find_best_match(input, pos, head, prev, chain_depth);
+        let (rep_len, _) = try_rep_match(input, pos, &rep);
+        if best_len < MIN_MATCH && rep_len < MIN_MATCH {
+            insert_hash(head, prev, input, pos);
+            pos += 1;
+            continue;
+        }
+
+        // There's at least one match — run the DP window from here.
+        let window_end = (pos + OPT_WINDOW).min(len);
+        let wlen = window_end - pos;
+
+        // Reset the DP table.
+        for i in 0..=wlen {
+            opt_buf[i] = OptNode::default();
+        }
+        opt_buf[0] = OptNode { cost: 0, mlen: 0, off: 0, lits: 0 };
+
+        for i in 0..wlen {
+            if opt_buf[i].cost == u32::MAX {
+                // Still hash this position so later positions can find it.
+                let ip = pos + i;
+                if ip + 4 <= len {
+                    insert_hash(head, prev, input, ip);
+                }
+                continue;
+            }
+            let ip = pos + i;
+
+            let cur_cost = opt_buf[i].cost;
+            let cur_lits = opt_buf[i].lits;
+
+            // Option 1: emit a literal at position ip.
+            if i + 1 <= wlen {
+                let new_cost = cur_cost + LIT_COST;
+                if new_cost < opt_buf[i + 1].cost {
+                    opt_buf[i + 1] = OptNode {
+                        cost: new_cost,
+                        mlen: 0,
+                        off: 0,
+                        lits: cur_lits + 1,
+                    };
+                }
+            }
+
+            if ip + 4 > len {
+                continue; // can't hash or match with < 4 bytes
+            }
+
+            // Option 2: repeat-offset matches at position ip.
+            for ri in 0..3 {
+                let d = rep[ri] as usize;
+                if d == 0 || d > ip {
+                    continue;
+                }
+                let mp = ip - d;
+                if mp + 4 <= len && u32_at(input, mp) == u32_at(input, ip) {
+                    let max = MAX_MATCH.min(len - ip);
+                    let mlen = 4 + count_common_bytes(input, mp + 4, ip + 4, max - 4);
+                    let ov = encode_offset_value(d as u32, cur_lits, &rep);
+                    // Try full length and a few shorter.
+                    opt_try_match(&mut opt_buf, i, wlen, d as u32, mlen,
+                                  cur_cost, cur_lits, ov);
+                }
+            }
+
+            // Option 3: walk the hash chain to find MULTIPLE matches at
+            // different offsets.  Each chain entry that extends the best
+            // known length is a new candidate for the DP.
+            if ip + 4 <= len {
+                let h = hash4(&input[ip..]);
+                let mut cand = head[h];
+                let mut chain_left = OPT_CHAIN_DEPTH;
+                let mut prev_best = 0usize;
+
+                while cand != NONE && chain_left > 0 {
+                    let mp = cand as usize;
+                    if mp >= ip {
+                        break;
+                    }
+                    let dist = ip - mp;
+                    if dist > MAX_OFFSET || dist == 0 {
+                        break;
+                    }
+                    if u32_at(input, mp) == u32_at(input, ip) {
+                        let max_ml = MAX_MATCH.min(len - ip);
+                        let mlen = 4 + count_common_bytes(
+                            input, mp + 4, ip + 4, max_ml - 4,
+                        );
+                        // Only consider if this match extends beyond previous
+                        // candidates (otherwise it's strictly dominated).
+                        if mlen > prev_best {
+                            let ov = encode_offset_value(
+                                dist as u32, cur_lits, &rep,
+                            );
+                            opt_try_match(
+                                &mut opt_buf, i, wlen, dist as u32, mlen,
+                                cur_cost, cur_lits, ov,
+                            );
+                            prev_best = mlen;
+                            if mlen >= max_ml {
+                                break;
+                            }
+                        }
+                    }
+                    if prev.is_empty() {
+                        break;
+                    }
+                    cand = prev[mp & CHAIN_MASK];
+                    chain_left -= 1;
+                }
+            }
+
+            // Hash ip AFTER all match finding is done, so the next
+            // iteration (at ip+1) can find ip in the chain.
+            insert_hash(head, prev, input, ip);
+        }
+
+        // Pick the end of the window: the furthest position that the DP
+        // reached.  This always processes the full window (or as far as
+        // we can get), avoiding the problem of committing to tiny chunks.
+        let mut best_end = wlen;
+        while best_end > 0 && opt_buf[best_end].cost == u32::MAX {
+            best_end -= 1;
+        }
+        if best_end == 0 {
+            // No match reachable (shouldn't happen since we checked above).
+            pos += 1;
+            continue;
+        }
+
+        // Backtrack through the DP to reconstruct the parse decisions.
+        let mut decisions: Vec<(u32, u32)> = Vec::new();
+        let mut i = best_end;
+        while i > 0 {
+            let node = opt_buf[i];
+            if node.mlen > 0 {
+                decisions.push((node.mlen, node.off));
+                i -= node.mlen as usize;
+            } else {
+                decisions.push((0, 0));
+                i -= 1;
+            }
+        }
+        decisions.reverse();
+
+        // Emit the decisions as sequences + literals.
+        let mut dpos = pos;
+        for &(mlen, off) in &decisions {
+            if mlen == 0 {
+                dpos += 1;
+            } else {
+                let lit_len = (dpos - lit_run_start) as u32;
+                literals.extend_from_slice(&input[lit_run_start..dpos]);
+                sequences.push(Sequence {
+                    lit_len,
+                    match_len: mlen,
+                    offset: off,
+                });
+                update_rep(&mut rep, off, lit_len);
+                dpos += mlen as usize;
+                lit_run_start = dpos;
+            }
+        }
+        pos = dpos;
+    }
+
+    // Tail literals.
+    if lit_run_start < len {
+        literals.extend_from_slice(&input[lit_run_start..len]);
+    }
+
+    ParsedBlock { literals, sequences }
+}
+
+/// Compute the offset_value the decoder would see, WITHOUT mutating rep state.
+/// Used by the price estimator in the optimal parser.
+#[allow(dead_code)]
+#[inline]
+fn encode_offset_value(offset: u32, lit_len: u32, rep: &[u32; 3]) -> u32 {
+    if lit_len > 0 {
+        if offset == rep[0] { return 1; }
+        if offset == rep[1] { return 2; }
+        if offset == rep[2] { return 3; }
+    } else {
+        if offset == rep[1] { return 1; }
+        if offset == rep[2] { return 2; }
+        if offset + 1 == rep[0] { return 3; }
+    }
+    offset + 3
 }
 
 #[inline]
@@ -1177,8 +1505,119 @@ fn encode_offset(offset: u32, lit_len: u32, rep: &mut [u32; 3]) -> u32 {
 }
 
 // -------------------------------------------------------------------------
-// Step 4: Sequence section encoder (predefined FSE tables, mode = 00)
+// Step 4: Sequence section encoder with FSE mode selection
 // -------------------------------------------------------------------------
+
+/// Which FSE compression mode to use for a sequence symbol stream.
+enum SeqFseChoice {
+    /// Mode 00: predefined FSE table from RFC 8878.
+    Predefined,
+    /// Mode 01: single repeated symbol (RLE).
+    Rle(u8),
+    /// Mode 10: custom FSE table built from actual symbol frequencies.
+    Custom {
+        encoder: FseEncoder,
+        table_desc: Vec<u8>,
+    },
+}
+
+/// Estimate the total bit cost of encoding `counts` with an FSE table
+/// described by `weights` at the given accuracy log.  Returns the
+/// approximate number of bits the FSE bitstream would use (excluding
+/// table description overhead).
+fn estimate_fse_bits(counts: &[u32], weights: &[i16], accuracy_log: u32) -> u64 {
+    let mut bits: u64 = 0;
+    for (i, &c) in counts.iter().enumerate() {
+        if c == 0 {
+            continue;
+        }
+        let w = if i < weights.len() { weights[i] } else { 0 };
+        if w == 0 {
+            // Symbol not in the table — predefined can't encode this.
+            return u64::MAX;
+        }
+        let w_eff = if w == -1 { 1u32 } else { w as u32 };
+        // Average bits per symbol ≈ accuracy_log - floor(log2(weight))
+        let nb = accuracy_log - (31 - w_eff.leading_zeros());
+        bits += c as u64 * nb as u64;
+    }
+    // Initial state bits
+    bits += accuracy_log as u64;
+    bits
+}
+
+/// Choose the best FSE compression mode for one symbol stream.
+///
+/// Returns `(mode_bits, choice)` where `mode_bits` is the 2-bit mode
+/// value for the Symbol_Compression_Modes byte (00/01/10).
+fn choose_seq_fse_mode(
+    counts: &[u32],
+    num_symbols: usize,
+    predefined_weights: &[i16],
+    predefined_al: u32,
+    max_al: u32,
+) -> (u8, SeqFseChoice) {
+    // Find distinct symbols with non-zero count.
+    let distinct: Vec<usize> = counts.iter().enumerate()
+        .filter(|(_, &c)| c > 0)
+        .map(|(i, _)| i)
+        .collect();
+
+    if distinct.is_empty() {
+        // No symbols — shouldn't happen, but predefined is safe.
+        return (0, SeqFseChoice::Predefined);
+    }
+
+    // RLE mode: only one distinct symbol.
+    if distinct.len() == 1 {
+        return (1, SeqFseChoice::Rle(distinct[0] as u8));
+    }
+
+    let total: u32 = counts.iter().sum();
+
+    // Choose accuracy log: use predefined default, scale up for large blocks.
+    let al = if total >= 2048 {
+        max_al.min(predefined_al + 2)
+    } else if total >= 512 {
+        max_al.min(predefined_al + 1)
+    } else {
+        predefined_al
+    };
+
+    // Trim trailing zeros from counts for normalization.
+    let max_sym = counts.iter().rposition(|&c| c > 0).unwrap_or(0) + 1;
+    let max_sym = max_sym.max(num_symbols.min(counts.len()));
+
+    // Normalize and build custom table.
+    let table_size = 1usize << al;
+    let norm = match normalize_to_acc_log(&counts[..max_sym], table_size) {
+        Some(n) => n,
+        None => return (0, SeqFseChoice::Predefined),
+    };
+
+    // Serialize the FSE table description.
+    let mut desc_bw = ForwardBitWriter::new();
+    write_fse_table_description(&mut desc_bw, &norm, al);
+    let table_desc = desc_bw.finalize_no_sentinel();
+
+    // Build encoder from the custom table.
+    let dec = match FseTable::from_weights(&norm, al) {
+        Ok(t) => t,
+        Err(_) => return (0, SeqFseChoice::Predefined),
+    };
+    let encoder = FseEncoder::from_decoder(&dec, max_sym);
+
+    // Cost comparison: predefined vs custom.
+    let predefined_bits = estimate_fse_bits(counts, predefined_weights, predefined_al);
+    let custom_bits = estimate_fse_bits(&counts[..max_sym], &norm, al);
+    let custom_total = custom_bits.saturating_add(table_desc.len() as u64 * 8);
+
+    if custom_total < predefined_bits {
+        (2, SeqFseChoice::Custom { encoder, table_desc })
+    } else {
+        (0, SeqFseChoice::Predefined)
+    }
+}
 
 fn encode_sequences_section(seqs: &[Sequence], rep_offsets: &mut [u32; 3]) -> Option<Vec<u8>> {
     let n = seqs.len();
@@ -1196,14 +1635,6 @@ fn encode_sequences_section(seqs: &[Sequence], rep_offsets: &mut [u32; 3]) -> Op
         out.push((v & 0xFF) as u8);
         out.push((v >> 8) as u8);
     }
-
-    // Symbol_Compression_Modes byte: ll=00, of=00, ml=00, reserved=00.
-    out.push(0);
-
-    // Cached FSE encoder tables for the predefined distributions.
-    let ll_enc: &FseEncoder = &PREDEFINED_LL_ENC;
-    let of_enc: &FseEncoder = &PREDEFINED_OF_ENC;
-    let ml_enc: &FseEncoder = &PREDEFINED_ML_ENC;
 
     // Pre-compute (code, extra_bits, extra_value) for every sequence,
     // applying repeat-offset substitution along the way.  `rep_offsets` is
@@ -1223,10 +1654,119 @@ fn encode_sequences_section(seqs: &[Sequence], rep_offsets: &mut [u32; 3]) -> Op
         })
         .collect();
 
-    // Encoder writes to a forward bitstream.  In encoder time we process the
-    // LAST sequence first; the decoder reads MSB-first from the end which
-    // recovers them in input order.
-    let mut bw = ForwardBitWriter::with_capacity(seqs.len() * 4);
+    // Count symbol frequencies for each stream.
+    let mut ll_freq = [0u32; 36];
+    let mut of_freq = [0u32; 32];
+    let mut ml_freq = [0u32; 53];
+    for (of_c, ml_c, ll_c) in &codes {
+        ll_freq[ll_c.code as usize] += 1;
+        of_freq[of_c.code as usize] += 1;
+        ml_freq[ml_c.code as usize] += 1;
+    }
+
+    // Choose best FSE mode for each stream.
+    let (ll_mode, ll_choice) = choose_seq_fse_mode(
+        &ll_freq, 36, &PREDEFINED_LL_WEIGHTS, 6, 9,
+    );
+    let (of_mode, of_choice) = choose_seq_fse_mode(
+        &of_freq, 32, &PREDEFINED_OF_WEIGHTS, 5, 8,
+    );
+    let (ml_mode, ml_choice) = choose_seq_fse_mode(
+        &ml_freq, 53, &PREDEFINED_ML_WEIGHTS, 6, 9,
+    );
+
+    // Symbol_Compression_Modes byte: [LL_Mode:2][OF_Mode:2][ML_Mode:2][Reserved:2]
+    let mode_byte = (ll_mode << 6) | (of_mode << 4) | (ml_mode << 2);
+    out.push(mode_byte);
+
+    // Write table descriptions / RLE symbols in order: LL, OF, ML.
+    for choice in [&ll_choice, &of_choice, &ml_choice] {
+        match choice {
+            SeqFseChoice::Rle(sym) => out.push(*sym),
+            SeqFseChoice::Custom { table_desc, .. } => out.extend_from_slice(table_desc),
+            SeqFseChoice::Predefined => {}
+        }
+    }
+
+    // Get the actual encoder references for the bitstream.
+    // If any stream uses RLE, we need to build temporary encoders.
+    let has_rle = matches!(ll_choice, SeqFseChoice::Rle(_))
+        || matches!(of_choice, SeqFseChoice::Rle(_))
+        || matches!(ml_choice, SeqFseChoice::Rle(_));
+
+    if has_rle {
+        return encode_sequences_with_rle(out, &codes, n,
+            &ll_choice, &of_choice, &ml_choice);
+    }
+
+    let ll_enc: &FseEncoder = match &ll_choice {
+        SeqFseChoice::Predefined => &PREDEFINED_LL_ENC,
+        SeqFseChoice::Custom { encoder, .. } => encoder,
+        SeqFseChoice::Rle(_) => unreachable!(),
+    };
+    let of_enc: &FseEncoder = match &of_choice {
+        SeqFseChoice::Predefined => &PREDEFINED_OF_ENC,
+        SeqFseChoice::Custom { encoder, .. } => encoder,
+        SeqFseChoice::Rle(_) => unreachable!(),
+    };
+    let ml_enc: &FseEncoder = match &ml_choice {
+        SeqFseChoice::Predefined => &PREDEFINED_ML_ENC,
+        SeqFseChoice::Custom { encoder, .. } => encoder,
+        SeqFseChoice::Rle(_) => unreachable!(),
+    };
+
+    encode_bitstream(&mut out, &codes, n, ll_enc, of_enc, ml_enc);
+    Some(out)
+}
+
+/// Build an FseEncoder for a single RLE symbol.
+fn make_rle_encoder(sym: u8, num_symbols: usize) -> FseEncoder {
+    let dec = fse::fse_rle_table(sym);
+    FseEncoder::from_decoder(&dec, num_symbols)
+}
+
+/// Fallback path when any stream uses RLE mode — we can't borrow the RLE
+/// encoder from the enum variant, so we construct temporary encoders here.
+fn encode_sequences_with_rle(
+    mut out: Vec<u8>,
+    codes: &[(SeqCodes, SeqCodes, SeqCodes)],
+    n: usize,
+    ll_choice: &SeqFseChoice,
+    of_choice: &SeqFseChoice,
+    ml_choice: &SeqFseChoice,
+) -> Option<Vec<u8>> {
+    let ll_rle;
+    let of_rle;
+    let ml_rle;
+    let ll_enc: &FseEncoder = match ll_choice {
+        SeqFseChoice::Predefined => &PREDEFINED_LL_ENC,
+        SeqFseChoice::Custom { encoder, .. } => encoder,
+        SeqFseChoice::Rle(sym) => { ll_rle = make_rle_encoder(*sym, 36); &ll_rle }
+    };
+    let of_enc: &FseEncoder = match of_choice {
+        SeqFseChoice::Predefined => &PREDEFINED_OF_ENC,
+        SeqFseChoice::Custom { encoder, .. } => encoder,
+        SeqFseChoice::Rle(sym) => { of_rle = make_rle_encoder(*sym, 32); &of_rle }
+    };
+    let ml_enc: &FseEncoder = match ml_choice {
+        SeqFseChoice::Predefined => &PREDEFINED_ML_ENC,
+        SeqFseChoice::Custom { encoder, .. } => encoder,
+        SeqFseChoice::Rle(sym) => { ml_rle = make_rle_encoder(*sym, 53); &ml_rle }
+    };
+    encode_bitstream(&mut out, codes, n, ll_enc, of_enc, ml_enc);
+    Some(out)
+}
+
+/// Encode the FSE bitstream for sequences using the given encoder tables.
+fn encode_bitstream(
+    out: &mut Vec<u8>,
+    codes: &[(SeqCodes, SeqCodes, SeqCodes)],
+    n: usize,
+    ll_enc: &FseEncoder,
+    of_enc: &FseEncoder,
+    ml_enc: &FseEncoder,
+) {
+    let mut bw = ForwardBitWriter::with_capacity(n * 4);
 
     // Initial encoder states pinned to the LAST sequence's symbols.
     let last = codes.last().unwrap();
@@ -1234,18 +1774,11 @@ fn encode_sequences_section(seqs: &[Sequence], rep_offsets: &mut [u32; 3]) -> Op
     let mut state_ml = ml_enc.start_state(last.1.code);
     let mut state_ll = ll_enc.start_state(last.2.code);
 
-    // -- Last sequence in encoder time = first encoded.  Only its EXTRA bits go
-    //    out (no preceding state-update bits).  Decoder reads of_extra → ml_extra
-    //    → ll_extra in this order, so encoder writes them in the REVERSE order:
-    //    ll_extra first, then ml_extra, then of_extra.
+    // Last sequence in encoder time = first encoded.  Only its EXTRA bits go
+    // out (no preceding state-update bits).
     write_extra_lmo(&mut bw, &last.2, &last.1, &last.0);
 
-    // -- Walk all preceding sequences in REVERSE encoder time.  For each one,
-    //    we (a) emit the state-update bits to "rewind" from sequence (i+1) to
-    //    sequence (i), then (b) emit the extra bits for sequence (i).
-    //
-    //    Decoder bit order between two sequences is ll_update → ml_update →
-    //    of_update; encoder writes them in REVERSE: of, ml, ll.
+    // Walk all preceding sequences in REVERSE encoder time.
     for i in (0..n - 1).rev() {
         let (of_c, ml_c, ll_c) = &codes[i];
         state_of = of_enc.encode_symbol(state_of, of_c.code, &mut bw);
@@ -1254,15 +1787,13 @@ fn encode_sequences_section(seqs: &[Sequence], rep_offsets: &mut [u32; 3]) -> Op
         write_extra_lmo(&mut bw, ll_c, ml_c, of_c);
     }
 
-    // -- Initial states.  Decoder reads ll → of → ml; encoder writes ml → of → ll.
+    // Initial states.  Decoder reads ll → of → ml; encoder writes ml → of → ll.
     bw.write_bits(state_ml as u64, ml_enc.accuracy_log);
     bw.write_bits(state_of as u64, of_enc.accuracy_log);
     bw.write_bits(state_ll as u64, ll_enc.accuracy_log);
 
     let bitstream = bw.finalize();
     out.extend_from_slice(&bitstream);
-
-    Some(out)
 }
 
 #[derive(Clone, Copy)]

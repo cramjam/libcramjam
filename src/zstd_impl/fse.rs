@@ -241,37 +241,40 @@ fn highest_bit(v: u32) -> u32 {
 // Predefined FSE tables (RFC 8878 Appendix A)
 // ---------------------------------------------------------------------------
 
+/// Predefined Literals Length weights (RFC 8878 Appendix A, Table 14).
+pub(crate) static PREDEFINED_LL_WEIGHTS: [i16; 36] = [
+    4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
+    -1, -1, -1, -1,
+];
+
+/// Predefined Match Length weights (RFC 8878 Appendix A, Table 16).
+pub(crate) static PREDEFINED_ML_WEIGHTS: [i16; 53] = [
+    1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1,
+    -1, -1, -1, -1, -1,
+];
+
+/// Predefined Offset weights (RFC 8878 Appendix A, Table 18).
+pub(crate) static PREDEFINED_OF_WEIGHTS: [i16; 29] = [
+    1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
+];
+
 /// Build the predefined Literals Length FSE table (accuracy_log = 6).
 pub fn predefined_litlen_table() -> FseTable {
-    // From RFC 8878 Appendix A, Table 14.
-    static WEIGHTS: [i16; 36] = [
-        4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1,
-        2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
-        -1, -1, -1, -1,
-    ];
-    FseTable::from_weights(&WEIGHTS, 6).unwrap()
+    FseTable::from_weights(&PREDEFINED_LL_WEIGHTS, 6).unwrap()
 }
 
 /// Build the predefined Match Length FSE table (accuracy_log = 6).
 pub fn predefined_matchlen_table() -> FseTable {
-    // From RFC 8878 Appendix A, Table 16.
-    static WEIGHTS: [i16; 53] = [
-        1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
-        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1,
-        -1, -1, -1, -1, -1,
-    ];
-    FseTable::from_weights(&WEIGHTS, 6).unwrap()
+    FseTable::from_weights(&PREDEFINED_ML_WEIGHTS, 6).unwrap()
 }
 
 /// Build the predefined Offset FSE table (accuracy_log = 5).
 pub fn predefined_offset_table() -> FseTable {
-    // From RFC 8878 Appendix A, Table 18.
-    static WEIGHTS: [i16; 29] = [
-        1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
-        1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1,
-    ];
-    FseTable::from_weights(&WEIGHTS, 5).unwrap()
+    FseTable::from_weights(&PREDEFINED_OF_WEIGHTS, 5).unwrap()
 }
 
 // ---------------------------------------------------------------------------
