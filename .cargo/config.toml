@@ -1,4 +1,17 @@
-# Local development config: enable AVX2 + BMI2 for SIMD codegen.
-# For production wheels, use multiversion or per-target rustflags instead.
+# Build configuration.
+#
+# `-Cllvm-args=-enable-dfa-jump-thread` — enables LLVM's DFA jump threading
+# pass.  Rust's `match` has no C-style fallthrough, so LLVM by default
+# dispatches every state-machine iteration through a jump table.  This flag
+# threads direct jumps between states, which recovers ~10% on inflate-style
+# and zstd frame/block decoders.  zlib-rs documents this as load-bearing:
+# https://trifectatech.org/blog/current-zlib-rs-performance/
+#
+# `target-cpu=x86-64-v3` — baseline AVX2/BMI2/FMA for local development.
+# Production wheels should either build for the target CPU via per-target
+# rustflags or use runtime dispatch in the hot kernels (see cpu_features.rs).
 [build]
-rustflags = ["-C", "target-cpu=x86-64-v3"]
+rustflags = [
+    "-C", "target-cpu=x86-64-v3",
+    "-C", "llvm-args=-enable-dfa-jump-thread",
+]

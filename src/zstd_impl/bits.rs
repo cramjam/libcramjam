@@ -57,7 +57,12 @@ impl<'a> ReverseBitReader<'a> {
     }
 
     /// Refill the container so at least 56 bits are available (when possible).
+    ///
+    /// Fast path uses `ptr::read_unaligned::<u64>()` — no bounds check, no
+    /// slice indexing, compiles to a single `mov` on x86_64 / `ldr` on aarch64.
+    /// Near-start-of-input handling uses the safe partial-load path.
     #[cold]
+    #[inline(never)]
     fn refill(&mut self) {
         let bytes_consumed = (self.bits_consumed / 8) as usize;
         if bytes_consumed == 0 {
@@ -65,27 +70,29 @@ impl<'a> ReverseBitReader<'a> {
         }
 
         if self.index >= bytes_consumed {
-            // Move the window down by `bytes_consumed`.
             self.index -= bytes_consumed;
             self.bits_consumed &= 7;
-            // Read 8 bytes ending at index+8 from the source.
-            let end = self.index + 8;
-            if end <= self.source.len() {
-                self.bit_container = u64::from_le_bytes(
-                    self.source[self.index..end].try_into().unwrap(),
-                );
-            } else {
-                // Near the start: read whatever is available, zero-pad.
-                let mut buf = [0u8; 8];
-                let avail = self.source.len() - self.index;
-                buf[..avail].copy_from_slice(&self.source[self.index..]);
-                self.bit_container = u64::from_le_bytes(buf);
+            // Hot path: we have at least 8 bytes at [index..].
+            if self.index + 8 <= self.source.len() {
+                // SAFETY: index+8 ≤ source.len() just checked above.
+                unsafe {
+                    let ptr = self.source.as_ptr().add(self.index) as *const u64;
+                    self.bit_container = u64::from_le(std::ptr::read_unaligned(ptr));
+                }
+                return;
             }
+            // Near the end of source (small input): partial load.
+            let mut buf = [0u8; 8];
+            let avail = self.source.len() - self.index;
+            buf[..avail].copy_from_slice(&self.source[self.index..]);
+            self.bit_container = u64::from_le_bytes(buf);
         } else if self.index > 0 {
             // Last partial load: read from offset 0.
             if self.source.len() >= 8 {
-                self.bit_container =
-                    u64::from_le_bytes((&self.source[..8]).try_into().unwrap());
+                unsafe {
+                    let ptr = self.source.as_ptr() as *const u64;
+                    self.bit_container = u64::from_le(std::ptr::read_unaligned(ptr));
+                }
             } else {
                 let mut buf = [0u8; 8];
                 buf[..self.source.len()].copy_from_slice(self.source);
@@ -97,27 +104,24 @@ impl<'a> ReverseBitReader<'a> {
             self.extra_bits += self.bits_consumed as usize;
             self.bits_consumed = 0;
         } else if self.bits_consumed < 64 {
-            // index == 0 but partial bits remain.
             self.bit_container <<= self.bits_consumed;
             self.extra_bits += self.bits_consumed as usize;
             self.bits_consumed = 0;
         } else {
-            // Fully exhausted — return zeros.
             self.extra_bits += self.bits_consumed as usize;
             self.bits_consumed = 0;
             self.bit_container = 0;
         }
     }
 
-    /// Read up to 56 bits.  Reading more than the stream contains returns zero
-    /// bits but advances `bits_remaining()` into negative territory.
-    ///
-    /// Hot path: the `n == 0` branch is removed (callers never pass 0),
-    /// the mask computation is unconditional (n ≤ 56 < 64 so `1 << n` never
-    /// overflows), and peek/consume are inlined.
+    /// Read up to 56 bits.  Short-circuits on `n == 0` (very common in zstd
+    /// — LL/ML codes 0-15/0-31 have zero extra bits).
     #[inline(always)]
     pub fn get_bits(&mut self, n: u32) -> u32 {
-        debug_assert!(n > 0 && n <= 56);
+        if n == 0 {
+            return 0;
+        }
+        debug_assert!(n <= 56);
         if self.bits_consumed as u32 + n > 64 {
             self.refill();
         }

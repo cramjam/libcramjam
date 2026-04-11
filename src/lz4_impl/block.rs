@@ -377,38 +377,7 @@ unsafe fn read_u64(buf: &[u8], pos: usize) -> u64 {
 /// at a time and finds the first differing byte via XOR + trailing-zero.
 #[inline(always)]
 fn count_match(input: &[u8], mut ms: usize, mut is: usize, limit: usize) -> usize {
-    use core::simd::cmp::SimdPartialEq;
-    use core::simd::u8x32;
-
     let start = is;
-
-    // First 8 bytes via u64 — handles short matches without SIMD overhead.
-    if is + 8 <= limit {
-        let diff = unsafe { read_u64(input, ms) ^ read_u64(input, is) };
-        if diff != 0 {
-            return (is - start) + (diff.trailing_zeros() as usize >> 3);
-        }
-        ms += 8;
-        is += 8;
-    }
-
-    // 32-byte SIMD chunks for long matches.
-    while is + 32 <= limit {
-        let va = u8x32::from_slice(unsafe {
-            std::slice::from_raw_parts(input.as_ptr().add(ms), 32)
-        });
-        let vb = u8x32::from_slice(unsafe {
-            std::slice::from_raw_parts(input.as_ptr().add(is), 32)
-        });
-        let bm = va.simd_ne(vb).to_bitmask();
-        if bm != 0 {
-            return (is - start) + bm.trailing_zeros() as usize;
-        }
-        ms += 32;
-        is += 32;
-    }
-
-    // 8-byte u64 tail.
     while is + 8 <= limit {
         let diff = unsafe { read_u64(input, ms) ^ read_u64(input, is) };
         if diff == 0 {

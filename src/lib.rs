@@ -1,5 +1,3 @@
-#![feature(portable_simd)]
-
 #[cfg(any(
     feature = "blosc2",
     feature = "blosc2-static",

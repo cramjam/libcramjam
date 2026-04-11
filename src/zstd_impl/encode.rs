@@ -1098,37 +1098,7 @@ fn u64_at(input: &[u8], idx: usize) -> u64 {
 /// to: x86_64, aarch64, wasm32).
 #[inline(always)]
 fn count_common_bytes(input: &[u8], a: usize, b: usize, max: usize) -> usize {
-    use core::simd::cmp::SimdPartialEq;
-    use core::simd::u8x32;
-
     let mut n = 0usize;
-
-    // First 8 bytes via u64 — handles the common short-match case (most
-    // hash hits extend by only 0-7 bytes) without SIMD setup overhead.
-    if n + 8 <= max {
-        let x = u64_at(input, a + n) ^ u64_at(input, b + n);
-        if x != 0 {
-            return n + (x.trailing_zeros() as usize / 8);
-        }
-        n += 8;
-    }
-
-    // For longer matches, escalate to 32-byte SIMD chunks.
-    while n + 32 <= max {
-        let va = u8x32::from_slice(unsafe {
-            std::slice::from_raw_parts(input.as_ptr().add(a + n), 32)
-        });
-        let vb = u8x32::from_slice(unsafe {
-            std::slice::from_raw_parts(input.as_ptr().add(b + n), 32)
-        });
-        let bm = va.simd_ne(vb).to_bitmask();
-        if bm != 0 {
-            return n + bm.trailing_zeros() as usize;
-        }
-        n += 32;
-    }
-
-    // 8-byte u64 tail.
     while n + 8 <= max {
         let x = u64_at(input, a + n) ^ u64_at(input, b + n);
         if x == 0 {
@@ -1145,6 +1115,9 @@ fn count_common_bytes(input: &[u8], a: usize, b: usize, max: usize) -> usize {
 
 /// Walk the hash chain from `pos` looking for the longest 4-byte (or longer)
 /// match within the allowed offset range.  Returns (offset, length).
+///
+/// Hot inner-loop function.  Uses raw pointer access throughout to eliminate
+/// bounds checks and hoists the no-chain case out of the loop.
 #[inline]
 fn find_best_match(
     input: &[u8],
@@ -1158,12 +1131,34 @@ fn find_best_match(
     }
     let len = input.len();
     let max_len = MAX_MATCH.min(len - pos);
-    let h = hash4(&input[pos..]);
-    let mut cand = head[h];
+    // Inline hash4 via unaligned u32 load.
+    let v = unsafe {
+        std::ptr::read_unaligned(input.as_ptr().add(pos) as *const u32)
+    };
+    let h = (v.wrapping_mul(2654435761) >> (32 - HASH_BITS)) as usize & HASH_MASK;
+    let mut cand = unsafe { *head.get_unchecked(h) };
     let mut best_len = 0usize;
     let mut best_off = 0usize;
-    let mut chain_left = max_chain;
 
+    // No-chain path (L1): check only the head entry.
+    if prev.is_empty() {
+        if cand != NONE {
+            let mp = cand as usize;
+            if mp < pos {
+                let dist = pos - mp;
+                if dist <= MAX_OFFSET && dist > 0 && u32_at(input, mp) == v {
+                    let mlen = 4 + count_common_bytes(input, mp + 4, pos + 4, max_len - 4);
+                    best_len = mlen;
+                    best_off = dist;
+                }
+            }
+        }
+        return (best_off, best_len);
+    }
+
+    // Chain walk (L2+).
+    let prev_ptr = prev.as_ptr();
+    let mut chain_left = max_chain;
     while cand != NONE && chain_left > 0 {
         let mp = cand as usize;
         if mp >= pos {
@@ -1173,8 +1168,7 @@ fn find_best_match(
         if dist > MAX_OFFSET || dist == 0 {
             break;
         }
-        // u32 prefix compare via single load.
-        if u32_at(input, mp) == u32_at(input, pos) {
+        if u32_at(input, mp) == v {
             let mlen = 4 + count_common_bytes(input, mp + 4, pos + 4, max_len - 4);
             if mlen > best_len {
                 best_len = mlen;
@@ -1184,10 +1178,7 @@ fn find_best_match(
                 }
             }
         }
-        if prev.is_empty() {
-            break;
-        }
-        cand = prev[mp & CHAIN_MASK];
+        cand = unsafe { *prev_ptr.add(mp & CHAIN_MASK) };
         chain_left -= 1;
     }
 
@@ -1839,20 +1830,27 @@ struct SeqCodes {
     ev: u32,
 }
 
-#[inline]
+#[inline(always)]
 fn write_extra_lmo(
     bw: &mut ForwardBitWriter,
     ll: &SeqCodes,
     ml: &SeqCodes,
     ofc: &SeqCodes,
 ) {
-    if ll.eb > 0 {
-        bw.write_bits(ll.ev as u64, ll.eb as u32);
-    }
-    if ml.eb > 0 {
-        bw.write_bits(ml.ev as u64, ml.eb as u32);
-    }
-    if ofc.eb > 0 {
+    // Pack LL + ML + OF extra bits into a single write.  LL and ML extra
+    // bits are max 16 each; OF extra bits max 32.  Total max 64 > 56 only
+    // when all three are near their max simultaneously — very rare.
+    let total = ll.eb as u32 + ml.eb as u32 + ofc.eb as u32;
+    if total <= 56 {
+        // Common path: one bitstream write for all three extras.
+        let combined = (ll.ev as u64)
+            | ((ml.ev as u64) << ll.eb)
+            | ((ofc.ev as u64) << (ll.eb + ml.eb));
+        bw.write_bits(combined, total);
+    } else {
+        // Rare overflow path: LL + ML first (≤32 bits), then OF.
+        let lm = (ll.ev as u64) | ((ml.ev as u64) << ll.eb);
+        bw.write_bits(lm, ll.eb as u32 + ml.eb as u32);
         bw.write_bits(ofc.ev as u64, ofc.eb as u32);
     }
 }
