@@ -279,6 +279,20 @@ const HASH_MASK: usize = HASH_SIZE - 1;
 const FAST_HASH_BITS: usize = 17;
 const FAST_HASH_SIZE: usize = 1 << FAST_HASH_BITS;
 const NONE: u32 = u32::MAX;
+
+// ---- doubleFast (L2-L4) tables ----
+/// 8-byte hash "long" table.  Matches C zstd dfast's hashLog=17 at L3.
+const DFAST_LONG_BITS: usize = 17;
+const DFAST_LONG_SIZE: usize = 1 << DFAST_LONG_BITS;
+/// 4-byte hash "short" table.  Acts as the chain replacement.  Matches C zstd
+/// dfast's chainLog=17 at L3.
+const DFAST_SHORT_BITS: usize = 17;
+const DFAST_SHORT_SIZE: usize = 1 << DFAST_SHORT_BITS;
+/// 64-bit Knuth multiplicative constant used by C zstd's `ZSTD_hash8`.
+const DFAST_PRIME8: u64 = 11400714785074694791;
+/// Miss-step growth rate.  Matches C zstd `kSearchStrength = 8`: step grows
+/// one extra byte for every 256 bytes of literal run.
+const DFAST_SEARCH_STRENGTH: u32 = 8;
 /// Max distance for back references.
 const MAX_OFFSET: usize = 1 << 20;
 /// Chain table size (must be a power of two).  Positions that differ by more
@@ -297,6 +311,20 @@ fn hash4(b: &[u8]) -> usize {
 #[inline(always)]
 fn hash4_fast(v: u32) -> usize {
     (v.wrapping_mul(2654435761) >> (32 - FAST_HASH_BITS)) as usize
+}
+
+/// 4-byte hash keyed into the dfast short table.  Reads `*p` unaligned.
+#[inline(always)]
+unsafe fn dfast_hash_short(p: *const u8) -> usize {
+    let v = std::ptr::read_unaligned(p as *const u32);
+    (v.wrapping_mul(2654435761) >> (32 - DFAST_SHORT_BITS)) as usize
+}
+
+/// 8-byte hash keyed into the dfast long table.  Reads `*p` unaligned.
+#[inline(always)]
+unsafe fn dfast_hash_long(p: *const u8) -> usize {
+    let v = std::ptr::read_unaligned(p as *const u64);
+    (v.wrapping_mul(DFAST_PRIME8) >> (64 - DFAST_LONG_BITS)) as usize
 }
 
 /// LZ77 strategy parameters tuned per zstd level.
@@ -357,6 +385,11 @@ struct EncoderScratch {
     fast_gen: Vec<u32>,
     /// Generation token for the fast path.  Bumped per call.
     fast_current_gen: u32,
+    /// doubleFast path: 8-byte-hash "long" table.  Stores positions of
+    /// the most recent 8-byte prefix for each hash slot.
+    dfast_long: Vec<u32>,
+    /// doubleFast path: 4-byte-hash "short" table.  Acts as chain replacement.
+    dfast_short: Vec<u32>,
 }
 
 impl EncoderScratch {
@@ -367,6 +400,28 @@ impl EncoderScratch {
             fast_head: Vec::new(),
             fast_gen: Vec::new(),
             fast_current_gen: 0,
+            dfast_long: Vec::new(),
+            dfast_short: Vec::new(),
+        }
+    }
+
+    /// Resize and reset the dfast long/short hash tables.
+    fn reset_dfast(&mut self) {
+        if self.dfast_long.len() != DFAST_LONG_SIZE {
+            self.dfast_long.clear();
+            self.dfast_long.resize(DFAST_LONG_SIZE, NONE);
+        } else {
+            for slot in self.dfast_long.iter_mut() {
+                *slot = NONE;
+            }
+        }
+        if self.dfast_short.len() != DFAST_SHORT_SIZE {
+            self.dfast_short.clear();
+            self.dfast_short.resize(DFAST_SHORT_SIZE, NONE);
+        } else {
+            for slot in self.dfast_short.iter_mut() {
+                *slot = NONE;
+            }
         }
     }
 
@@ -455,6 +510,11 @@ fn try_rep_match(input: &[u8], pos: usize, rep: &[u32; 3]) -> (usize, usize) {
 fn lz77_parse(input: &[u8], level: i32) -> ParsedBlock {
     if level <= 1 {
         return SCRATCH.with(|s| lz77_parse_fast(input, &mut s.borrow_mut()));
+    }
+    // Levels 2-4 use the doubleFast match finder (two hash tables, no chain
+    // walk).  Mirrors C zstd's `dfast` strategy which is the default at L3.
+    if level <= 4 {
+        return SCRATCH.with(|s| lz77_parse_dfast(input, &mut s.borrow_mut()));
     }
     // NOTE: lz77_parse_optimal exists but its price model is too rough to
     // beat the tuned general parser — it needs per-block FSE cost estimates
@@ -1067,6 +1127,279 @@ fn lz77_parse_fast(input: &[u8], scratch: &mut EncoderScratch) -> ParsedBlock {
         }
     }
 
+    if lit_run_start < len {
+        literals.extend_from_slice(&input[lit_run_start..len]);
+    }
+
+    ParsedBlock { literals, sequences }
+}
+
+/// doubleFast parser (ported from C zstd's `ZSTD_compressBlock_doubleFast`).
+///
+/// Two hash tables:
+///   * `dfast_long`  — 17-bit hash over an 8-byte prefix.  Provides longer,
+///      higher-quality matches when they exist.
+///   * `dfast_short` — 17-bit hash over a 4-byte prefix.  Provides short-match
+///      recall (acts like C zstd's "chainTable" under the dfast strategy, but
+///      there's no chain walk — just one probe per position).
+///
+/// At each position:
+///   1. Check rep offsets at `pos` (we reuse the general `try_rep_match`
+///      helper, which probes all three rep slots).
+///   2. Compute both hashes and load both candidates.  Update both to `pos`.
+///   3. Try a long match (8-byte prefix equality).  If it hits, go emit.
+///   4. Else try a short match (4-byte prefix).  If it hits, probe the long
+///      table at `pos+1`; if that hits, use the long match (emits from pos+1).
+///      Otherwise use the short match (emits from pos).
+///   5. Miss: `step = 1 + (miss_run >> 8)` and continue (kSearchStrength=8).
+///
+/// After emitting, we do C zstd's "complementary insertion":
+///   * long hash at `orig_pos + 2`
+///   * long hash at `match_end - 2`
+///   * short hash at `orig_pos + 2`
+///   * short hash at `match_end - 1`
+///
+/// Then we chain immediate rep continuations (rep[1] under lit_len=0 semantics
+/// is the cheapest code, so that's the one to probe first) before looping.
+fn lz77_parse_dfast(input: &[u8], scratch: &mut EncoderScratch) -> ParsedBlock {
+    let len = input.len();
+    let mut sequences: Vec<Sequence> = Vec::with_capacity((len / 32).max(8));
+    let mut literals: Vec<u8> = Vec::with_capacity((len / 4).max(64));
+
+    // Need at least enough bytes to read a 16-byte look-ahead window safely.
+    if len < 16 {
+        literals.extend_from_slice(input);
+        return ParsedBlock { literals, sequences };
+    }
+
+    scratch.reset_dfast();
+    let hash_long = scratch.dfast_long.as_mut_slice();
+    let hash_short = scratch.dfast_short.as_mut_slice();
+
+    let base = input.as_ptr();
+    let mut rep = [1u32, 4, 8];
+    let mut lit_run_start = 0usize;
+
+    // Seed position 0 in both tables so a match at pos=1 can find it.
+    unsafe {
+        let hl0 = dfast_hash_long(base);
+        let hs0 = dfast_hash_short(base);
+        *hash_long.get_unchecked_mut(hl0) = 0;
+        *hash_short.get_unchecked_mut(hs0) = 0;
+    }
+
+    // Stop condition: at each position we may read 8 bytes at `pos + 1`
+    // (for the short->long@+1 probe).  That needs `pos + 1 + 8 <= len`,
+    // i.e. `pos <= len - 9`.
+    let stop = len.saturating_sub(9);
+    let mut pos = 1usize;
+
+    while pos <= stop {
+        // --- 1. Rep check at pos ---
+        let (rep_len, rep_idx) = try_rep_match(input, pos, &rep);
+        if rep_len >= MIN_MATCH {
+            let lit_len = (pos - lit_run_start) as u32;
+            let d = rep[rep_idx];
+            literals.extend_from_slice(&input[lit_run_start..pos]);
+            sequences.push(Sequence { lit_len, match_len: rep_len as u32, offset: d });
+            update_rep(&mut rep, d, lit_len);
+            // Touch both hash tables at `pos` before advancing so we don't
+            // leave a hole the next dfast lookup would have to refill.
+            unsafe {
+                let hl = dfast_hash_long(base.add(pos));
+                let hs = dfast_hash_short(base.add(pos));
+                *hash_long.get_unchecked_mut(hl) = pos as u32;
+                *hash_short.get_unchecked_mut(hs) = pos as u32;
+            }
+            pos += rep_len;
+            lit_run_start = pos;
+            continue;
+        }
+
+        // --- 2. Hash lookups at pos ---
+        let orig_pos = pos;
+        let hl = unsafe { dfast_hash_long(base.add(pos)) };
+        let hs = unsafe { dfast_hash_short(base.add(pos)) };
+        let cand_long = unsafe { *hash_long.get_unchecked(hl) };
+        let cand_short = unsafe { *hash_short.get_unchecked(hs) };
+        unsafe {
+            *hash_long.get_unchecked_mut(hl) = pos as u32;
+            *hash_short.get_unchecked_mut(hs) = pos as u32;
+        }
+
+        // --- 3. Match selection ---
+        let mut best_mp: usize = 0;
+        let mut best_len: usize = 0;
+        let mut match_start: usize = pos;
+
+        // Long match at pos (8-byte prefix).
+        if cand_long != NONE {
+            let mp = cand_long as usize;
+            if mp < pos {
+                let dist = pos - mp;
+                if dist <= MAX_OFFSET && mp + 8 <= len {
+                    // pos + 8 <= len is guaranteed by `pos <= stop`.
+                    if u64_at(input, mp) == u64_at(input, pos) {
+                        let max = MAX_MATCH.min(len - pos);
+                        let mlen = 8 + count_common_bytes(input, mp + 8, pos + 8, max - 8);
+                        best_mp = mp;
+                        best_len = mlen;
+                    }
+                }
+            }
+        }
+
+        // Short match at pos — only if no long match.
+        if best_len == 0 && cand_short != NONE {
+            let mp = cand_short as usize;
+            if mp < pos {
+                let dist = pos - mp;
+                if dist <= MAX_OFFSET && mp + 4 <= len
+                    && u32_at(input, mp) == u32_at(input, pos)
+                {
+                    // 3a. Short hit — probe the long table at pos+1 and
+                    //     prefer a longer hit there if one exists.
+                    let mut taken_long_next = false;
+
+                    // pos + 1 + 8 <= len is guaranteed by `pos <= stop`.
+                    let p1 = unsafe { base.add(pos + 1) };
+                    let hl1 = unsafe { dfast_hash_long(p1) };
+                    let cand_l1 = unsafe { *hash_long.get_unchecked(hl1) };
+                    // Update long hash at pos+1 BEFORE doing the comparison
+                    // (matches C zstd — the write happens unconditionally).
+                    unsafe { *hash_long.get_unchecked_mut(hl1) = (pos + 1) as u32; }
+                    if cand_l1 != NONE {
+                        let nmp = cand_l1 as usize;
+                        if nmp < pos + 1 {
+                            let ndist = (pos + 1) - nmp;
+                            if ndist <= MAX_OFFSET
+                                && nmp + 8 <= len
+                                && u64_at(input, nmp) == u64_at(input, pos + 1)
+                            {
+                                let max = MAX_MATCH.min(len - (pos + 1));
+                                let nlen = 8 + count_common_bytes(
+                                    input, nmp + 8, pos + 1 + 8, max - 8,
+                                );
+                                best_mp = nmp;
+                                best_len = nlen;
+                                match_start = pos + 1;
+                                taken_long_next = true;
+                            }
+                        }
+                    }
+
+                    if !taken_long_next {
+                        // 3b. Plain short match at pos.
+                        let max = MAX_MATCH.min(len - pos);
+                        let mlen = 4 + count_common_bytes(input, mp + 4, pos + 4, max - 4);
+                        best_mp = mp;
+                        best_len = mlen;
+                    }
+                }
+            }
+        }
+
+        // --- 4. Miss — skip ahead ---
+        if best_len < MIN_MATCH {
+            let miss = (pos - lit_run_start) as u32;
+            let step = 1 + ((miss >> DFAST_SEARCH_STRENGTH) as usize);
+            pos += step;
+            continue;
+        }
+
+        // --- 5. Catch-up (walk back the match start) ---
+        let mut mp = best_mp;
+        let mut ip_start = match_start;
+        let mut mlen = best_len.min(MAX_MATCH);
+        while ip_start > lit_run_start
+            && mp > 0
+            && mlen < MAX_MATCH
+            && unsafe { *base.add(ip_start - 1) == *base.add(mp - 1) }
+        {
+            ip_start -= 1;
+            mp -= 1;
+            mlen += 1;
+        }
+        let offset = (ip_start - mp) as u32;
+
+        // --- 6. Emit sequence ---
+        let lit_len = (ip_start - lit_run_start) as u32;
+        literals.extend_from_slice(&input[lit_run_start..ip_start]);
+        sequences.push(Sequence { lit_len, match_len: mlen as u32, offset });
+        update_rep(&mut rep, offset, lit_len);
+        let match_end = ip_start + mlen;
+        pos = match_end;
+        lit_run_start = pos;
+
+        // --- 7. Complementary insertion ---
+        // Insert long@(orig_pos+2), long@(match_end-2),
+        //        short@(orig_pos+2), short@(match_end-1)
+        // so the next hash lookups at positions past `match_end` can find
+        // back-references into the data we just consumed.
+        unsafe {
+            let cur2 = orig_pos + 2;
+            if cur2 + 8 <= len {
+                let h = dfast_hash_long(base.add(cur2));
+                *hash_long.get_unchecked_mut(h) = cur2 as u32;
+            }
+            if cur2 + 4 <= len {
+                let h = dfast_hash_short(base.add(cur2));
+                *hash_short.get_unchecked_mut(h) = cur2 as u32;
+            }
+            if match_end >= 2 {
+                let me2 = match_end - 2;
+                if me2 + 8 <= len {
+                    let h = dfast_hash_long(base.add(me2));
+                    *hash_long.get_unchecked_mut(h) = me2 as u32;
+                }
+            }
+            if match_end >= 1 {
+                let me1 = match_end - 1;
+                if me1 + 4 <= len {
+                    let h = dfast_hash_short(base.add(me1));
+                    *hash_short.get_unchecked_mut(h) = me1 as u32;
+                }
+            }
+        }
+
+        // --- 8. Immediate rep chain ---
+        // With lit_len=0, code 1 maps to rep[1] (the rep swap happens inside
+        // `update_rep`).  Probe rep[1] first; each successful match keeps
+        // swapping rep[0]/rep[1] and extends the chain.
+        while pos + 4 <= len {
+            let d = rep[1] as usize;
+            if d == 0 || d > pos {
+                break;
+            }
+            let rp = pos - d;
+            if u32_at(input, rp) != u32_at(input, pos) {
+                break;
+            }
+            let max = MAX_MATCH.min(len - pos);
+            let cont_len = 4 + count_common_bytes(input, rp + 4, pos + 4, max - 4);
+            if cont_len < MIN_MATCH {
+                break;
+            }
+            let off = rep[1];
+            sequences.push(Sequence { lit_len: 0, match_len: cont_len as u32, offset: off });
+            update_rep(&mut rep, off, 0);
+            // Keep hash tables populated at this chained position too.
+            unsafe {
+                if pos + 8 <= len {
+                    let h = dfast_hash_long(base.add(pos));
+                    *hash_long.get_unchecked_mut(h) = pos as u32;
+                }
+                if pos + 4 <= len {
+                    let h = dfast_hash_short(base.add(pos));
+                    *hash_short.get_unchecked_mut(h) = pos as u32;
+                }
+            }
+            pos += cont_len;
+            lit_run_start = pos;
+        }
+    }
+
+    // Tail literals (no trailing sequence).
     if lit_run_start < len {
         literals.extend_from_slice(&input[lit_run_start..len]);
     }
