@@ -223,13 +223,26 @@ fn decode_compressed_block(
     let mut r = ForwardByteReader::new(data);
 
     // --- Literals Section ---
-    let literals = decode_literals_section(&mut r, huf_table)?;
+    let mut literals = decode_literals_section(&mut r, huf_table)?;
+    // Track the real literal length, then add 32 bytes of dead-zone padding
+    // so the per-sequence wildcopy in the hot loop can safely over-read by up
+    // to 16 bytes without the caller having to branch on "short literal".
+    let lit_total = literals.len();
+    literals.resize(lit_total + 32, 0);
+
+    // Reserve the worst-case output for this block upfront so neither the
+    // literal copies nor the per-sequence match wildcopy need to re-check
+    // capacity. zstd's block decoded size cap is 128 KiB (ZSTD_BLOCKSIZE_MAX);
+    // `+ 32` is dead-zone padding for the SIMD wildcopy overshoot in
+    // `cpu_features::copy_match_unchecked`.
+    const ZSTD_BLOCKSIZE_MAX: usize = 128 * 1024;
+    output.reserve(ZSTD_BLOCKSIZE_MAX + 32);
 
     // --- Sequences Section ---
     let seq_data = &data[r.position()..];
     if seq_data.is_empty() {
         // No sequences — all data is literals.
-        output.extend_from_slice(&literals);
+        output.extend_from_slice(&literals[..lit_total]);
         return Ok(());
     }
 
@@ -237,7 +250,7 @@ fn decode_compressed_block(
     let num_sequences = decode_sequence_count(&mut sr)?;
 
     if num_sequences == 0 {
-        output.extend_from_slice(&literals);
+        output.extend_from_slice(&literals[..lit_total]);
         return Ok(());
     }
 
@@ -264,12 +277,14 @@ fn decode_compressed_block(
     let mut ll_state = bits.get_bits(ll_t.accuracy_log);
     let mut of_state = bits.get_bits(of_t.accuracy_log);
     let mut ml_state = bits.get_bits(ml_t.accuracy_log);
-    #[cfg(test)]
-    if num_sequences <= 10 {
-        eprintln!("[init] ll_state={ll_state} of_state={of_state} ml_state={ml_state} ll_acc={} of_acc={} ml_acc={}",
-            ll_t.accuracy_log, of_t.accuracy_log, ml_t.accuracy_log);
-    }
 
+    // Cache the literals pointer + output pointer once so the per-sequence loop
+    // body is pure pointer arithmetic. The literals buffer has 32 bytes of
+    // trailing zero padding (see decode_compressed_block top), so a 16-byte
+    // wildcopy read past the last literal is safe and the value is discarded
+    // via the tracked `lit_pos`/`lit_total` cursor. The upfront
+    // `ZSTD_BLOCKSIZE_MAX + 32` reservation guards the destination overshoot.
+    let lit_ptr = literals.as_ptr();
     let mut lit_pos = 0usize;
     for i in 0..num_sequences {
         // 1. Peek symbols from current FSE states.
@@ -283,73 +298,78 @@ fn decode_compressed_block(
         } else {
             1
         };
-        let match_len = decode_match_length(ml_code, &mut bits)?;
-        let lit_len = decode_lit_length(ll_code, &mut bits)?;
-
-        #[cfg(test)]
-        if num_sequences <= 10 {
-            eprintln!("[seq {i}] of_code={of_code} ml_code={ml_code} ll_code={ll_code} offset_val={offset_value} match_len={match_len} lit_len={lit_len}");
-        }
+        // SAFETY: `ml_code` and `ll_code` come from FSE tables built with
+        // max_symbol 52 / 35 respectively, so both are in range of the
+        // MATCHLEN_TABLE / LITLEN_TABLE arrays.
+        let match_len = unsafe { decode_match_length_fast(ml_code, &mut bits) };
+        let lit_len = unsafe { decode_lit_length_fast(ll_code, &mut bits) };
 
         // 3. Resolve offset (handles repeat offsets per RFC 8878 3.1.2.1.3).
         let offset = resolve_offset(offset_value, rep_offsets, lit_len);
 
-        // 4. Execute: copy literals, then copy match.
-        if lit_pos + lit_len > literals.len() {
+        // 4. Execute: copy literals, then copy match. Both writes live inside
+        // the upfront-reserved block capacity; we use raw pointers to avoid
+        // the per-iteration bounds check / Vec reserve path.
+        if lit_pos + lit_len > lit_total {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "zstd: literals length exceeds available literals",
             ));
         }
-        output.extend_from_slice(&literals[lit_pos..lit_pos + lit_len]);
-        lit_pos += lit_len;
-
-        if offset as usize > output.len() || offset == 0 {
+        // zstd semantics: the offset is measured from AFTER the literal run
+        // is appended, so the in-history check must compare against
+        // `cur + lit_len`, not just `cur`. A match starting inside the
+        // freshly-copied literals is valid.
+        let cur = output.len();
+        let post_lit = cur + lit_len;
+        let off = offset as usize;
+        if off == 0 || off > post_lit {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("zstd: match offset {} exceeds available history {}", offset, output.len()),
+                format!("zstd: match offset {} exceeds available history {}", offset, post_lit),
             ));
         }
-        let off = offset as usize;
-        output.reserve(match_len);
         unsafe {
             let base = output.as_mut_ptr();
-            let cur = output.len();
-            let src = cur - off;
-            let dst = cur;
-            if off >= match_len {
-                // Non-overlapping: single bulk copy.
-                std::ptr::copy_nonoverlapping(base.add(src), base.add(dst), match_len);
-            } else if off == 1 {
-                // RLE: fill with a single repeated byte.
-                std::ptr::write_bytes(base.add(dst), *base.add(src), match_len);
-            } else {
-                // Overlapping: copy in offset-sized chunks so the pattern
-                // propagates, then a tail copy for the remainder.
-                let mut w = 0usize;
-                while w + off <= match_len {
-                    std::ptr::copy_nonoverlapping(base.add(src + w), base.add(dst + w), off);
-                    w += off;
-                }
-                if w < match_len {
-                    std::ptr::copy_nonoverlapping(base.add(src + w), base.add(dst + w), match_len - w);
-                }
-            }
-            output.set_len(cur + match_len);
+            // Literal copy: 16-byte SIMD wildcopy. The literals buffer was
+            // padded with 32 trailing zero bytes, and the output has the
+            // 128 KiB + 32 block reservation, so the up-to-15-byte over-read
+            // and over-write are both in-allocation. `lit_pos` tracks the
+            // real position and is advanced by the logical length only.
+            crate::cpu_features::wildcopy_chunks::<16>(
+                lit_ptr.add(lit_pos),
+                base.add(cur),
+                lit_len,
+            );
+            lit_pos += lit_len;
+
+            // Match copy: SIMD wildcopy kernel dispatching on offset.
+            let src = base.add(post_lit - off);
+            let dst = base.add(post_lit);
+            crate::cpu_features::copy_match_unchecked(src, dst, off, match_len);
+            output.set_len(post_lit + match_len);
         }
 
         // 5. Update FSE states (except for the last sequence).
         //    Order: LL, ML, OF (RFC 8878 3.1.2.1.2.4).
+        //
+        //    Max FSE accuracy_log is 9 (LL) + 8 (OF) + 9 (ML) = 26 bits for
+        //    all three state reads combined. One `ensure_bits(26)` call
+        //    refills (if needed) once, then the three `next_state_fast`
+        //    calls each skip the per-call refill-check branch.
         if i < num_sequences - 1 {
-            ll_state = ll_t.next_state(ll_state, &mut bits);
-            ml_state = ml_t.next_state(ml_state, &mut bits);
-            of_state = of_t.next_state(of_state, &mut bits);
+            bits.ensure_bits(26);
+            ll_state = ll_t.next_state_fast(ll_state, &mut bits);
+            ml_state = ml_t.next_state_fast(ml_state, &mut bits);
+            of_state = of_t.next_state_fast(of_state, &mut bits);
         }
     }
 
-    // Append remaining literals after all sequences.
-    if lit_pos < literals.len() {
-        output.extend_from_slice(&literals[lit_pos..]);
+    // Append remaining literals after all sequences. Use the tracked real
+    // literal length (`lit_total`) rather than `literals.len()` so we don't
+    // copy the trailing 32-byte wildcopy dead-zone.
+    if lit_pos < lit_total {
+        output.extend_from_slice(&literals[lit_pos..lit_total]);
     }
 
     Ok(())
@@ -546,6 +566,7 @@ fn decode_fse_table_mode(
 
 /// Resolve offset_value to an actual offset, handling repeat offsets (RFC 8878 3.1.2.1.3).
 /// Also updates the repeat offset table.
+#[inline(always)]
 fn resolve_offset(offset_value: u32, rep: &mut [u32; 3], lit_len: usize) -> u32 {
     if offset_value > 3 {
         // Real offset.
@@ -601,22 +622,30 @@ fn resolve_offset(offset_value: u32, rep: &mut [u32; 3], lit_len: usize) -> u32 
     }
 }
 
-fn decode_lit_length(code: u8, bits: &mut ReverseBitReader) -> io::Result<usize> {
-    if (code as usize) >= fse::LITLEN_TABLE.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "zstd: invalid literals length code"));
-    }
-    let (baseline, extra_bits) = fse::LITLEN_TABLE[code as usize];
+/// Decode a literals-length value (base + extra_bits) for `code`.
+///
+/// # Safety
+/// `code < 36`. The LL FSE tables (predefined and custom) are constructed
+/// with exactly 36 symbols, so any symbol returned by `FseTable::symbol` is
+/// in range.
+#[inline(always)]
+unsafe fn decode_lit_length_fast(code: u8, bits: &mut ReverseBitReader) -> usize {
+    debug_assert!((code as usize) < fse::LITLEN_TABLE.len());
+    let (baseline, extra_bits) = unsafe { *fse::LITLEN_TABLE.get_unchecked(code as usize) };
     let extra = bits.get_bits(extra_bits as u32);
-    Ok((baseline + extra) as usize)
+    (baseline + extra) as usize
 }
 
-fn decode_match_length(code: u8, bits: &mut ReverseBitReader) -> io::Result<usize> {
-    if (code as usize) >= fse::MATCHLEN_TABLE.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "zstd: invalid match length code"));
-    }
-    let (baseline, extra_bits) = fse::MATCHLEN_TABLE[code as usize];
+/// Decode a match-length value (base + extra_bits) for `code`.
+///
+/// # Safety
+/// `code < 53`. See [`decode_lit_length_fast`] for the invariant.
+#[inline(always)]
+unsafe fn decode_match_length_fast(code: u8, bits: &mut ReverseBitReader) -> usize {
+    debug_assert!((code as usize) < fse::MATCHLEN_TABLE.len());
+    let (baseline, extra_bits) = unsafe { *fse::MATCHLEN_TABLE.get_unchecked(code as usize) };
     let extra = bits.get_bits(extra_bits as u32);
-    Ok((baseline + extra) as usize)
+    (baseline + extra) as usize
 }
 
 

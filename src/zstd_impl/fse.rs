@@ -204,16 +204,45 @@ impl FseTable {
     }
 
     /// Peek at the symbol for the current state.
+    ///
+    /// # Safety
+    /// `state` must be `< self.table.len()`. Callers coming out of FSE init /
+    /// `next_state` always satisfy this: state is either produced from
+    /// `bits.get_bits(acc_log)` (bounded by `table_size = 1 << acc_log`) or
+    /// from a previous `next_state` return (bounded by construction).
     #[inline(always)]
     pub fn symbol(&self, state: u32) -> u8 {
-        self.table[state as usize].symbol
+        debug_assert!((state as usize) < self.table.len());
+        unsafe { self.table.get_unchecked(state as usize).symbol }
     }
 
     /// Advance to the next state by reading bits from the backward bitstream.
+    ///
+    /// # Safety invariant
+    /// Same as [`symbol`]: `state < table.len()`.
     #[inline(always)]
     pub fn next_state(&self, state: u32, bits: &mut ReverseBitReader) -> u32 {
-        let entry = &self.table[state as usize];
+        debug_assert!((state as usize) < self.table.len());
+        let entry = unsafe { self.table.get_unchecked(state as usize) };
         let low_bits = bits.get_bits(entry.num_bits as u32);
+        entry.baseline as u32 + low_bits
+    }
+
+    /// Like `next_state`, but uses the refill-free `get_bits_fast` path.
+    ///
+    /// # Preconditions
+    /// Caller must have called `bits.ensure_bits(ACC_LOG)` recently enough
+    /// that `bits_consumed + entry.num_bits <= 64`. In practice callers
+    /// ensure headroom for the *sum* of a batch of fast calls before the
+    /// first one.
+    ///
+    /// # Safety invariant
+    /// `state < table.len()`.
+    #[inline(always)]
+    pub fn next_state_fast(&self, state: u32, bits: &mut ReverseBitReader) -> u32 {
+        debug_assert!((state as usize) < self.table.len());
+        let entry = unsafe { self.table.get_unchecked(state as usize) };
+        let low_bits = bits.get_bits_fast(entry.num_bits as u32);
         entry.baseline as u32 + low_bits
     }
 }

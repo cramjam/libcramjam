@@ -11,6 +11,11 @@ pub mod bzip2;
 #[cfg(feature = "capi")]
 mod capi;
 
+// Shared runtime CPU feature detection + SIMD wildcopy kernel used by the
+// pure-Rust lz4 and zstd decoders. No-op on non-x86_64/aarch64 targets.
+#[cfg(any(feature = "lz4", feature = "zstd"))]
+pub(crate) mod cpu_features;
+
 // Pure-Rust DEFLATE / gzip / zlib implementation (no C dependencies).
 #[cfg(any(
     feature = "deflate",

@@ -54,8 +54,10 @@ pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize>
     // Reserve a generous amount of headroom so we never reallocate inside the
     // hot loop.  Worst case is bounded by `input.len() * 256` (single token,
     // 1 byte literal + 65535-byte match), but we cap at the LZ4 frame block
-    // limit + slack.
-    let upper_bound = (input.len() * 256 + 65_536).min(8 * 1024 * 1024);
+    // limit + slack. The `+32` is dead-zone padding so the 16-byte SIMD
+    // wildcopy in `copy_match` can overshoot the last match without touching
+    // unallocated memory.
+    let upper_bound = (input.len() * 256 + 65_536).min(8 * 1024 * 1024) + 32;
     output.reserve(upper_bound);
 
     let start = output.len();
@@ -91,9 +93,27 @@ pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize>
                 "lz4: literal run exceeds input",
             ));
         }
-        // Wildcopy literals: copy in 8-byte chunks then trim.  We reserved
-        // headroom above so writing past the current len is in-bounds.
-        copy_literals(output, &input[ip..ip + lit_len]);
+        // Literal copy: use 16-byte SIMD wildcopy when both sides have enough
+        // slack (destination is always reserved; source needs `+16` headroom
+        // so we don't read past the end of the compressed block). The LZ4
+        // spec guarantees at least 5 trailing literal bytes, so the non-last
+        // iterations always have plenty of source slack; only the final
+        // iteration (which normally breaks before this line anyway) could
+        // straddle the boundary. The fall-back is a plain memcpy.
+        unsafe {
+            let dst_len = output.len();
+            let base = output.as_mut_ptr().add(dst_len);
+            if ip + lit_len + 16 <= in_len {
+                crate::cpu_features::wildcopy_chunks::<16>(
+                    input.as_ptr().add(ip),
+                    base,
+                    lit_len,
+                );
+            } else {
+                core::ptr::copy_nonoverlapping(input.as_ptr().add(ip), base, lit_len);
+            }
+            output.set_len(dst_len + lit_len);
+        }
         ip += lit_len;
 
         // End of block: when there are no more bytes, we're done (the last
@@ -153,70 +173,29 @@ pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize>
     Ok(output.len() - start)
 }
 
-/// Copy a literal run into `output`.  Uses `extend_from_slice` which calls
-/// memcpy internally; the up-front `reserve` in the caller eliminates the
-/// per-call growth check.
-#[inline(always)]
-fn copy_literals(output: &mut Vec<u8>, literals: &[u8]) {
-    output.extend_from_slice(literals);
-}
-
 /// Copy a match (back-reference) into `output`.
 ///
-/// Three tiers, fastest first:
-///   1. `offset >= 8`: wildcopy 8-byte chunks with `copy_nonoverlapping`.
-///   2. `offset == 1` (RLE): `write_bytes` in one call.
-///   3. `2 ≤ offset < 8`: overlapping copy in `offset`-sized chunks, then
-///      a tail copy — avoids the per-byte loop that dominated the old slow path.
+/// Dispatches to the shared SIMD wildcopy kernel in `cpu_features`:
 ///
-/// Caller must have reserved enough capacity in `output`.
+///   * `offset >= 16`: 16-byte unaligned chunked copy (one `movdqu` pair per
+///     iteration on SSE2/NEON, `vmovdqu` pair when AVX2 is enabled). May
+///     overshoot by up to 15 bytes — the caller reserves enough headroom
+///     upfront so the overshoot is always in-allocation.
+///   * `offset == 1`: single-byte RLE via `write_bytes`.
+///   * `2 ≤ offset < 16`: overlapping `offset`-sized chunk copy so the
+///     pattern propagates.
+///
+/// Caller must have reserved at least 16 bytes of headroom beyond
+/// `output.len() + match_len` in `output`.
 #[inline(always)]
 fn copy_match(output: &mut Vec<u8>, offset: usize, match_len: usize) {
     let cur = output.len();
-    let match_start = cur - offset;
     let end = cur + match_len;
-
     unsafe {
         let base = output.as_mut_ptr();
+        let src = base.add(cur - offset);
         let dst = base.add(cur);
-
-        if offset >= 8 {
-            // Tier 1: non-overlapping wildcopy — 8-byte chunks.
-            let mut i = 0usize;
-            while i + 8 <= match_len {
-                std::ptr::copy_nonoverlapping(base.add(match_start + i), dst.add(i), 8);
-                i += 8;
-            }
-            // Tail bytes (0..7).
-            if i < match_len {
-                std::ptr::copy_nonoverlapping(base.add(match_start + i), dst.add(i), match_len - i);
-            }
-        } else if offset == 1 {
-            // Tier 2: single-byte RLE — very common in practice.
-            let b = *base.add(match_start);
-            std::ptr::write_bytes(dst, b, match_len);
-        } else {
-            // Tier 3: small overlapping copy (offset 2..7).
-            // Copy `offset` bytes at a time — each chunk reads from already-
-            // written data so the pattern propagates correctly.
-            let mut written = 0usize;
-            while written + offset <= match_len {
-                std::ptr::copy_nonoverlapping(
-                    base.add(match_start + written),
-                    dst.add(written),
-                    offset,
-                );
-                written += offset;
-            }
-            // Tail.
-            if written < match_len {
-                std::ptr::copy_nonoverlapping(
-                    base.add(match_start + written),
-                    dst.add(written),
-                    match_len - written,
-                );
-            }
-        }
+        crate::cpu_features::copy_match_unchecked(src, dst, offset, match_len);
         output.set_len(end);
     }
 }
