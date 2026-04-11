@@ -485,10 +485,45 @@ impl HufEncoder {
         bw: &mut super::bits::ForwardBitWriter,
         data: &[u8],
     ) {
-        for &sym in data.iter().rev() {
-            let (code, nb) = self.codes[sym as usize];
-            debug_assert!(nb > 0, "Huffman: symbol {} has zero code length", sym);
-            bw.write_bits(code as u64, nb as u32);
+        // Batch 4 symbols per write_bits call.  With max_num_bits ≤ 11,
+        // 4 × 11 = 44 bits, well within write_bits's 56-bit limit.
+        // This reduces bit-writer flush checks 4x on the hot literal loop.
+        let codes = &self.codes;
+        let n = data.len();
+        if n == 0 {
+            return;
+        }
+        let ptr = data.as_ptr();
+        let mut i = n;
+        while i >= 4 {
+            // Read 4 symbols in reverse order: data[i-1], data[i-2], data[i-3], data[i-4].
+            unsafe {
+                let s0 = *ptr.add(i - 1) as usize;
+                let s1 = *ptr.add(i - 2) as usize;
+                let s2 = *ptr.add(i - 3) as usize;
+                let s3 = *ptr.add(i - 4) as usize;
+                let (c0, nb0) = *codes.get_unchecked(s0);
+                let (c1, nb1) = *codes.get_unchecked(s1);
+                let (c2, nb2) = *codes.get_unchecked(s2);
+                let (c3, nb3) = *codes.get_unchecked(s3);
+                let combined = (c0 as u64)
+                    | ((c1 as u64) << nb0)
+                    | ((c2 as u64) << (nb0 + nb1))
+                    | ((c3 as u64) << (nb0 + nb1 + nb2));
+                let total = nb0 as u32 + nb1 as u32 + nb2 as u32 + nb3 as u32;
+                bw.write_bits(combined, total);
+            }
+            i -= 4;
+        }
+        // Tail: 0..3 symbols, one at a time.
+        while i > 0 {
+            unsafe {
+                let sym = *ptr.add(i - 1) as usize;
+                let (code, nb) = *codes.get_unchecked(sym);
+                debug_assert!(nb > 0, "Huffman: symbol {} has zero code length", sym);
+                bw.write_bits(code as u64, nb as u32);
+            }
+            i -= 1;
         }
     }
 }

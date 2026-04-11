@@ -212,18 +212,15 @@ impl ForwardBitWriter {
     /// Write the low `n` bits of `bits` (n ≤ 56).  Caller must ensure that
     /// the upper bits beyond `n` are zero.
     ///
-    /// Hot path: pre-reserves 8 bytes of headroom and writes via raw pointer
-    /// when draining, avoiding `extend_from_slice`'s per-call capacity check.
+    /// Drains BEFORE adding so the `bits << bits_in_partial` shift never
+    /// overflows the u64.  Fast path drains 4 bytes; slow tail drains
+    /// byte-by-byte if more room is still needed.
     #[inline]
     pub fn write_bits(&mut self, bits: u64, n: u32) {
         debug_assert!(n <= 56);
         debug_assert!(n == 64 || bits >> n == 0, "extra bits set above n");
-        self.partial |= bits << self.bits_in_partial;
-        self.bits_in_partial += n;
-        if self.bits_in_partial >= 32 {
-            // Drain 4 full bytes via raw pointer write into spare capacity.
-            // Reserve 4 bytes (typically a no-op since `with_capacity` in
-            // hot callers already provides headroom).
+        // Fast drain: 4 bytes at a time when bits_in_partial is high enough.
+        if self.bits_in_partial + n > 64 && self.bits_in_partial >= 32 {
             self.output.reserve(4);
             unsafe {
                 let len = self.output.len();
@@ -235,6 +232,14 @@ impl ForwardBitWriter {
             self.partial >>= 32;
             self.bits_in_partial -= 32;
         }
+        // Slow tail: if still not enough room, drain byte-by-byte.
+        while self.bits_in_partial + n > 64 {
+            self.output.push(self.partial as u8);
+            self.partial >>= 8;
+            self.bits_in_partial -= 8;
+        }
+        self.partial |= bits << self.bits_in_partial;
+        self.bits_in_partial += n;
     }
 
     /// Add the end-of-stream sentinel '1' bit and pad with zeroes to the next

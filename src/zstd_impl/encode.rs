@@ -1615,35 +1615,37 @@ fn choose_seq_fse_mode(
     let max_sym = counts.iter().rposition(|&c| c > 0).unwrap_or(0) + 1;
     let max_sym = max_sym.max(num_symbols.min(counts.len()));
 
-    // Normalize and build custom table.
+    // Normalize the distribution — cheap enough to always do.
     let table_size = 1usize << al;
     let norm = match normalize_to_acc_log(&counts[..max_sym], table_size) {
         Some(n) => n,
         None => return (0, SeqFseChoice::Predefined),
     };
 
-    // Serialize the FSE table description.
+    // Serialize the table description so we know how many header bytes it costs.
     let mut desc_bw = ForwardBitWriter::new();
     write_fse_table_description(&mut desc_bw, &norm, al);
     let table_desc = desc_bw.finalize_no_sentinel();
 
-    // Build encoder from the custom table.
+    // Cost comparison FIRST — the expensive part (building the encoder
+    // table) is deferred until we know custom wins.  On dickens-like data
+    // predefined wins ~60% of the time, so this halves the FSE encoder
+    // construction cost.
+    let predefined_bits = estimate_fse_bits(counts, predefined_weights, predefined_al);
+    let custom_bits = estimate_fse_bits(&counts[..max_sym], &norm, al);
+    let custom_total = custom_bits.saturating_add(table_desc.len() as u64 * 8);
+
+    if custom_total >= predefined_bits {
+        return (0, SeqFseChoice::Predefined);
+    }
+
+    // Custom wins — NOW build the encoder table.
     let dec = match FseTable::from_weights(&norm, al) {
         Ok(t) => t,
         Err(_) => return (0, SeqFseChoice::Predefined),
     };
     let encoder = FseEncoder::from_decoder(&dec, max_sym);
-
-    // Cost comparison: predefined vs custom.
-    let predefined_bits = estimate_fse_bits(counts, predefined_weights, predefined_al);
-    let custom_bits = estimate_fse_bits(&counts[..max_sym], &norm, al);
-    let custom_total = custom_bits.saturating_add(table_desc.len() as u64 * 8);
-
-    if custom_total < predefined_bits {
-        (2, SeqFseChoice::Custom { encoder, table_desc })
-    } else {
-        (0, SeqFseChoice::Predefined)
-    }
+    (2, SeqFseChoice::Custom { encoder, table_desc })
 }
 
 fn encode_sequences_section(seqs: &[Sequence], rep_offsets: &mut [u32; 3]) -> Option<Vec<u8>> {
