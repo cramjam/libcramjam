@@ -1,0 +1,4 @@
+# Local development config: enable AVX2 + BMI2 for SIMD codegen.
+# For production wheels, use multiversion or per-target rustflags instead.
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

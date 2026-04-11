@@ -111,42 +111,44 @@ impl<'a> ReverseBitReader<'a> {
 
     /// Read up to 56 bits.  Reading more than the stream contains returns zero
     /// bits but advances `bits_remaining()` into negative territory.
-    #[inline]
+    ///
+    /// Hot path: the `n == 0` branch is removed (callers never pass 0),
+    /// the mask computation is unconditional (n ≤ 56 < 64 so `1 << n` never
+    /// overflows), and peek/consume are inlined.
+    #[inline(always)]
     pub fn get_bits(&mut self, n: u32) -> u32 {
-        if n == 0 {
-            return 0;
-        }
+        debug_assert!(n > 0 && n <= 56);
         if self.bits_consumed as u32 + n > 64 {
             self.refill();
         }
-        let value = self.peek_bits(n);
-        self.consume(n);
+        let shift_by = 64u32 - self.bits_consumed as u32 - n;
+        let mask = (1u64 << n) - 1;
+        let value = ((self.bit_container >> shift_by) & mask) as u32;
+        self.bits_consumed += n as u8;
         value
     }
 
     /// Ensure at least `n` bits are available in the container so a subsequent
     /// `peek_bits` is valid.  Used by Huffman decoders that peek wider than
     /// they consume.
-    #[inline]
+    #[inline(always)]
     pub fn ensure_bits(&mut self, n: u32) {
         if self.bits_consumed as u32 + n > 64 {
             self.refill();
         }
     }
 
-    /// Peek without consuming.
-    #[inline]
+    /// Peek without consuming.  Assumes `ensure_bits(n)` was called first.
+    #[inline(always)]
     pub fn peek_bits(&self, n: u32) -> u32 {
-        if n == 0 {
-            return 0;
-        }
+        debug_assert!(n > 0 && n <= 56);
         let shift_by = 64u32 - self.bits_consumed as u32 - n;
-        let mask = if n >= 32 { u32::MAX as u64 } else { (1u64 << n) - 1 };
+        let mask = (1u64 << n) - 1;
         ((self.bit_container >> shift_by) & mask) as u32
     }
 
     /// Consume `n` bits previously peeked.
-    #[inline]
+    #[inline(always)]
     pub fn consume(&mut self, n: u32) {
         self.bits_consumed += n as u8;
     }
@@ -205,6 +207,9 @@ impl ForwardBitWriter {
 
     /// Write the low `n` bits of `bits` (n ≤ 56).  Caller must ensure that
     /// the upper bits beyond `n` are zero.
+    ///
+    /// Hot path: pre-reserves 8 bytes of headroom and writes via raw pointer
+    /// when draining, avoiding `extend_from_slice`'s per-call capacity check.
     #[inline]
     pub fn write_bits(&mut self, bits: u64, n: u32) {
         debug_assert!(n <= 56);
@@ -212,9 +217,17 @@ impl ForwardBitWriter {
         self.partial |= bits << self.bits_in_partial;
         self.bits_in_partial += n;
         if self.bits_in_partial >= 32 {
-            // Drain 4 full bytes to keep partial usable.
-            let lo = self.partial as u32;
-            self.output.extend_from_slice(&lo.to_le_bytes());
+            // Drain 4 full bytes via raw pointer write into spare capacity.
+            // Reserve 4 bytes (typically a no-op since `with_capacity` in
+            // hot callers already provides headroom).
+            self.output.reserve(4);
+            unsafe {
+                let len = self.output.len();
+                let ptr = self.output.as_mut_ptr().add(len);
+                let lo = self.partial as u32;
+                std::ptr::write_unaligned(ptr as *mut u32, lo.to_le());
+                self.output.set_len(len + 4);
+            }
             self.partial >>= 32;
             self.bits_in_partial -= 32;
         }

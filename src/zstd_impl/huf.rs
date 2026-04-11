@@ -157,9 +157,69 @@ impl HufTable {
     pub fn decode_symbol(&self, bits: &mut ReverseBitReader) -> u8 {
         bits.ensure_bits(self.max_bits);
         let idx = bits.peek_bits(self.max_bits);
-        let entry = self.table[idx as usize];
+        let entry = unsafe { *self.table.get_unchecked(idx as usize) };
         bits.consume(entry.num_bits as u32);
         entry.symbol
+    }
+
+    /// Decode `n` symbols into `out`, using batched bit-reader refills so
+    /// the inner loop only checks for refill every 5 symbols instead of
+    /// every symbol.  With `max_bits ≤ 11` we can safely consume up to
+    /// `5 * 11 = 55` bits per refill (the reader has a 64-bit container).
+    #[inline(always)]
+    pub fn decode_symbols_into(
+        &self,
+        bits: &mut ReverseBitReader,
+        out: &mut [u8],
+    ) {
+        let max_bits = self.max_bits;
+        let table_ptr = self.table.as_ptr();
+        let out_ptr = out.as_mut_ptr();
+        let n = out.len();
+        let mut i = 0usize;
+
+        // Fast path: 5 symbols per refill check.
+        // Requires max_bits * 5 <= 56.  When max_bits > 11 this path is skipped.
+        if max_bits * 5 <= 56 {
+            let batch_bits = max_bits * 5;
+            while i + 5 <= n {
+                bits.ensure_bits(batch_bits);
+                unsafe {
+                    // Symbol 0
+                    let idx = bits.peek_bits(max_bits);
+                    let e = *table_ptr.add(idx as usize);
+                    bits.consume(e.num_bits as u32);
+                    *out_ptr.add(i) = e.symbol;
+                    // Symbol 1
+                    let idx = bits.peek_bits(max_bits);
+                    let e = *table_ptr.add(idx as usize);
+                    bits.consume(e.num_bits as u32);
+                    *out_ptr.add(i + 1) = e.symbol;
+                    // Symbol 2
+                    let idx = bits.peek_bits(max_bits);
+                    let e = *table_ptr.add(idx as usize);
+                    bits.consume(e.num_bits as u32);
+                    *out_ptr.add(i + 2) = e.symbol;
+                    // Symbol 3
+                    let idx = bits.peek_bits(max_bits);
+                    let e = *table_ptr.add(idx as usize);
+                    bits.consume(e.num_bits as u32);
+                    *out_ptr.add(i + 3) = e.symbol;
+                    // Symbol 4
+                    let idx = bits.peek_bits(max_bits);
+                    let e = *table_ptr.add(idx as usize);
+                    bits.consume(e.num_bits as u32);
+                    *out_ptr.add(i + 4) = e.symbol;
+                }
+                i += 5;
+            }
+        }
+
+        // Tail: one symbol at a time.
+        while i < n {
+            unsafe { *out_ptr.add(i) = self.decode_symbol(bits); }
+            i += 1;
+        }
     }
 }
 
@@ -207,22 +267,38 @@ fn decode_weights_fse(data: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 /// Decode Huffman-compressed literals using 1 stream.
+///
+/// Uses the bulk `decode_symbols_into` path which batches 5 symbols per
+/// bit-reader refill check.
 pub fn decode_literals_1stream(table: &HufTable, data: &[u8], regen_size: usize) -> io::Result<Vec<u8>> {
     let mut bits = ReverseBitReader::new(data)?;
     bits.skip_padding_bits()?;
-    let mut output = Vec::with_capacity(regen_size);
-    while output.len() < regen_size {
-        output.push(table.decode_symbol(&mut bits));
-    }
+    let mut output = vec![0u8; regen_size];
+    table.decode_symbols_into(&mut bits, &mut output);
     Ok(output)
 }
 
+/// Decode Huffman-compressed literals into a caller-provided buffer.
+fn decode_1stream_into(
+    table: &HufTable,
+    data: &[u8],
+    out: &mut [u8],
+) -> io::Result<usize> {
+    let mut bits = ReverseBitReader::new(data)?;
+    bits.skip_padding_bits()?;
+    let regen = out.len();
+    table.decode_symbols_into(&mut bits, out);
+    Ok(regen)
+}
+
 /// Decode Huffman-compressed literals using 4 streams.
+///
+/// Decodes all 4 streams directly into a single pre-allocated buffer,
+/// avoiding 4 intermediate Vec allocations + copies.
 pub fn decode_literals_4stream(table: &HufTable, data: &[u8], regen_size: usize) -> io::Result<Vec<u8>> {
     if data.len() < 6 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "zstd: 4-stream Huffman header too short"));
     }
-    // Jump table: 3 u16 LE values giving the sizes of streams 1-3.
     let s1_size = u16::from_le_bytes([data[0], data[1]]) as usize;
     let s2_size = u16::from_le_bytes([data[2], data[3]]) as usize;
     let s3_size = u16::from_le_bytes([data[4], data[5]]) as usize;
@@ -250,10 +326,12 @@ pub fn decode_literals_4stream(table: &HufTable, data: &[u8], regen_size: usize)
         &s_data[s3_end..],
     ];
 
-    let mut output = Vec::with_capacity(regen_size);
+    // Decode all 4 streams directly into one pre-allocated buffer.
+    let mut output = vec![0u8; regen_size];
+    let mut offset = 0usize;
     for i in 0..4 {
-        let decoded = decode_literals_1stream(table, streams[i], sizes[i])?;
-        output.extend_from_slice(&decoded);
+        decode_1stream_into(table, streams[i], &mut output[offset..offset + sizes[i]])?;
+        offset += sizes[i];
     }
     Ok(output)
 }

@@ -161,39 +161,63 @@ fn copy_literals(output: &mut Vec<u8>, literals: &[u8]) {
     output.extend_from_slice(literals);
 }
 
-/// Copy a match (back-reference) into `output` using LZ4's wildcopy strategy.
+/// Copy a match (back-reference) into `output`.
+///
+/// Three tiers, fastest first:
+///   1. `offset >= 8`: wildcopy 8-byte chunks with `copy_nonoverlapping`.
+///   2. `offset == 1` (RLE): `write_bytes` in one call.
+///   3. `2 ≤ offset < 8`: overlapping copy in `offset`-sized chunks, then
+///      a tail copy — avoids the per-byte loop that dominated the old slow path.
+///
 /// Caller must have reserved enough capacity in `output`.
 #[inline(always)]
 fn copy_match(output: &mut Vec<u8>, offset: usize, match_len: usize) {
     let cur = output.len();
     let match_start = cur - offset;
     let end = cur + match_len;
-    debug_assert!(output.capacity() >= end + 16);
 
-    if offset >= 8 && end + 16 <= output.capacity() {
-        // Wildcopy 8-byte chunks.  Reading from src is always safe because
-        // the bytes we read in chunk N were written by an earlier chunk
-        // (or already exist as initialized output).  The dst writes go into
-        // reserved spare capacity, which we then truncate via set_len.
-        unsafe {
-            let base = output.as_mut_ptr();
+    unsafe {
+        let base = output.as_mut_ptr();
+        let dst = base.add(cur);
+
+        if offset >= 8 {
+            // Tier 1: non-overlapping wildcopy — 8-byte chunks.
             let mut i = 0usize;
-            while i < match_len {
-                let src = base.add(match_start + i);
-                let dst = base.add(cur + i);
-                std::ptr::copy_nonoverlapping(src, dst, 8);
+            while i + 8 <= match_len {
+                std::ptr::copy_nonoverlapping(base.add(match_start + i), dst.add(i), 8);
                 i += 8;
             }
-            output.set_len(end);
+            // Tail bytes (0..7).
+            if i < match_len {
+                std::ptr::copy_nonoverlapping(base.add(match_start + i), dst.add(i), match_len - i);
+            }
+        } else if offset == 1 {
+            // Tier 2: single-byte RLE — very common in practice.
+            let b = *base.add(match_start);
+            std::ptr::write_bytes(dst, b, match_len);
+        } else {
+            // Tier 3: small overlapping copy (offset 2..7).
+            // Copy `offset` bytes at a time — each chunk reads from already-
+            // written data so the pattern propagates correctly.
+            let mut written = 0usize;
+            while written + offset <= match_len {
+                std::ptr::copy_nonoverlapping(
+                    base.add(match_start + written),
+                    dst.add(written),
+                    offset,
+                );
+                written += offset;
+            }
+            // Tail.
+            if written < match_len {
+                std::ptr::copy_nonoverlapping(
+                    base.add(match_start + written),
+                    dst.add(written),
+                    match_len - written,
+                );
+            }
         }
-    } else {
-        // Slow / overlapping path: 1 byte at a time.  Required when
-        // offset < 8 (small-period RLE) OR when we're near the end of the
-        // reserved capacity and can't safely overshoot by 8 bytes.
-        for i in 0..match_len {
-            let b = output[match_start + i];
-            output.push(b);
-        }
+        output.set_len(end);
     }
 }
 
@@ -353,8 +377,38 @@ unsafe fn read_u64(buf: &[u8], pos: usize) -> u64 {
 /// at a time and finds the first differing byte via XOR + trailing-zero.
 #[inline(always)]
 fn count_match(input: &[u8], mut ms: usize, mut is: usize, limit: usize) -> usize {
+    use core::simd::cmp::SimdPartialEq;
+    use core::simd::u8x32;
+
     let start = is;
-    // 8-byte chunks.
+
+    // First 8 bytes via u64 — handles short matches without SIMD overhead.
+    if is + 8 <= limit {
+        let diff = unsafe { read_u64(input, ms) ^ read_u64(input, is) };
+        if diff != 0 {
+            return (is - start) + (diff.trailing_zeros() as usize >> 3);
+        }
+        ms += 8;
+        is += 8;
+    }
+
+    // 32-byte SIMD chunks for long matches.
+    while is + 32 <= limit {
+        let va = u8x32::from_slice(unsafe {
+            std::slice::from_raw_parts(input.as_ptr().add(ms), 32)
+        });
+        let vb = u8x32::from_slice(unsafe {
+            std::slice::from_raw_parts(input.as_ptr().add(is), 32)
+        });
+        let bm = va.simd_ne(vb).to_bitmask();
+        if bm != 0 {
+            return (is - start) + bm.trailing_zeros() as usize;
+        }
+        ms += 32;
+        is += 32;
+    }
+
+    // 8-byte u64 tail.
     while is + 8 <= limit {
         let diff = unsafe { read_u64(input, ms) ^ read_u64(input, is) };
         if diff == 0 {
@@ -364,7 +418,6 @@ fn count_match(input: &[u8], mut ms: usize, mut is: usize, limit: usize) -> usiz
             return (is - start) + (diff.trailing_zeros() as usize >> 3);
         }
     }
-    // Tail: byte-at-a-time.
     while is < limit && unsafe { *input.get_unchecked(ms) == *input.get_unchecked(is) } {
         ms += 1;
         is += 1;

@@ -495,35 +495,33 @@ pub struct Dict {
     pub buf: Vec<u8>,
     /// Total bytes ever written (used to compute the wrapped position).
     pub total: u64,
+    /// `buf.len() - 1` when capacity is a power of two (fast modulo via
+    /// bitwise AND), or 0 to signal that real modulo is needed.
+    mask: usize,
 }
 
 impl Dict {
     pub fn new(size: usize) -> Self {
-        // Always allocate at least 1 so byte_at() never indexes into an
-        // empty Vec on a freshly-created decoder.
-        //
-        // Skip zero-initialization: byte_at() / repeat() only ever read
-        // positions that have already been written via push(), so the
-        // initial contents don't matter.  This shaves the (potentially
-        // 8+ MiB) memset that dominates small-input decompress times.
         let cap = size.max(1);
         let mut buf: Vec<u8> = Vec::with_capacity(cap);
-        // SAFETY: We never read from `buf[i]` until `push()` writes
-        // there.  `byte_at(back_offset)` returns 0 if `back_offset >
-        // total`, and `repeat()` rejects offsets larger than the buffer
-        // before doing any reads — both checks happen BEFORE any
-        // possibly-uninit memory is touched.
         unsafe { buf.set_len(cap); }
-        Self { buf, total: 0 }
+        let mask = if cap.is_power_of_two() { cap - 1 } else { 0 };
+        Self { buf, total: 0, mask }
     }
 
     pub fn capacity(&self) -> usize {
         self.buf.len()
     }
 
+    /// Fast cyclic-buffer index: uses bitwise AND for power-of-2 buffers.
+    #[inline(always)]
+    fn wrap(&self, pos: usize) -> usize {
+        if self.mask != 0 { pos & self.mask } else { pos % self.buf.len() }
+    }
+
     /// Position within the cyclic buffer for the NEXT byte to be written.
     pub fn position(&self) -> usize {
-        (self.total as usize) % self.buf.len()
+        self.wrap(self.total as usize)
     }
 
     /// Most recently written byte (or 0 if dict is empty).
@@ -531,7 +529,7 @@ impl Dict {
         if self.total == 0 {
             0
         } else {
-            let pos = ((self.total - 1) as usize) % self.buf.len();
+            let pos = self.wrap((self.total - 1) as usize);
             self.buf[pos]
         }
     }
@@ -544,16 +542,13 @@ impl Dict {
         if back_offset == 0 || (back_offset as u64) > self.total {
             return 0;
         }
-        let cap = self.buf.len();
-        let pos = (self.total as usize + cap - back_offset) % cap;
-        self.buf[pos]
+        let pos = self.wrap(self.total as usize + self.buf.len() - back_offset);
+        unsafe { *self.buf.as_ptr().add(pos) }
     }
 
     #[inline(always)]
     pub fn push(&mut self, b: u8) {
-        let cap = self.buf.len();
-        let pos = (self.total as usize) % cap;
-        // SAFETY: pos < cap because of the modulo, and buf.len() == cap.
+        let pos = self.wrap(self.total as usize);
         unsafe { *self.buf.as_mut_ptr().add(pos) = b; }
         self.total += 1;
     }
@@ -573,51 +568,53 @@ impl Dict {
             ));
         }
         let cap = self.buf.len();
-        let mut dst = (self.total as usize) % cap;
-        let mut src = (self.total as usize + cap - back_offset) % cap;
+        let mut dst = self.wrap(self.total as usize);
+        let mut src = self.wrap(self.total as usize + cap - back_offset);
 
-        // Fast path: the entire copy stays inside [0, cap) on both sides
-        // and never wraps the cyclic buffer.  Picks one of three sub-cases:
-        //
-        //  * back_offset == 1   → ptr::write_bytes (RLE byte fill)
-        //  * back_offset >= len → non-overlapping memcpy via copy_nonoverlapping
-        //  * back_offset <  len → overlapping; fall through to byte-by-byte
+        // Fast path: neither src nor dst wraps the cyclic buffer.
         let no_wrap_dst = dst + len <= cap;
-        let no_wrap_src = if src <= dst { src + len <= cap } else { src + len <= cap };
+        let no_wrap_src = src + len <= cap;
         if no_wrap_dst && no_wrap_src {
             unsafe {
                 let p = self.buf.as_mut_ptr();
                 if back_offset == 1 {
-                    // RLE: write `len` copies of buf[src].
                     let b = *p.add(src);
                     std::ptr::write_bytes(p.add(dst), b, len);
-                    self.total += len as u64;
-                    return Ok(());
-                }
-                if back_offset >= len {
+                } else if back_offset >= len {
                     std::ptr::copy_nonoverlapping(p.add(src), p.add(dst), len);
-                    self.total += len as u64;
-                    return Ok(());
+                } else {
+                    // Overlapping: copy in back_offset-sized chunks so
+                    // the repeating pattern propagates correctly.
+                    let mut w = 0usize;
+                    while w + back_offset <= len {
+                        std::ptr::copy_nonoverlapping(
+                            p.add(src + w), p.add(dst + w), back_offset,
+                        );
+                        w += back_offset;
+                    }
+                    if w < len {
+                        std::ptr::copy_nonoverlapping(
+                            p.add(src + w), p.add(dst + w), len - w,
+                        );
+                    }
                 }
-                // Overlapping (back_offset < len): walk byte-by-byte but
-                // without the function-call overhead of push/byte_at.
-                for _ in 0..len {
-                    let b = *p.add(src);
-                    *p.add(dst) = b;
-                    src += 1;
-                    dst += 1;
-                }
-                self.total += len as u64;
-                return Ok(());
             }
+            self.total += len as u64;
+            return Ok(());
         }
 
-        // Slow path: at least one of the dst/src ranges crosses the cyclic
-        // buffer boundary.  Fall back to per-byte copy via the existing
-        // helpers.
+        // Slow path: at least one side wraps.  Uses wrap() (bitwise AND
+        // for power-of-2 dicts) instead of modulo per byte.
         for _ in 0..len {
-            let b = self.byte_at(back_offset);
-            self.push(b);
+            let s = self.wrap(src);
+            let d = self.wrap(dst);
+            unsafe {
+                let p = self.buf.as_mut_ptr();
+                *p.add(d) = *p.add(s);
+            }
+            src += 1;
+            dst += 1;
+            self.total += 1;
         }
         Ok(())
     }

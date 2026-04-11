@@ -883,16 +883,22 @@ fn encode_offset_value(offset: u32, lit_len: u32, rep: &[u32; 3]) -> u32 {
     offset + 3
 }
 
-#[inline]
+#[inline(always)]
 fn insert_hash(head: &mut [u32], prev: &mut [u32], input: &[u8], pos: usize) {
     if pos + 4 > input.len() {
         return;
     }
-    let h = hash4(&input[pos..]);
-    if !prev.is_empty() {
-        prev[pos & CHAIN_MASK] = head[h];
+    // Inline hash4 to avoid a slice re-bound and use direct unchecked access.
+    let v = unsafe {
+        std::ptr::read_unaligned(input.as_ptr().add(pos) as *const u32)
+    };
+    let h = (v.wrapping_mul(2654435761) >> (32 - HASH_BITS)) as usize & HASH_MASK;
+    unsafe {
+        if !prev.is_empty() {
+            *prev.get_unchecked_mut(pos & CHAIN_MASK) = *head.get_unchecked(h);
+        }
+        *head.get_unchecked_mut(h) = pos as u32;
     }
-    head[h] = pos as u32;
 }
 
 /// Specialized fast path for level 1.  No chain, no lazy match, aggressive
@@ -1092,7 +1098,37 @@ fn u64_at(input: &[u8], idx: usize) -> u64 {
 /// to: x86_64, aarch64, wasm32).
 #[inline(always)]
 fn count_common_bytes(input: &[u8], a: usize, b: usize, max: usize) -> usize {
+    use core::simd::cmp::SimdPartialEq;
+    use core::simd::u8x32;
+
     let mut n = 0usize;
+
+    // First 8 bytes via u64 — handles the common short-match case (most
+    // hash hits extend by only 0-7 bytes) without SIMD setup overhead.
+    if n + 8 <= max {
+        let x = u64_at(input, a + n) ^ u64_at(input, b + n);
+        if x != 0 {
+            return n + (x.trailing_zeros() as usize / 8);
+        }
+        n += 8;
+    }
+
+    // For longer matches, escalate to 32-byte SIMD chunks.
+    while n + 32 <= max {
+        let va = u8x32::from_slice(unsafe {
+            std::slice::from_raw_parts(input.as_ptr().add(a + n), 32)
+        });
+        let vb = u8x32::from_slice(unsafe {
+            std::slice::from_raw_parts(input.as_ptr().add(b + n), 32)
+        });
+        let bm = va.simd_ne(vb).to_bitmask();
+        if bm != 0 {
+            return n + bm.trailing_zeros() as usize;
+        }
+        n += 32;
+    }
+
+    // 8-byte u64 tail.
     while n + 8 <= max {
         let x = u64_at(input, a + n) ^ u64_at(input, b + n);
         if x == 0 {

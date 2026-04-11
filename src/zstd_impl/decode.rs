@@ -310,17 +310,32 @@ fn decode_compressed_block(
                 format!("zstd: match offset {} exceeds available history {}", offset, output.len()),
             ));
         }
-        let match_start = output.len() - offset as usize;
-        if offset as usize >= match_len {
-            output.extend_from_within(match_start..match_start + match_len);
-        } else {
-            let mut remaining = match_len;
-            while remaining > 0 {
-                let copy_len = remaining.min(offset as usize);
-                let src = output.len() - offset as usize;
-                output.extend_from_within(src..src + copy_len);
-                remaining -= copy_len;
+        let off = offset as usize;
+        output.reserve(match_len);
+        unsafe {
+            let base = output.as_mut_ptr();
+            let cur = output.len();
+            let src = cur - off;
+            let dst = cur;
+            if off >= match_len {
+                // Non-overlapping: single bulk copy.
+                std::ptr::copy_nonoverlapping(base.add(src), base.add(dst), match_len);
+            } else if off == 1 {
+                // RLE: fill with a single repeated byte.
+                std::ptr::write_bytes(base.add(dst), *base.add(src), match_len);
+            } else {
+                // Overlapping: copy in offset-sized chunks so the pattern
+                // propagates, then a tail copy for the remainder.
+                let mut w = 0usize;
+                while w + off <= match_len {
+                    std::ptr::copy_nonoverlapping(base.add(src + w), base.add(dst + w), off);
+                    w += off;
+                }
+                if w < match_len {
+                    std::ptr::copy_nonoverlapping(base.add(src + w), base.add(dst + w), match_len - w);
+                }
             }
+            output.set_len(cur + match_len);
         }
 
         // 5. Update FSE states (except for the last sequence).
