@@ -221,6 +221,105 @@ impl HufTable {
             i += 1;
         }
     }
+
+    /// 4-stream interleaved Huffman decode. Decodes 4 independent bit streams
+    /// into 4 contiguous segments of `out_ptr[..regen_size]` by stepping all
+    /// streams in lockstep. This exposes memory-level parallelism so the OOO
+    /// engine can overlap the 4 table-load → shift → store dependency chains
+    /// that serialize within a single stream.
+    ///
+    /// `out_ptr` points at the start of the output buffer; segment starts at
+    /// offsets `0`, `s1`, `s1+s2`, `s1+s2+s3` (the first three of length
+    /// `seg_size`, the fourth of length `regen_size - 3*seg_size`).
+    ///
+    /// # Safety
+    /// * `out_ptr` must point to a writable region of at least `regen_size`
+    ///   bytes (the 4 segments are written in bounds).
+    /// * `r1`..`r4` must already have their padding skipped.
+    #[inline(always)]
+    pub unsafe fn decode_4stream_interleaved(
+        &self,
+        r1: &mut ReverseBitReader,
+        r2: &mut ReverseBitReader,
+        r3: &mut ReverseBitReader,
+        r4: &mut ReverseBitReader,
+        out_ptr: *mut u8,
+        seg_size: usize,
+        last_size: usize,
+    ) {
+        let max_bits = self.max_bits;
+        let table_ptr = self.table.as_ptr();
+        // Segment starts.
+        let mut p1 = 0usize;
+        let mut p2 = seg_size;
+        let mut p3 = seg_size * 2;
+        let mut p4 = seg_size * 3;
+        // Segment ends.
+        let e1 = seg_size;
+        let e2 = seg_size * 2;
+        let e3 = seg_size * 3;
+        let e4 = seg_size * 3 + last_size;
+
+        // Main interleaved loop: 5 symbols per stream per refill, all 4 in
+        // lockstep. 20 symbols per iteration. Runs while every stream has
+        // room for 5 more symbols. Stops short of the shortest segment end
+        // (the last segment is ≤ seg_size; segments 1-3 are exactly seg_size
+        // so p1..p3 reach `seg_size` first).
+        if max_bits * 5 <= 56 {
+            let batch_bits = max_bits * 5;
+            // Shortest segment end is e4 in general (last stream is always
+            // the short one). But be safe and check all 4.
+            while p1 + 5 <= e1
+                && p2 + 5 <= e2
+                && p3 + 5 <= e3
+                && p4 + 5 <= e4
+            {
+                r1.ensure_bits(batch_bits);
+                r2.ensure_bits(batch_bits);
+                r3.ensure_bits(batch_bits);
+                r4.ensure_bits(batch_bits);
+                unsafe {
+                    // Unroll 5 times. The inner order (r1, r2, r3, r4 per
+                    // symbol position) keeps independent dependency chains
+                    // adjacent so the CPU can overlap them.
+                    macro_rules! one {
+                        ($r:ident, $p:ident) => {{
+                            let idx = $r.peek_bits(max_bits);
+                            let e = *table_ptr.add(idx as usize);
+                            $r.consume(e.num_bits as u32);
+                            *out_ptr.add($p) = e.symbol;
+                            $p += 1;
+                        }};
+                    }
+                    one!(r1, p1); one!(r2, p2); one!(r3, p3); one!(r4, p4);
+                    one!(r1, p1); one!(r2, p2); one!(r3, p3); one!(r4, p4);
+                    one!(r1, p1); one!(r2, p2); one!(r3, p3); one!(r4, p4);
+                    one!(r1, p1); one!(r2, p2); one!(r3, p3); one!(r4, p4);
+                    one!(r1, p1); one!(r2, p2); one!(r3, p3); one!(r4, p4);
+                }
+            }
+        }
+
+        // Tail: each stream to completion, one symbol at a time.
+        unsafe {
+            while p1 < e1 {
+                *out_ptr.add(p1) = self.decode_symbol(r1);
+                p1 += 1;
+            }
+            while p2 < e2 {
+                *out_ptr.add(p2) = self.decode_symbol(r2);
+                p2 += 1;
+            }
+            while p3 < e3 {
+                *out_ptr.add(p3) = self.decode_symbol(r3);
+                p3 += 1;
+            }
+            while p4 < e4 {
+                *out_ptr.add(p4) = self.decode_symbol(r4);
+                p4 += 1;
+            }
+        }
+    }
 }
 
 /// Decode Huffman weights using a 2-state FSE-compressed backward bitstream
@@ -266,36 +365,33 @@ fn decode_weights_fse(data: &[u8]) -> io::Result<Vec<u8>> {
     Ok(weights)
 }
 
-/// Decode Huffman-compressed literals using 1 stream.
-///
-/// Uses the bulk `decode_symbols_into` path which batches 5 symbols per
-/// bit-reader refill check.
-pub fn decode_literals_1stream(table: &HufTable, data: &[u8], regen_size: usize) -> io::Result<Vec<u8>> {
-    let mut bits = ReverseBitReader::new(data)?;
-    bits.skip_padding_bits()?;
-    let mut output = vec![0u8; regen_size];
-    table.decode_symbols_into(&mut bits, &mut output);
-    Ok(output)
-}
-
-/// Decode Huffman-compressed literals into a caller-provided buffer.
-fn decode_1stream_into(
+/// Decode 1-stream Huffman literals into a caller-provided buffer of
+/// exactly the regenerated size. Uses the bulk `decode_symbols_into` path
+/// which batches 5 symbols per bit-reader refill check.
+pub fn decode_literals_1stream_into(
     table: &HufTable,
     data: &[u8],
-    out: &mut [u8],
-) -> io::Result<usize> {
+    output: &mut [u8],
+) -> io::Result<()> {
     let mut bits = ReverseBitReader::new(data)?;
     bits.skip_padding_bits()?;
-    let regen = out.len();
-    table.decode_symbols_into(&mut bits, out);
-    Ok(regen)
+    table.decode_symbols_into(&mut bits, output);
+    Ok(())
 }
 
-/// Decode Huffman-compressed literals using 4 streams.
+/// Decode 4-stream Huffman literals into a caller-provided buffer of
+/// exactly `regen_size` bytes.
 ///
-/// Decodes all 4 streams directly into a single pre-allocated buffer,
-/// avoiding 4 intermediate Vec allocations + copies.
-pub fn decode_literals_4stream(table: &HufTable, data: &[u8], regen_size: usize) -> io::Result<Vec<u8>> {
+/// Decodes all 4 streams in lockstep into a single pre-allocated buffer,
+/// exposing memory-level parallelism so the CPU can overlap the 4
+/// table-load → shift → store dependency chains that serialize within a
+/// single stream. A sequential 4-stream walk would only reach ~25% of the
+/// interleaved throughput on modern OOO cores.
+pub fn decode_literals_4stream_into(
+    table: &HufTable,
+    data: &[u8],
+    output: &mut [u8],
+) -> io::Result<()> {
     if data.len() < 6 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "zstd: 4-stream Huffman header too short"));
     }
@@ -311,29 +407,43 @@ pub fn decode_literals_4stream(table: &HufTable, data: &[u8], regen_size: usize)
         return Err(io::Error::new(io::ErrorKind::InvalidData, "zstd: 4-stream jump table overflows data"));
     }
 
+    let regen_size = output.len();
     let seg_size = (regen_size + 3) / 4;
-    let sizes = [
-        seg_size.min(regen_size),
-        seg_size.min(regen_size.saturating_sub(seg_size)),
-        seg_size.min(regen_size.saturating_sub(seg_size * 2)),
-        regen_size.saturating_sub(seg_size * 3),
-    ];
-
-    let streams: [&[u8]; 4] = [
-        &s_data[..s1_end],
-        &s_data[s1_end..s2_end],
-        &s_data[s2_end..s3_end],
-        &s_data[s3_end..],
-    ];
-
-    // Decode all 4 streams directly into one pre-allocated buffer.
-    let mut output = vec![0u8; regen_size];
-    let mut offset = 0usize;
-    for i in 0..4 {
-        decode_1stream_into(table, streams[i], &mut output[offset..offset + sizes[i]])?;
-        offset += sizes[i];
+    // Sanity: first 3 segments are exactly `seg_size`; the last is the
+    // remainder. Any degenerate `regen_size < 4` hits the guarded
+    // `saturating_sub` path below and the interleaved loop degrades to
+    // its tail.
+    let last_size = regen_size.saturating_sub(seg_size.saturating_mul(3));
+    // Short-regen guard: if seg_size == 0 the output is tiny — fall back
+    // to a single-stream-per-stream tail-only decode.
+    if seg_size == 0 {
+        // Nothing to do; output is empty or near-empty.
+        return Ok(());
     }
-    Ok(output)
+
+    let mut r1 = ReverseBitReader::new(&s_data[..s1_end])?;
+    let mut r2 = ReverseBitReader::new(&s_data[s1_end..s2_end])?;
+    let mut r3 = ReverseBitReader::new(&s_data[s2_end..s3_end])?;
+    let mut r4 = ReverseBitReader::new(&s_data[s3_end..])?;
+    r1.skip_padding_bits()?;
+    r2.skip_padding_bits()?;
+    r3.skip_padding_bits()?;
+    r4.skip_padding_bits()?;
+
+    // SAFETY: output has exactly regen_size bytes and segment bounds are
+    // `seg_size * 3 + last_size = regen_size`.
+    unsafe {
+        table.decode_4stream_interleaved(
+            &mut r1,
+            &mut r2,
+            &mut r3,
+            &mut r4,
+            output.as_mut_ptr(),
+            seg_size,
+            last_size,
+        );
+    }
+    Ok(())
 }
 
 #[inline(always)]
@@ -1086,7 +1196,8 @@ mod tests {
         eprintln!("Huffman table: max_bits={}, table_size={}", table.max_bits, table.table.len());
 
         // Step 3: Decode literals.
-        let literals = decode_literals_1stream(&table, &huf_stream, 99).unwrap();
+        let mut literals = vec![0u8; 99];
+        decode_literals_1stream_into(&table, &huf_stream, &mut literals).unwrap();
         eprintln!("Decoded {} literals, first 20: {:?}", literals.len(), &literals[..20.min(literals.len())]);
         eprintln!("As string: {:?}", std::str::from_utf8(&literals[..20.min(literals.len())]));
 

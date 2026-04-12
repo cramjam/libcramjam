@@ -9,6 +9,9 @@ use super::huf::HufTable;
 const ZSTD_MAGIC: u32 = 0xFD2FB528;
 const MIN_WINDOW_LOG: u32 = 10;
 const MAX_WINDOW_SIZE: u64 = 1 << 27; // 128 MB cap for safety
+/// Maximum decoded size of one zstd block. Used to size the frame-lifetime
+/// literals scratch and to reserve output headroom for the SIMD wildcopy.
+const ZSTD_BLOCKSIZE_MAX: usize = 128 * 1024;
 
 // ---------------------------------------------------------------------------
 // Frame header
@@ -134,6 +137,11 @@ pub fn decode_frame(data: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
     let mut ml_table: Option<FseTable> = None;
     // Repeat offsets.
     let mut rep_offsets = [1u32, 4, 8];
+    // Frame-lifetime literals scratch. Sized to hold any one block's
+    // decompressed literals plus a 32-byte trailing dead zone used by the
+    // SIMD wildcopy in the sequence loop. Reused across all blocks in the
+    // frame so we allocate once per decode instead of twice per block.
+    let mut literals_buf: Vec<u8> = Vec::with_capacity(ZSTD_BLOCKSIZE_MAX + 32);
 
     loop {
         let block_header = r.read_u24_le()?;
@@ -164,6 +172,7 @@ pub fn decode_frame(data: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
                     &mut ml_table,
                     &mut rep_offsets,
                     header.window_size,
+                    &mut literals_buf,
                 )?;
             }
             3 => {
@@ -219,23 +228,25 @@ fn decode_compressed_block(
     ml_table: &mut Option<FseTable>,
     rep_offsets: &mut [u32; 3],
     _window_size: u64,
+    literals_buf: &mut Vec<u8>,
 ) -> io::Result<()> {
     let mut r = ForwardByteReader::new(data);
 
     // --- Literals Section ---
-    let mut literals = decode_literals_section(&mut r, huf_table)?;
-    // Track the real literal length, then add 32 bytes of dead-zone padding
-    // so the per-sequence wildcopy in the hot loop can safely over-read by up
-    // to 16 bytes without the caller having to branch on "short literal".
-    let lit_total = literals.len();
-    literals.resize(lit_total + 32, 0);
+    // Decode directly into the frame-lifetime scratch (reused across blocks)
+    // so we avoid one Vec alloc per block. `decode_literals_section_into`
+    // sets the length to the real literal count.
+    let lit_total = decode_literals_section_into(&mut r, huf_table, literals_buf)?;
+    // Pad with 32 trailing dead-zone bytes so the per-sequence 16-byte
+    // wildcopy in the hot loop can safely over-read past the last literal
+    // without the caller having to branch on "short literal".
+    literals_buf.resize(lit_total + 32, 0);
+    let literals: &[u8] = literals_buf;
 
     // Reserve the worst-case output for this block upfront so neither the
     // literal copies nor the per-sequence match wildcopy need to re-check
-    // capacity. zstd's block decoded size cap is 128 KiB (ZSTD_BLOCKSIZE_MAX);
-    // `+ 32` is dead-zone padding for the SIMD wildcopy overshoot in
-    // `cpu_features::copy_match_unchecked`.
-    const ZSTD_BLOCKSIZE_MAX: usize = 128 * 1024;
+    // capacity. The `+ 32` is dead-zone padding for the SIMD wildcopy
+    // overshoot in `cpu_features::copy_match_unchecked`.
     output.reserve(ZSTD_BLOCKSIZE_MAX + 32);
 
     // --- Sequences Section ---
@@ -284,86 +295,41 @@ fn decode_compressed_block(
     // wildcopy read past the last literal is safe and the value is discarded
     // via the tracked `lit_pos`/`lit_total` cursor. The upfront
     // `ZSTD_BLOCKSIZE_MAX + 32` reservation guards the destination overshoot.
+    //
+    // `dst_off` tracks the logical end of the output for this block. We set
+    // `output.len()` exactly once at the end of the loop instead of every
+    // sequence, saving ~1% of total Ir.
     let lit_ptr = literals.as_ptr();
+    let base = output.as_mut_ptr();
     let mut lit_pos = 0usize;
-    for i in 0..num_sequences {
-        // 1. Peek symbols from current FSE states.
-        let of_code = of_t.symbol(of_state) as u32;
-        let ml_code = ml_t.symbol(ml_state);
-        let ll_code = ll_t.symbol(ll_state);
-
-        // 2. Read extra bits in order: Offset, MatchLength, LitLength (RFC 8878 3.1.2.1.2.4).
-        let offset_value = if of_code > 0 {
-            (1u32 << of_code) + bits.get_bits(of_code)
-        } else {
-            1
-        };
-        // SAFETY: `ml_code` and `ll_code` come from FSE tables built with
-        // max_symbol 52 / 35 respectively, so both are in range of the
-        // MATCHLEN_TABLE / LITLEN_TABLE arrays.
-        let match_len = unsafe { decode_match_length_fast(ml_code, &mut bits) };
-        let lit_len = unsafe { decode_lit_length_fast(ll_code, &mut bits) };
-
-        // 3. Resolve offset (handles repeat offsets per RFC 8878 3.1.2.1.3).
-        let offset = resolve_offset(offset_value, rep_offsets, lit_len);
-
-        // 4. Execute: copy literals, then copy match. Both writes live inside
-        // the upfront-reserved block capacity; we use raw pointers to avoid
-        // the per-iteration bounds check / Vec reserve path.
-        if lit_pos + lit_len > lit_total {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "zstd: literals length exceeds available literals",
-            ));
-        }
-        // zstd semantics: the offset is measured from AFTER the literal run
-        // is appended, so the in-history check must compare against
-        // `cur + lit_len`, not just `cur`. A match starting inside the
-        // freshly-copied literals is valid.
-        let cur = output.len();
-        let post_lit = cur + lit_len;
-        let off = offset as usize;
-        if off == 0 || off > post_lit {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("zstd: match offset {} exceeds available history {}", offset, post_lit),
-            ));
-        }
-        unsafe {
-            let base = output.as_mut_ptr();
-            // Literal copy: 16-byte SIMD wildcopy. The literals buffer was
-            // padded with 32 trailing zero bytes, and the output has the
-            // 128 KiB + 32 block reservation, so the up-to-15-byte over-read
-            // and over-write are both in-allocation. `lit_pos` tracks the
-            // real position and is advanced by the logical length only.
-            crate::cpu_features::wildcopy_chunks::<16>(
-                lit_ptr.add(lit_pos),
-                base.add(cur),
-                lit_len,
-            );
-            lit_pos += lit_len;
-
-            // Match copy: SIMD wildcopy kernel dispatching on offset.
-            let src = base.add(post_lit - off);
-            let dst = base.add(post_lit);
-            crate::cpu_features::copy_match_unchecked(src, dst, off, match_len);
-            output.set_len(post_lit + match_len);
-        }
-
-        // 5. Update FSE states (except for the last sequence).
-        //    Order: LL, ML, OF (RFC 8878 3.1.2.1.2.4).
-        //
-        //    Max FSE accuracy_log is 9 (LL) + 8 (OF) + 9 (ML) = 26 bits for
-        //    all three state reads combined. One `ensure_bits(26)` call
-        //    refills (if needed) once, then the three `next_state_fast`
-        //    calls each skip the per-call refill-check branch.
-        if i < num_sequences - 1 {
-            bits.ensure_bits(26);
-            ll_state = ll_t.next_state_fast(ll_state, &mut bits);
-            ml_state = ml_t.next_state_fast(ml_state, &mut bits);
-            of_state = of_t.next_state_fast(of_state, &mut bits);
-        }
+    let mut dst_off = output.len();
+    // Peel off the last iteration so the state-update branch (`if i <
+    // num_sequences - 1`) disappears from the hot body — we update state on
+    // every iteration except the last, and the peeled tail has no update.
+    let main_iters = num_sequences - 1;
+    for _ in 0..main_iters {
+        let r = decode_one_sequence(
+            of_t, ml_t, ll_t,
+            &mut of_state, &mut ml_state, &mut ll_state,
+            &mut bits,
+            lit_ptr, base, lit_total, &mut lit_pos, &mut dst_off,
+            rep_offsets,
+            true,
+        )?;
+        debug_assert!(r);
     }
+    // Final sequence: no trailing state update.
+    decode_one_sequence(
+        of_t, ml_t, ll_t,
+        &mut of_state, &mut ml_state, &mut ll_state,
+        &mut bits,
+        lit_ptr, base, lit_total, &mut lit_pos, &mut dst_off,
+        rep_offsets,
+        false,
+    )?;
+
+    // Commit the accumulated output length in one shot.
+    unsafe { output.set_len(dst_off); }
 
     // Append remaining literals after all sequences. Use the tracked real
     // literal length (`lit_total`) rather than `literals.len()` so we don't
@@ -375,14 +341,147 @@ fn decode_compressed_block(
     Ok(())
 }
 
+/// Decode one sequence from the FSE-driven backward bit stream and execute
+/// its literal+match copies into `output_base`. Centralized into a single
+/// `#[inline(always)]` helper so the main loop body and peeled final
+/// iteration share the same compiled code.
+///
+/// `update_state`: when true, run the trailing `ensure_bits(26) + 3x
+/// next_state_fast` to advance the FSE states for the next iteration.
+///
+/// # Safety
+/// * `lit_ptr` must point into a literal buffer of at least `lit_total + 16`
+///   valid bytes (the trailing 16 are wildcopy padding).
+/// * `output_base` must point into a buffer with at least 128 KiB + 32 bytes
+///   of headroom at `*dst_off` (the upfront block reservation).
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn decode_one_sequence(
+    of_t: &FseTable,
+    ml_t: &FseTable,
+    ll_t: &FseTable,
+    of_state: &mut u32,
+    ml_state: &mut u32,
+    ll_state: &mut u32,
+    bits: &mut ReverseBitReader,
+    lit_ptr: *const u8,
+    output_base: *mut u8,
+    lit_total: usize,
+    lit_pos: &mut usize,
+    dst_off: &mut usize,
+    rep_offsets: &mut [u32; 3],
+    update_state: bool,
+) -> io::Result<bool> {
+    // 1. Peek symbols from current FSE states.
+    let of_code = of_t.symbol(*of_state) as u32;
+    let ml_code = ml_t.symbol(*ml_state);
+    let ll_code = ll_t.symbol(*ll_state);
+
+    // 2. Read extra bits in order: Offset, MatchLength, LitLength
+    // (RFC 8878 3.1.2.1.2.4). When the combined extras fit in the
+    // 56-bit window, do one refill and three fast reads — saves two
+    // refill branches per sequence and stacks cleanly with the later
+    // `ensure_bits(26)` for the state update.
+    //
+    // SAFETY: `ml_code`/`ll_code` come from FSE tables with max symbol
+    // 52/35, so both are in range of MATCHLEN_TABLE / LITLEN_TABLE.
+    let (ml_base, ml_extra) = unsafe { *fse::MATCHLEN_TABLE.get_unchecked(ml_code as usize) };
+    let (ll_base, ll_extra) = unsafe { *fse::LITLEN_TABLE.get_unchecked(ll_code as usize) };
+    let extras_total = of_code + ml_extra as u32 + ll_extra as u32;
+    let (offset_value, match_len, lit_len) = if extras_total <= 56 {
+        bits.ensure_bits(extras_total);
+        // Zero-bit reads are defined (shift wrap + zero mask). When
+        // of_code == 0: (1 << 0) + 0 == 1, matching the "offset_value = 1"
+        // special case without a branch.
+        let of_extra_val = bits.get_bits_fast(of_code);
+        let offset_value = (1u32 << of_code) + of_extra_val;
+        let ml_extra_val = bits.get_bits_fast(ml_extra as u32);
+        let match_len = (ml_base + ml_extra_val) as usize;
+        let ll_extra_val = bits.get_bits_fast(ll_extra as u32);
+        let lit_len = (ll_base + ll_extra_val) as usize;
+        (offset_value, match_len, lit_len)
+    } else {
+        // Fallback for pathological windowLog + max extras combos.
+        let offset_value = (1u32 << of_code) + bits.get_bits(of_code);
+        let match_len = (ml_base + bits.get_bits(ml_extra as u32)) as usize;
+        let lit_len = (ll_base + bits.get_bits(ll_extra as u32)) as usize;
+        (offset_value, match_len, lit_len)
+    };
+
+    // 3. Resolve offset (handles repeat offsets per RFC 8878 3.1.2.1.3).
+    let offset = resolve_offset(offset_value, rep_offsets, lit_len);
+
+    // 4. Execute: copy literals, then copy match. The upfront `output.reserve`
+    // and the 32-byte literals padding let us use raw pointers without
+    // re-checking capacity per iteration. Both safety checks are collapsed
+    // into one `|`-combined test with a cold error helper so the hot body
+    // gets a single branch that the predictor rings like a dial tone.
+    let cur = *dst_off;
+    let post_lit = cur + lit_len;
+    let off = offset as usize;
+    // Branchless combined check: any of the four bad conditions sets the
+    // `err_mask` to nonzero; we branch once on the OR. Using `|` (not `||`)
+    // so the compiler sees a single conditional move pattern.
+    let bad_lit = (*lit_pos + lit_len > lit_total) as u32;
+    let bad_off_zero = (off == 0) as u32;
+    let bad_off_big = (off > post_lit) as u32;
+    if (bad_lit | bad_off_zero | bad_off_big) != 0 {
+        return seq_validation_error(*lit_pos, lit_len, lit_total, offset, post_lit);
+    }
+    unsafe {
+        crate::cpu_features::wildcopy_chunks::<16>(
+            lit_ptr.add(*lit_pos),
+            output_base.add(cur),
+            lit_len,
+        );
+        *lit_pos += lit_len;
+
+        let src = output_base.add(post_lit - off);
+        let dst = output_base.add(post_lit);
+        crate::cpu_features::copy_match_unchecked(src, dst, off, match_len);
+    }
+    *dst_off = post_lit + match_len;
+
+    // 5. Update FSE states (except on the peeled last sequence).
+    //    Order: LL, ML, OF (RFC 8878 3.1.2.1.2.4). Max accuracy_log is
+    //    9 + 8 + 9 = 26 bits across all three reads — one ensure_bits,
+    //    three fast reads.
+    //
+    // Performance detail: we load all three table entries BEFORE doing any
+    // bit reads. The 3 table loads are fully independent (different state
+    // indices in different tables) so the OOO engine can pipeline them,
+    // whereas the bit reads serialize through the shared bit container.
+    // Naively calling `next_state_fast` three times interleaves load/read
+    // and stalls on each load's ~4-cycle latency. Load-first shaves one
+    // load-to-use latency from the critical path per iteration.
+    if update_state {
+        bits.ensure_bits(26);
+        let ll_entry = ll_t.entry_at(*ll_state);
+        let ml_entry = ml_t.entry_at(*ml_state);
+        let of_entry = of_t.entry_at(*of_state);
+        let ll_lb = bits.get_bits_fast(ll_entry.num_bits as u32);
+        let ml_lb = bits.get_bits_fast(ml_entry.num_bits as u32);
+        let of_lb = bits.get_bits_fast(of_entry.num_bits as u32);
+        *ll_state = ll_entry.baseline as u32 + ll_lb;
+        *ml_state = ml_entry.baseline as u32 + ml_lb;
+        *of_state = of_entry.baseline as u32 + of_lb;
+    }
+    Ok(true)
+}
+
 // ---------------------------------------------------------------------------
 // Literals section
 // ---------------------------------------------------------------------------
 
-fn decode_literals_section(
+/// Decode the literals section directly into `buf`, truncating/growing as
+/// needed. Returns the real decoded-literal count. `buf` may have trailing
+/// garbage past the returned length (the caller pads to +32 before the
+/// sequence loop anyway).
+fn decode_literals_section_into(
     r: &mut ForwardByteReader,
     huf_table: &mut Option<HufTable>,
-) -> io::Result<Vec<u8>> {
+    buf: &mut Vec<u8>,
+) -> io::Result<usize> {
     let byte0 = r.read_u8()?;
     let lit_type = byte0 & 3;
     let size_format = (byte0 >> 2) & 3;
@@ -392,13 +491,17 @@ fn decode_literals_section(
             // Raw literals.
             let regen_size = decode_lit_size_raw(byte0, size_format, r)?;
             let raw = r.read_bytes(regen_size)?;
-            Ok(raw.to_vec())
+            buf.clear();
+            buf.extend_from_slice(raw);
+            Ok(regen_size)
         }
         1 => {
             // RLE literals.
             let regen_size = decode_lit_size_raw(byte0, size_format, r)?;
             let byte = r.read_u8()?;
-            Ok(vec![byte; regen_size])
+            buf.clear();
+            buf.resize(regen_size, byte);
+            Ok(regen_size)
         }
         2 | 3 => {
             // Compressed or Treeless literals.
@@ -421,11 +524,18 @@ fn decode_literals_section(
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "zstd: treeless literals without prior Huffman table"))?;
 
             let stream_data = &lit_data[pos..];
+            // Resize to exactly `regen_size` so the inner decoders see an
+            // uninitialized (but valid) region to fill. We're about to
+            // overwrite every byte; the `resize` zeroes fresh bytes which
+            // is fine — the wildcopy-tail padding is applied by the caller.
+            buf.clear();
+            buf.resize(regen_size, 0);
             if four_streams {
-                super::huf::decode_literals_4stream(table, stream_data, regen_size)
+                super::huf::decode_literals_4stream_into(table, stream_data, buf)?;
             } else {
-                super::huf::decode_literals_1stream(table, stream_data, regen_size)
+                super::huf::decode_literals_1stream_into(table, stream_data, buf)?;
             }
+            Ok(regen_size)
         }
         _ => unreachable!(),
     }
@@ -622,32 +732,32 @@ fn resolve_offset(offset_value: u32, rep: &mut [u32; 3], lit_len: usize) -> u32 
     }
 }
 
-/// Decode a literals-length value (base + extra_bits) for `code`.
-///
-/// # Safety
-/// `code < 36`. The LL FSE tables (predefined and custom) are constructed
-/// with exactly 36 symbols, so any symbol returned by `FseTable::symbol` is
-/// in range.
-#[inline(always)]
-unsafe fn decode_lit_length_fast(code: u8, bits: &mut ReverseBitReader) -> usize {
-    debug_assert!((code as usize) < fse::LITLEN_TABLE.len());
-    let (baseline, extra_bits) = unsafe { *fse::LITLEN_TABLE.get_unchecked(code as usize) };
-    let extra = bits.get_bits(extra_bits as u32);
-    (baseline + extra) as usize
+/// Cold error helper for the sequence-loop safety checks. Out-of-line so the
+/// hot path only pays for one taken branch + one fall-through, not the
+/// register spilling that `format!` would force inline.
+#[cold]
+#[inline(never)]
+fn seq_validation_error(
+    lit_pos: usize,
+    lit_len: usize,
+    lit_total: usize,
+    offset: u32,
+    post_lit: usize,
+) -> io::Result<bool> {
+    if lit_pos + lit_len > lit_total {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "zstd: literals length exceeds available literals",
+        ));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "zstd: match offset {} exceeds available history {}",
+            offset, post_lit
+        ),
+    ))
 }
-
-/// Decode a match-length value (base + extra_bits) for `code`.
-///
-/// # Safety
-/// `code < 53`. See [`decode_lit_length_fast`] for the invariant.
-#[inline(always)]
-unsafe fn decode_match_length_fast(code: u8, bits: &mut ReverseBitReader) -> usize {
-    debug_assert!((code as usize) < fse::MATCHLEN_TABLE.len());
-    let (baseline, extra_bits) = unsafe { *fse::MATCHLEN_TABLE.get_unchecked(code as usize) };
-    let extra = bits.get_bits(extra_bits as u32);
-    (baseline + extra) as usize
-}
-
 
 // ---------------------------------------------------------------------------
 // XXHash64 (lower 32 bits) for content checksum

@@ -228,22 +228,16 @@ impl FseTable {
         entry.baseline as u32 + low_bits
     }
 
-    /// Like `next_state`, but uses the refill-free `get_bits_fast` path.
-    ///
-    /// # Preconditions
-    /// Caller must have called `bits.ensure_bits(ACC_LOG)` recently enough
-    /// that `bits_consumed + entry.num_bits <= 64`. In practice callers
-    /// ensure headroom for the *sum* of a batch of fast calls before the
-    /// first one.
+    /// Raw table entry at a state — for callers that want to interleave
+    /// FSE table loads across multiple tables before serializing through
+    /// the shared bit reader.
     ///
     /// # Safety invariant
-    /// `state < table.len()`.
+    /// `state < table.len()` (same as [`symbol`]).
     #[inline(always)]
-    pub fn next_state_fast(&self, state: u32, bits: &mut ReverseBitReader) -> u32 {
+    pub fn entry_at(&self, state: u32) -> FseEntry {
         debug_assert!((state as usize) < self.table.len());
-        let entry = unsafe { self.table.get_unchecked(state as usize) };
-        let low_bits = bits.get_bits_fast(entry.num_bits as u32);
-        entry.baseline as u32 + low_bits
+        unsafe { *self.table.get_unchecked(state as usize) }
     }
 }
 
