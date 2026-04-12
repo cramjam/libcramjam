@@ -346,48 +346,324 @@ fn forward_bwt(input: &[u8]) -> (Vec<u8>, usize) {
         return (vec![input[0]], 0);
     }
 
-    if is_high_entropy_input(input) {
-        bwt_via_prefix_doubling(input)
-    } else {
-        bwt_via_sais(input)
+    match bwt_via_main_sort(input) {
+        Some(result) => result,
+        None => bwt_via_sais(input),
     }
 }
 
-/// Heuristic: input is "high entropy" (random-like) iff its number of
-/// distinct cyclic 2-grams is > n/2.  Costs O(n) time and O(65536/8) bytes.
-fn is_high_entropy_input(input: &[u8]) -> bool {
+// =========================================================================
+// mainSort BWT — port of C bzip2's blocksort algorithm
+// =========================================================================
+//
+// Sorts cyclic rotations of `input` using:
+//   1. Radix sort by first 2 bytes into 65536 sub-buckets.
+//   2. Shell sort within each sub-bucket using byte-by-byte comparison.
+//   3. Quadrant array (u32 per position) for O(1) tiebreaking at depth > 2.
+//   4. Comparison budget — returns None if exceeded (caller falls back to SA-IS).
+//
+// Works directly on u8 input (no doubling), with a 34-byte cyclic overshoot
+// appended to the block for safe over-read in comparisons.
+
+const BZ_OVERSHOOT: usize = 34;
+const SHELL_INCS: [usize; 10] = [1, 4, 13, 40, 121, 364, 1093, 3280, 9841, 29524];
+/// Bit flag in ftab[] marking a sub-bucket as already sorted.
+const SETMASK: u32 = 1 << 21;
+const CLEARMASK: u32 = !SETMASK;
+
+fn bwt_via_main_sort(input: &[u8]) -> Option<(Vec<u8>, usize)> {
     let n = input.len();
-    if n < 32 {
-        // For very small inputs the heuristic isn't meaningful — the
-        // doubling-vs-sais constant factor doesn't matter either, so use
-        // prefix doubling (simpler / lower setup cost).
-        return true;
+
+    // Block with cyclic overshoot for safe over-read in comparisons.
+    let mut block = vec![0u8; n + BZ_OVERSHOOT];
+    block[..n].copy_from_slice(input);
+    for i in 0..BZ_OVERSHOOT {
+        block[n + i] = input[i % n];
     }
-    // Bitset of seen 2-grams (8 KB).
-    let mut seen = [0u64; 1024]; // 1024 * 64 = 65536 bits
-    let mut distinct = 0usize;
+
+    // Quadrant: per-position rank within its "big bucket" (all positions
+    // sharing the same first byte).  Used as tiebreaker in deep comparisons.
+    let mut quadrant = vec![0u32; n + BZ_OVERSHOOT];
+
+    // 2-byte pair frequency table.  ftab[(c0<<8)|c1] = number of positions
+    // where block[pos]==c0 and block[pos+1]==c1.
+    let mut ftab = vec![0u32; 65537];
+
+    // Output: sorted rotation indices.
+    let mut ptr = vec![0u32; n];
+
+    // Comparison budget: 7*n is the same heuristic C bzip2 uses.
+    let mut budget = (n as i32).saturating_mul(7);
+
+    // ---- Step 1: Count 2-byte pairs ----
     for i in 0..n {
-        let next = if i + 1 == n { 0 } else { i + 1 };
-        let g = ((input[i] as usize) << 8) | input[next] as usize;
-        let word = g >> 6;
-        let bit = 1u64 << (g & 63);
-        if seen[word] & bit == 0 {
-            seen[word] |= bit;
-            distinct += 1;
-            if distinct > n / 2 {
-                return true;
+        let j = ((block[i] as usize) << 8) | block[i + 1] as usize;
+        ftab[j] += 1;
+    }
+
+    // ---- Step 2: Cumulative sum → bucket start indices ----
+    for i in 1..65537 {
+        ftab[i] += ftab[i - 1];
+    }
+
+    // ---- Step 3: Place each position into its sub-bucket ----
+    // Walk backwards so positions land in the correct initial order within
+    // each bucket (stable by descending position).
+    for i in (0..n).rev() {
+        let j = ((block[i] as usize) << 8) | block[i + 1] as usize;
+        ftab[j] -= 1;
+        ptr[ftab[j] as usize] = i as u32;
+    }
+
+    // ---- Step 4: Sort sub-buckets + update quadrant ----
+    // The key optimization from C bzip2: after sorting big bucket `ss`,
+    // scan its positions' predecessors to derive the sorted order for
+    // sub-buckets [t, ss] (where big bucket t hasn't been processed yet).
+    // This avoids shell sort for roughly half the sub-buckets.
+    let mut big_done = [false; 256];
+    let mut copy_start = [0u32; 256];
+
+    for ss in 0..256usize {
+        // Sort sub-buckets [ss, j] that haven't been placed by the
+        // predecessor-copy trick from an earlier iteration.
+        for j in 0..256usize {
+            let sb = (ss << 8) | j;
+            if ftab[sb] & SETMASK != 0 {
+                continue;
+            }
+            let lo = (ftab[sb] & CLEARMASK) as usize;
+            let hi = (ftab[sb + 1] & CLEARMASK) as usize;
+            if hi > lo + 1 {
+                main_shell_sort(
+                    &mut ptr, &block, &quadrant, n, lo, hi - 1, 2, &mut budget,
+                );
+                if budget < 0 {
+                    return None;
+                }
+            }
+            ftab[sb] |= SETMASK;
+        }
+
+        // Update quadrant: assign per-position sequential ranks within the
+        // big bucket.  u32 prevents overflow (u16 would truncate for big
+        // buckets > 65535 positions, causing incorrect sort results).
+        {
+            let big_lo = (ftab[ss << 8] & CLEARMASK) as usize;
+            let big_hi = if ss < 255 {
+                (ftab[(ss + 1) << 8] & CLEARMASK) as usize
+            } else {
+                n
+            };
+            let mut rank = 0u32;
+            for k in big_lo..big_hi {
+                let p = ptr[k] as usize;
+                quadrant[p] = rank;
+                if p < BZ_OVERSHOOT {
+                    quadrant[p + n] = rank;
+                }
+                rank += 1;
+            }
+        }
+
+        big_done[ss] = true;
+
+        // Predecessor-copy: for each position p in the sorted big bucket ss,
+        // its predecessor pred = (p-1) mod n belongs to sub-bucket
+        // [block[pred], ss].  If big bucket block[pred] hasn't been processed
+        // yet, place pred directly — its order within [block[pred], ss] is
+        // determined by p's position in the sorted big bucket ss.
+        if ss < 255 {
+            for j in 0..256usize {
+                copy_start[j] = ftab[(j << 8) | ss] & CLEARMASK;
+            }
+            let big_lo = (ftab[ss << 8] & CLEARMASK) as usize;
+            let big_hi = (ftab[(ss + 1) << 8] & CLEARMASK) as usize;
+            for j in big_lo..big_hi {
+                let p = ptr[j] as usize;
+                let pred = if p == 0 { n - 1 } else { p - 1 };
+                let c1 = block[pred] as usize;
+                if !big_done[c1] {
+                    ptr[copy_start[c1] as usize] = pred as u32;
+                    copy_start[c1] += 1;
+                }
+            }
+            for j in 0..256usize {
+                ftab[(j << 8) | ss] |= SETMASK;
             }
         }
     }
-    false
+
+    // ---- Extract BWT output ----
+    let mut last = Vec::with_capacity(n);
+    let mut origin = 0usize;
+    for (row, &p) in ptr.iter().enumerate() {
+        let p = p as usize;
+        last.push(input[if p == 0 { n - 1 } else { p - 1 }]);
+        if p == 0 {
+            origin = row;
+        }
+    }
+    Some((last, origin))
 }
+
+/// Shell sort ptr[lo..=hi] by cyclic rotation order at the given depth.
+/// Positions in this range share the same first `depth` bytes, so comparisons
+/// start at byte `depth`.
+#[inline(never)]
+fn main_shell_sort(
+    ptr: &mut [u32],
+    block: &[u8],
+    quadrant: &[u32],
+    nblock: usize,
+    lo: usize,
+    hi: usize,
+    depth: usize,
+    budget: &mut i32,
+) {
+    let num = hi - lo + 1;
+    if num < 2 {
+        return;
+    }
+
+    // Find the largest shell increment ≤ num.
+    let mut hp = 0usize;
+    while hp < SHELL_INCS.len() - 1 && SHELL_INCS[hp + 1] <= num {
+        hp += 1;
+    }
+
+    // Shell sort with decreasing increments.
+    loop {
+        let gap = SHELL_INCS[hp];
+        let mut i = lo + gap;
+        while i <= hi {
+            // Safety: lo..=hi are within ptr bounds (sub-bucket from ftab).
+            unsafe {
+                let tmp = *ptr.get_unchecked(i);
+                let mut j = i;
+                loop {
+                    if j < lo + gap {
+                        break;
+                    }
+                    let prev = *ptr.get_unchecked(j - gap);
+                    if !main_gt_u(block, quadrant, nblock, prev as usize, tmp as usize, depth, budget) {
+                        break;
+                    }
+                    *ptr.get_unchecked_mut(j) = prev;
+                    j -= gap;
+                }
+                *ptr.get_unchecked_mut(j) = tmp;
+            }
+            i += 1;
+            if *budget < 0 {
+                return;
+            }
+        }
+        if hp == 0 {
+            break;
+        }
+        hp -= 1;
+    }
+}
+
+/// Compare two cyclic rotations starting at positions `i1` and `i2`,
+/// beginning at byte offset `depth` (which is already known to be equal).
+/// Returns true if rotation i1 > rotation i2.
+///
+fn main_gt_u(
+    block: &[u8],
+    quadrant: &[u32],
+    nblock: usize,
+    i1: usize,
+    i2: usize,
+    depth: usize,
+    budget: &mut i32,
+) -> bool {
+    debug_assert!(i1 < nblock && i2 < nblock);
+
+    // No initial wrap check needed: with BZ_OVERSHOOT=34, p1/p2 at most
+    // nblock+1, and the unrolled 12 bytes read up to nblock+13 — well
+    // within the overshoot.  The deep loop has its own wrap check.
+    let mut p1 = i1 + depth;
+    let mut p2 = i2 + depth;
+
+    // Unrolled first 12 bytes — safe because BZ_OVERSHOOT ≥ depth + 12.
+    unsafe {
+        macro_rules! cmp1 {
+            () => {
+                let c1 = *block.get_unchecked(p1);
+                let c2 = *block.get_unchecked(p2);
+                if c1 != c2 {
+                    return c1 > c2;
+                }
+                p1 += 1;
+                p2 += 1;
+            };
+        }
+        cmp1!();
+        cmp1!();
+        cmp1!();
+        cmp1!();
+        cmp1!();
+        cmp1!();
+        cmp1!();
+        cmp1!();
+        cmp1!();
+        cmp1!();
+        cmp1!();
+        cmp1!();
+    }
+
+    // Continue comparing with wrap-around + quadrant tiebreaking.
+    let mut k = (nblock + 8) as i32;
+    loop {
+        unsafe {
+            macro_rules! cmp_q {
+                () => {
+                    let c1 = *block.get_unchecked(p1);
+                    let c2 = *block.get_unchecked(p2);
+                    if c1 != c2 {
+                        return c1 > c2;
+                    }
+                    let s1 = *quadrant.get_unchecked(p1);
+                    let s2 = *quadrant.get_unchecked(p2);
+                    if s1 != s2 {
+                        return s1 > s2;
+                    }
+                    p1 += 1;
+                    p2 += 1;
+                };
+            }
+            cmp_q!();
+            cmp_q!();
+            cmp_q!();
+            cmp_q!();
+        }
+
+        if p1 >= nblock {
+            p1 -= nblock;
+        }
+        if p2 >= nblock {
+            p2 -= nblock;
+        }
+        k -= 4;
+        *budget -= 1;
+        if k < 4 || *budget < 0 {
+            return false;
+        }
+    }
+}
+
+// is_high_entropy_input and bwt_via_prefix_doubling removed —
+// mainSort handles both text and high-entropy inputs.
 
 fn bwt_via_sais(input: &[u8]) -> (Vec<u8>, usize) {
     let n = input.len();
     // Build T = input ++ input ++ [sentinel] over a 257-symbol alphabet:
     //   * bytes are mapped to 1..=256 so 0 is reserved for the sentinel
     //   * the trailing 0 is the unique smallest character
-    // Length = 2n + 1.
+    // Length = 2n + 1.  The doubling is necessary for correctness: the SA of
+    // just input$ gives a different ordering than cyclic rotation sort when
+    // suffixes share a prefix that extends past the shorter one's sentinel.
     let total = 2 * n + 1;
     let mut t = vec![0u32; total];
     for i in 0..n {
@@ -395,20 +671,16 @@ fn bwt_via_sais(input: &[u8]) -> (Vec<u8>, usize) {
         t[i] = b;
         t[i + n] = b;
     }
-    t[total - 1] = 0;
+    // t[2*n] = 0 already (sentinel)
 
-    // Sort all suffixes of T.
     let sa = sais(&t, 257);
 
-    // Filter to keep only positions in [0, n) — these are the n rotation
-    // starts in cyclic order.  Allocate exactly n slots.
     let mut last = Vec::with_capacity(n);
     let mut origin = 0usize;
     let mut row = 0usize;
     for &p in &sa {
         let p = p as usize;
         if p < n {
-            // BWT row: cyclic char preceding rotation start `p` is input[(p + n - 1) % n].
             let last_byte_index = if p == 0 { n - 1 } else { p - 1 };
             last.push(input[last_byte_index]);
             if p == 0 {
@@ -419,107 +691,6 @@ fn bwt_via_sais(input: &[u8]) -> (Vec<u8>, usize) {
     }
     debug_assert_eq!(last.len(), n);
     (last, origin)
-}
-
-fn bwt_via_prefix_doubling(input: &[u8]) -> (Vec<u8>, usize) {
-    let n = input.len();
-    let order = manber_myers_rotations(input);
-
-    let mut last = Vec::with_capacity(n);
-    let mut origin = 0usize;
-    for (row, &start) in order.iter().enumerate() {
-        let last_byte_index = if start == 0 { n - 1 } else { start as usize - 1 };
-        last.push(input[last_byte_index]);
-        if start == 0 {
-            origin = row;
-        }
-    }
-    (last, origin)
-}
-
-/// Prefix doubling on rotations of `input`, but with a 2-pass LSD radix sort
-/// per doubling step instead of a comparator-based sort.  This brings the
-/// per-pass complexity from O(n log n) to O(n), so the total is O(n log n)
-/// instead of O(n log² n).
-///
-/// Returns `order[i] = the starting index (0..n) of the i-th rotation in
-/// sorted lexicographic order`.  Cyclic comparisons are handled by treating
-/// the "second key" at offset `k` as `rank[(pos + k) % n]`.
-fn manber_myers_rotations(input: &[u8]) -> Vec<u32> {
-    let n = input.len();
-    let mut order: Vec<u32> = (0..n as u32).collect();
-    let mut rank: Vec<u32> = input.iter().map(|&b| b as u32).collect();
-    let mut new_rank = vec![0u32; n];
-
-    let key_range = n.max(256) + 1;
-    let mut counts: Vec<u32> = vec![0u32; key_range + 1];
-    let mut tmp_order: Vec<u32> = vec![0u32; n];
-
-    #[inline(always)]
-    fn wrap(a: usize, k: usize, n: usize) -> usize {
-        let p = a + k;
-        if p >= n { p - n } else { p }
-    }
-
-    let mut k = 1usize;
-    loop {
-        // ---- LSD radix sort by (primary = rank[a], secondary = rank[(a+k)%n]) ----
-        // Pass 1: stable sort `order → tmp_order` by the SECONDARY key.
-        for c in counts.iter_mut() {
-            *c = 0;
-        }
-        for &a in &order {
-            let s = rank[wrap(a as usize, k, n)] as usize;
-            counts[s + 1] += 1;
-        }
-        for i in 1..counts.len() {
-            counts[i] += counts[i - 1];
-        }
-        for &a in &order {
-            let s = rank[wrap(a as usize, k, n)] as usize;
-            let slot = counts[s] as usize;
-            tmp_order[slot] = a;
-            counts[s] += 1;
-        }
-
-        // Pass 2: stable sort `tmp_order → order` by the PRIMARY key.
-        for c in counts.iter_mut() {
-            *c = 0;
-        }
-        for &a in &tmp_order {
-            let p = rank[a as usize] as usize;
-            counts[p + 1] += 1;
-        }
-        for i in 1..counts.len() {
-            counts[i] += counts[i - 1];
-        }
-        for &a in &tmp_order {
-            let p = rank[a as usize] as usize;
-            let slot = counts[p] as usize;
-            order[slot] = a;
-            counts[p] += 1;
-        }
-
-        // Reassign ranks based on the new order.
-        new_rank[order[0] as usize] = 0;
-        for i in 1..n {
-            let prev = order[i - 1] as usize;
-            let cur = order[i] as usize;
-            let same = rank[prev] == rank[cur]
-                && rank[wrap(prev, k, n)] == rank[wrap(cur, k, n)];
-            new_rank[cur] = new_rank[prev] + if same { 0 } else { 1 };
-        }
-
-        // If all ranks are unique we're done.
-        if new_rank[order[n - 1] as usize] as usize == n - 1 {
-            return order;
-        }
-        std::mem::swap(&mut rank, &mut new_rank);
-        k *= 2;
-        if k >= n {
-            return order;
-        }
-    }
 }
 
 // =========================================================================
@@ -560,8 +731,6 @@ fn sais_impl(t: &[u32], sa: &mut [u32], k: usize) {
     debug_assert!(n >= 2, "SA-IS requires at least 2 elements (incl. sentinel)");
 
     // ---- 1. Classify L/S types ----
-    // type[i] = true (S) means t[i..] < t[i+1..]; false (L) means t[i..] > t[i+1..].
-    // The sentinel at position n-1 is S by convention.
     let mut t_type = vec![false; n];
     t_type[n - 1] = true;
     for i in (0..n - 1).rev() {
@@ -580,33 +749,31 @@ fn sais_impl(t: &[u32], sa: &mut [u32], k: usize) {
         bucket[c as usize] += 1;
     }
 
+    // Reusable scratch for bucket starts/ends (avoids repeated allocations).
+    let mut bkt = vec![0u32; k];
+
     // ---- 3. Place LMS positions at the END of their buckets ----
     for s in sa.iter_mut() {
         *s = SAIS_EMPTY;
     }
-    let mut bucket_end = sais_bucket_ends(&bucket);
+    sais_fill_bucket_ends(&bucket, &mut bkt);
     for i in 1..n {
         if t_type[i] && !t_type[i - 1] {
             let c = t[i] as usize;
-            bucket_end[c] -= 1;
-            sa[bucket_end[c] as usize] = i as u32;
+            bkt[c] -= 1;
+            sa[bkt[c] as usize] = i as u32;
         }
     }
 
     // ---- 4. Induced sort L-types ----
-    induced_sort_l(t, sa, &t_type, &bucket);
+    sais_induced_sort_l(t, sa, &t_type, &bucket, &mut bkt);
 
     // ---- 5. Induced sort S-types ----
-    induced_sort_s(t, sa, &t_type, &bucket);
+    sais_induced_sort_s(t, sa, &t_type, &bucket, &mut bkt);
 
     // ---- 6. Name LMS substrings ----
-    // Collect LMS positions in SA order, then assign each substring a name
-    // based on whether it equals the previous one.
     let mut name_count: u32 = 0;
     let mut prev_lms: Option<usize> = None;
-    // Reuse the second half of `sa` to store names temporarily.  After this
-    // pass, sa[..n1] holds LMS-position-in-text-order entries replaced with
-    // their names; we then compact.
     let mut name_buf = vec![SAIS_EMPTY; n];
     for i in 0..n {
         let pos = sa[i];
@@ -614,13 +781,12 @@ fn sais_impl(t: &[u32], sa: &mut [u32], k: usize) {
             continue;
         }
         let pos = pos as usize;
-        // pos is LMS iff pos > 0 && t_type[pos] && !t_type[pos-1].
         if pos == 0 || !t_type[pos] || t_type[pos - 1] {
             continue;
         }
         let is_new = match prev_lms {
             None => true,
-            Some(prev) => !lms_substr_equal(t, &t_type, prev, pos),
+            Some(prev) => !sais_lms_substr_equal(t, &t_type, prev, pos),
         };
         if is_new {
             name_count += 1;
@@ -628,7 +794,6 @@ fn sais_impl(t: &[u32], sa: &mut [u32], k: usize) {
         name_buf[pos] = name_count - 1;
         prev_lms = Some(pos);
     }
-    // Compact names into sa[..n1] in text order.
     let mut n1 = 0usize;
     for i in 0..n {
         if name_buf[i] != SAIS_EMPTY {
@@ -639,39 +804,22 @@ fn sais_impl(t: &[u32], sa: &mut [u32], k: usize) {
     drop(name_buf);
 
     // ---- 7. Recurse if needed ----
+    let mut lms_positions: Vec<u32> = Vec::with_capacity(n1);
+    for i in 1..n {
+        if t_type[i] && !t_type[i - 1] {
+            lms_positions.push(i as u32);
+        }
+    }
+
     if (name_count as usize) < n1 {
-        // Some LMS substrings collided.  Recurse to sort them properly.
-        // Allocate sub_sa as a fresh buffer; we can't easily reuse sa because
-        // we need both the names and the result simultaneously.
         let mut sub_t = vec![0u32; n1];
         sub_t.copy_from_slice(&sa[..n1]);
         let mut sub_sa = vec![0u32; n1];
         sais_impl(&sub_t, &mut sub_sa, name_count as usize);
-
-        // Map sub_sa indices back to original LMS positions.
-        // We need an "LMS positions in text order" list.
-        let mut lms_positions: Vec<u32> = Vec::with_capacity(n1);
-        for i in 1..n {
-            if t_type[i] && !t_type[i - 1] {
-                lms_positions.push(i as u32);
-            }
-        }
-        // sa[..n1] now becomes the LMS positions in sorted-by-suffix order.
         for i in 0..n1 {
             sa[i] = lms_positions[sub_sa[i] as usize];
         }
     } else {
-        // All LMS substrings are distinct → the names already give the sort
-        // order directly.  We need sa[..n1] = LMS positions in sorted order.
-        // Currently sa[..n1] = names in text order, but since each name maps
-        // 1:1 to a position, we can invert.
-        let mut lms_positions: Vec<u32> = Vec::with_capacity(n1);
-        for i in 1..n {
-            if t_type[i] && !t_type[i - 1] {
-                lms_positions.push(i as u32);
-            }
-        }
-        // sa[i] is the name (= sort rank) of lms_positions[i].
         let mut tmp = vec![0u32; n1];
         for i in 0..n1 {
             tmp[sa[i] as usize] = lms_positions[i];
@@ -679,53 +827,48 @@ fn sais_impl(t: &[u32], sa: &mut [u32], k: usize) {
         sa[..n1].copy_from_slice(&tmp);
     }
 
-    // ---- 8. Final placement: clear sa[n1..], place sorted LMS positions
-    //         at the ENDS of their buckets, then re-induce L and S. ----
+    // ---- 8. Final placement ----
     for i in n1..n {
         sa[i] = SAIS_EMPTY;
     }
-    let mut bucket_end = sais_bucket_ends(&bucket);
-    // Walk sorted LMS positions in REVERSE order so that placing at bucket
-    // ends preserves their order within each bucket.
+    sais_fill_bucket_ends(&bucket, &mut bkt);
     for i in (0..n1).rev() {
         let pos = sa[i] as usize;
-        sa[i] = SAIS_EMPTY; // clear before re-placing
+        sa[i] = SAIS_EMPTY;
         let c = t[pos] as usize;
-        bucket_end[c] -= 1;
-        sa[bucket_end[c] as usize] = pos as u32;
+        bkt[c] -= 1;
+        sa[bkt[c] as usize] = pos as u32;
     }
 
-    induced_sort_l(t, sa, &t_type, &bucket);
-    induced_sort_s(t, sa, &t_type, &bucket);
+    sais_induced_sort_l(t, sa, &t_type, &bucket, &mut bkt);
+    sais_induced_sort_s(t, sa, &t_type, &bucket, &mut bkt);
+}
+
+// ---- Bucket helpers (fill existing slice, no allocation) ----
+
+#[inline]
+fn sais_fill_bucket_ends(bucket: &[u32], out: &mut [u32]) {
+    let mut sum = 0u32;
+    for c in 0..bucket.len() {
+        sum += bucket[c];
+        out[c] = sum;
+    }
 }
 
 #[inline]
-fn sais_bucket_ends(bucket: &[u32]) -> Vec<u32> {
-    let k = bucket.len();
-    let mut ends = vec![0u32; k];
+fn sais_fill_bucket_starts(bucket: &[u32], out: &mut [u32]) {
     let mut sum = 0u32;
-    for c in 0..k {
-        sum += bucket[c];
-        ends[c] = sum;
-    }
-    ends
-}
-
-#[inline]
-fn sais_bucket_starts(bucket: &[u32]) -> Vec<u32> {
-    let k = bucket.len();
-    let mut starts = vec![0u32; k];
-    let mut sum = 0u32;
-    for c in 0..k {
-        starts[c] = sum;
+    for c in 0..bucket.len() {
+        out[c] = sum;
         sum += bucket[c];
     }
-    starts
 }
 
-fn induced_sort_l(t: &[u32], sa: &mut [u32], t_type: &[bool], bucket: &[u32]) {
+// ---- SA-IS helpers using Vec<bool> for the fallback path ----
+
+fn sais_induced_sort_l(t: &[u32], sa: &mut [u32], t_type: &[bool], bucket: &[u32], bkt: &mut [u32]) {
     let n = t.len();
-    let mut bucket_start = sais_bucket_starts(bucket);
+    sais_fill_bucket_starts(bucket, bkt);
     for i in 0..n {
         let p = sa[i];
         if p == SAIS_EMPTY || p == 0 {
@@ -734,15 +877,15 @@ fn induced_sort_l(t: &[u32], sa: &mut [u32], t_type: &[bool], bucket: &[u32]) {
         let j = (p - 1) as usize;
         if !t_type[j] {
             let c = t[j] as usize;
-            sa[bucket_start[c] as usize] = j as u32;
-            bucket_start[c] += 1;
+            sa[bkt[c] as usize] = j as u32;
+            bkt[c] += 1;
         }
     }
 }
 
-fn induced_sort_s(t: &[u32], sa: &mut [u32], t_type: &[bool], bucket: &[u32]) {
+fn sais_induced_sort_s(t: &[u32], sa: &mut [u32], t_type: &[bool], bucket: &[u32], bkt: &mut [u32]) {
     let n = t.len();
-    let mut bucket_end = sais_bucket_ends(bucket);
+    sais_fill_bucket_ends(bucket, bkt);
     for i in (0..n).rev() {
         let p = sa[i];
         if p == SAIS_EMPTY || p == 0 {
@@ -751,15 +894,13 @@ fn induced_sort_s(t: &[u32], sa: &mut [u32], t_type: &[bool], bucket: &[u32]) {
         let j = (p - 1) as usize;
         if t_type[j] {
             let c = t[j] as usize;
-            bucket_end[c] -= 1;
-            sa[bucket_end[c] as usize] = j as u32;
+            bkt[c] -= 1;
+            sa[bkt[c] as usize] = j as u32;
         }
     }
 }
 
-/// Two LMS substrings are equal iff they have the same length AND the same
-/// characters AND the same L/S type pattern at every position.
-fn lms_substr_equal(t: &[u32], t_type: &[bool], a: usize, b: usize) -> bool {
+fn sais_lms_substr_equal(t: &[u32], t_type: &[bool], a: usize, b: usize) -> bool {
     let n = t.len();
     let mut i = 0usize;
     loop {
@@ -771,8 +912,6 @@ fn lms_substr_equal(t: &[u32], t_type: &[bool], a: usize, b: usize) -> bool {
         if t[pa] != t[pb] || t_type[pa] != t_type[pb] {
             return false;
         }
-        // After step 0, check if either position is itself LMS — that marks
-        // the END of the substring.
         if i > 0 {
             let a_lms = t_type[pa] && !t_type[pa - 1];
             let b_lms = t_type[pb] && !t_type[pb - 1];
@@ -916,16 +1055,19 @@ fn assign_selectors(symbols: &[u16], tables: &[HufTable]) -> Vec<u8> {
         let mut costs = [0u32; MAX_HUFFMAN_TABLES];
         // Inner loop reads `MAX_HUFFMAN_TABLES = 6` u32s per symbol, sum into
         // costs.  LLVM auto-vectorises this into a small SIMD add.
+        // Safety: `s < alpha_size` (enforced by construction) and
+        // `alpha_size * MAX_HUFFMAN_TABLES == lens_t.len()`, so
+        // `base + 5 < lens_t.len()`.
         for &s in chunk {
             let base = (s as usize) * MAX_HUFFMAN_TABLES;
-            // Unrolled by MAX_HUFFMAN_TABLES so the compiler can lift this
-            // into a single SIMD load + add.
-            costs[0] += lens_t[base];
-            costs[1] += lens_t[base + 1];
-            costs[2] += lens_t[base + 2];
-            costs[3] += lens_t[base + 3];
-            costs[4] += lens_t[base + 4];
-            costs[5] += lens_t[base + 5];
+            unsafe {
+                costs[0] += *lens_t.get_unchecked(base);
+                costs[1] += *lens_t.get_unchecked(base + 1);
+                costs[2] += *lens_t.get_unchecked(base + 2);
+                costs[3] += *lens_t.get_unchecked(base + 3);
+                costs[4] += *lens_t.get_unchecked(base + 4);
+                costs[5] += *lens_t.get_unchecked(base + 5);
+            }
         }
         // Pick the cheapest active table.
         let mut best_t = 0u8;
