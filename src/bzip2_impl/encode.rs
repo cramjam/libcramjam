@@ -100,15 +100,14 @@ fn encode_block_from_rle1(bw: &mut BitWriter, rle1_out: Vec<u8>, block_crc: u32)
         }
     }
 
-    // MTF state — fixed-size 256-entry stacks let LLVM avoid bounds checks and
-    // keep everything in L1.  `mtf[i]` = alphabet index currently at MTF
-    // position `i`; `mtf_pos[a]` = position of alphabet index `a` (inverse map
-    // for O(1) lookup, replacing the linear `iter().position(...)` scan).
-    let mut mtf: [u16; 256] = [0; 256];
-    let mut mtf_pos: [u16; 256] = [0; 256];
+    // MTF list as a 256-byte array (alphabet indexes are < 256), walked the
+    // way C bzip2's `generateMTFValues` does it: a fused scan-and-shift that
+    // stops at the symbol's position.  Typical MTF positions on compressible
+    // data are tiny, so this beats maintaining an inverse table plus a
+    // memmove per symbol.
+    let mut yy: [u8; 256] = [0; 256];
     for i in 0..num_used {
-        mtf[i] = i as u16;
-        mtf_pos[i] = i as u16;
+        yy[i] = i as u8;
     }
     let alpha_size = num_used + 2; // RUNA + RUNB + (num_used - 1) MTF symbols + EOB
     let eob_symbol = (num_used + 1) as u16;
@@ -119,52 +118,32 @@ fn encode_block_from_rle1(bw: &mut BitWriter, rle1_out: Vec<u8>, block_crc: u32)
     let mut zero_run: u32 = 0;
 
     for &b in &bwt_out {
-        let alpha_idx = byte_to_alpha[b as usize];
-        // O(1) MTF position lookup via the inverse table.
-        let pos = mtf_pos[alpha_idx as usize] as usize;
-
-        if pos == 0 {
-            zero_run += 1;
-        } else {
-            // Move-to-front: shift mtf[0..pos] one slot right, then update
-            // mtf_pos for each shifted element.  We do the shift with
-            // `copy_within` (SIMD memmove) and the position-table update in
-            // a tight sweep.  `unsafe` skips bounds checks; `pos < 256` and
-            // both arrays are length 256 so the indices are always valid.
-            unsafe {
-                let mtf_ptr = mtf.as_mut_ptr();
-                let pos_ptr = mtf_pos.as_mut_ptr();
-                // Equivalent to mtf.copy_within(0..pos, 1).
-                std::ptr::copy(mtf_ptr, mtf_ptr.add(1), pos);
-                // Sweep updates mtf_pos[mtf[i]] = i for i in 1..=pos.
-                let mut i = 1usize;
-                while i + 4 <= pos + 1 {
-                    let a0 = *mtf_ptr.add(i);
-                    let a1 = *mtf_ptr.add(i + 1);
-                    let a2 = *mtf_ptr.add(i + 2);
-                    let a3 = *mtf_ptr.add(i + 3);
-                    *pos_ptr.add(a0 as usize) = i as u16;
-                    *pos_ptr.add(a1 as usize) = (i + 1) as u16;
-                    *pos_ptr.add(a2 as usize) = (i + 2) as u16;
-                    *pos_ptr.add(a3 as usize) = (i + 3) as u16;
-                    i += 4;
-                }
-                while i <= pos {
-                    let a = *mtf_ptr.add(i);
-                    *pos_ptr.add(a as usize) = i as u16;
-                    i += 1;
-                }
-                *mtf_ptr = alpha_idx;
-                *pos_ptr.add(alpha_idx as usize) = 0;
+        let ll_i = byte_to_alpha[b as usize] as u8;
+        // SAFETY: `yy` holds a permutation of 0..num_used and `ll_i < num_used`,
+        // so the scan always terminates inside the array.
+        unsafe {
+            let yyp = yy.as_mut_ptr();
+            if *yyp == ll_i {
+                zero_run += 1;
+                continue;
             }
-
+            let mut rtmp = *yyp.add(1);
+            *yyp.add(1) = *yyp;
+            let mut j = 1usize;
+            while ll_i != rtmp {
+                j += 1;
+                let rtmp2 = rtmp;
+                rtmp = *yyp.add(j);
+                *yyp.add(j) = rtmp2;
+            }
+            *yyp = rtmp;
             // Flush any pending zero run as RUNA/RUNB.
             if zero_run > 0 {
                 emit_zero_run(&mut symbols, zero_run);
                 zero_run = 0;
             }
-            // Real symbol: pos in 1..num_used → alphabet symbol pos+1.
-            symbols.push((pos + 1) as u16);
+            // Real symbol: position j in 1..num_used → alphabet symbol j+1.
+            symbols.push((j + 1) as u16);
         }
     }
     if zero_run > 0 {
@@ -290,31 +269,57 @@ fn forward_rle1(input: &[u8]) -> Vec<u8> {
 /// decoder's hard buffer limit.  Worst-case expansion: a 4-run encodes as
 /// 5 bytes, so the largest output any single step adds is 5 bytes.
 fn forward_rle1_capped(input: &[u8], max_out: usize) -> (Vec<u8>, usize) {
-    let mut out = Vec::with_capacity(input.len().min(max_out) + 8);
+    let n = input.len();
+    // Output never exceeds `max_out`, and a step adds at most 5 bytes for 4
+    // consumed (+25%), so this capacity is enough for unchecked writes.
+    let cap = max_out.min(n + n / 4 + 8);
+    let mut out: Vec<u8> = Vec::with_capacity(cap);
+    let op = out.as_mut_ptr();
+    let mut len = 0usize;
     let mut i = 0usize;
-    while i < input.len() {
-        let b = input[i];
-        let mut run = 1usize;
-        while i + run < input.len() && input[i + run] == b && run < 255 {
-            run += 1;
-        }
-        // Bytes this step will append.
-        let step_out = if run >= 4 { 5 } else { run };
-        if out.len() + step_out > max_out {
-            break;
-        }
-        if run >= 4 {
-            out.push(b);
-            out.push(b);
-            out.push(b);
-            out.push(b);
-            out.push((run - 4) as u8);
-        } else {
-            for _ in 0..run {
-                out.push(b);
+    // While `len <= safe_len` a step of up to 5 bytes can't exceed `max_out`,
+    // so the cap check is skipped on the hot path.
+    let safe_len = max_out.saturating_sub(5);
+    // SAFETY (all raw writes): every step first ensures `len + step_out <=
+    // max_out` and `len + step_out <= i + step_out <= n + n / 4 + 8`, so the
+    // writes stay within `cap`.
+    unsafe {
+        while i < n {
+            let b = *input.get_unchecked(i);
+            // Common case: a run of exactly one byte.
+            if i + 1 < n && *input.get_unchecked(i + 1) != b {
+                if len > safe_len && len + 1 > max_out {
+                    break;
+                }
+                *op.add(len) = b;
+                len += 1;
+                i += 1;
+                continue;
             }
+            let lim = (n - i).min(255);
+            let mut run = 1usize;
+            while run < lim && *input.get_unchecked(i + run) == b {
+                run += 1;
+            }
+            let step_out = if run >= 4 { 5 } else { run };
+            if len > safe_len && len + step_out > max_out {
+                break;
+            }
+            if run >= 4 {
+                *op.add(len) = b;
+                *op.add(len + 1) = b;
+                *op.add(len + 2) = b;
+                *op.add(len + 3) = b;
+                *op.add(len + 4) = (run - 4) as u8;
+            } else {
+                for k in 0..run {
+                    *op.add(len + k) = b;
+                }
+            }
+            len += step_out;
+            i += run;
         }
-        i += run;
+        out.set_len(len);
     }
     (out, i)
 }
@@ -501,14 +506,23 @@ fn bwt_via_main_sort(input: &[u8]) -> Option<(Vec<u8>, usize)> {
         }
     }
 
-    let mut last = Vec::with_capacity(n);
+    // Last column: input[p - 1] (wrapping) for each sorted rotation start p.
+    let mut last: Vec<u8> = Vec::with_capacity(n);
     let mut origin = 0usize;
-    for (row, &p) in ptr.iter().enumerate() {
-        let p = p as usize;
-        last.push(input[if p == 0 { n - 1 } else { p - 1 }]);
-        if p == 0 {
-            origin = row;
+    // SAFETY: `ptr` holds a permutation of 0..n, `last` has capacity n and
+    // every slot 0..n is written exactly once before `set_len`.
+    unsafe {
+        let lp = last.as_mut_ptr();
+        let bp = input.as_ptr();
+        for (row, &p) in ptr.iter().enumerate() {
+            let p = p as usize;
+            let src = if p == 0 { n - 1 } else { p - 1 };
+            *lp.add(row) = *bp.add(src);
+            if p == 0 {
+                origin = row;
+            }
         }
+        last.set_len(n);
     }
     Some((last, origin))
 }
@@ -1157,36 +1171,32 @@ fn assign_selectors(symbols: &[u16], tables: &[HufTable]) -> Vec<u8> {
     let nt = tables.len();
     let alpha_size = tables[0].code_lens.len();
 
-    // Transpose code lengths so all tables' lengths for a given symbol are
-    // contiguous in memory.  Layout: `lens_t[sym * MAX_HUFFMAN_TABLES + t]`.
-    // Padded slot for missing tables (t >= nt) is unused; we only sum the
-    // first `nt` slots in the inner loop.
-    let mut lens_t: Vec<u32> = vec![0u32; alpha_size * MAX_HUFFMAN_TABLES];
+    // C bzip2's `len_pack` trick: per symbol, the 6 tables' code lengths are
+    // packed as three u32s holding two u16 lengths each, so a group's cost
+    // for all tables is 3 loads + 3 adds per symbol.  A group is 50 symbols
+    // of length <= 17, so a half never exceeds 850 and can't carry into the
+    // other half.  Slots for absent tables stay 0.
+    let mut len_pack: Vec<[u32; 3]> = vec![[0u32; 3]; alpha_size];
     for (t, table) in tables.iter().enumerate() {
+        let shift = (t & 1) as u32 * 16;
         for (s, &l) in table.code_lens.iter().enumerate() {
-            lens_t[s * MAX_HUFFMAN_TABLES + t] = l as u32;
+            len_pack[s][t >> 1] |= (l as u32) << shift;
         }
     }
 
     for chunk in symbols.chunks(HUFFMAN_GROUP_SIZE) {
-        let mut costs = [0u32; MAX_HUFFMAN_TABLES];
-        // Inner loop reads `MAX_HUFFMAN_TABLES = 6` u32s per symbol, sum into
-        // costs.  LLVM auto-vectorises this into a small SIMD add.
-        // Safety: `s < alpha_size` (enforced by construction) and
-        // `alpha_size * MAX_HUFFMAN_TABLES == lens_t.len()`, so
-        // `base + 5 < lens_t.len()`.
+        let mut c01 = 0u32;
+        let mut c23 = 0u32;
+        let mut c45 = 0u32;
+        // SAFETY: `s < alpha_size == len_pack.len()` by construction.
         for &s in chunk {
-            let base = (s as usize) * MAX_HUFFMAN_TABLES;
-            unsafe {
-                costs[0] += *lens_t.get_unchecked(base);
-                costs[1] += *lens_t.get_unchecked(base + 1);
-                costs[2] += *lens_t.get_unchecked(base + 2);
-                costs[3] += *lens_t.get_unchecked(base + 3);
-                costs[4] += *lens_t.get_unchecked(base + 4);
-                costs[5] += *lens_t.get_unchecked(base + 5);
-            }
+            let p = unsafe { len_pack.get_unchecked(s as usize) };
+            c01 += p[0];
+            c23 += p[1];
+            c45 += p[2];
         }
-        // Pick the cheapest active table.
+        let costs = [c01 & 0xFFFF, c01 >> 16, c23 & 0xFFFF, c23 >> 16, c45 & 0xFFFF, c45 >> 16];
+        // Pick the cheapest active table (first minimum wins).
         let mut best_t = 0u8;
         let mut best_cost = costs[0];
         for t in 1..nt {
