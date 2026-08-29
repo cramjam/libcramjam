@@ -4,7 +4,8 @@ use std::io::{Cursor, Read};
 use std::time::Instant;
 
 fn main() {
-    let bz2 = std::fs::read("benches/data/dickens.bz2").expect("read corpus");
+    let file = std::env::var("FILE").unwrap_or("dickens".into());
+    let bz2 = std::fs::read(format!("benches/data/{file}.bz2")).expect("read corpus");
     let mut input = Vec::new();
     bzip2::read::BzDecoder::new(&bz2[..]).read_to_end(&mut input).unwrap();
     let mut compressed = Vec::new();

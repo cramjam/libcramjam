@@ -162,6 +162,12 @@ const DEC64: [isize; 8] = [0, 0, 0, -1, -4, 1, 2, 3];
 #[inline(always)]
 pub unsafe fn copy_match_unchecked(src: *const u8, dst: *mut u8, offset: usize, match_len: usize) {
     if offset >= 16 {
+        // Long, non-overlapping matches (nci-style data): libc memcpy moves
+        // 32-64 bytes/cycle with AVX/`rep movsb`, vs 16 per iteration here.
+        if match_len > 64 && offset >= match_len {
+            unsafe { core::ptr::copy_nonoverlapping(src, dst, match_len) };
+            return;
+        }
         unsafe { wildcopy_chunks::<16>(src, dst, match_len) };
         return;
     }
