@@ -52,13 +52,20 @@ pub fn encode_xz(input: &[u8], preset: u32) -> io::Result<Vec<u8>> {
 /// legacy `.lzma` "Alone" format (13-byte header followed by a raw LZMA
 /// stream — what `lzma.compress(..., format=FORMAT_ALONE)` produces).
 pub fn decode_xz(input: &[u8]) -> io::Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(input.len() * 4);
-    if alone::looks_like_alone(input) {
-        alone::decode_alone(input, &mut out)?;
-    } else {
-        xz_format::decode_xz_stream(input, &mut out)?;
-    }
+    let mut out = Vec::new();
+    decode_xz_into(input, &mut out)?;
     Ok(out)
+}
+
+/// [`decode_xz`] into a caller-provided (possibly pre-allocated) buffer.
+pub fn decode_xz_into(input: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+    out.reserve(input.len().saturating_mul(4));
+    if alone::looks_like_alone(input) {
+        alone::decode_alone(input, out)?;
+    } else {
+        xz_format::decode_xz_stream(input, out)?;
+    }
+    Ok(())
 }
 
 /// Streaming Write-adapter so the cramjam Python wrapper can wrap an output

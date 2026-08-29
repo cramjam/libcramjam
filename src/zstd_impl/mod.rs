@@ -24,17 +24,17 @@ pub fn decompress<W: Write + ?Sized, R: Read>(
     let mut data = Vec::new();
     input.read_to_end(&mut data)?;
 
-    let mut decoded = Vec::new();
-    let mut consumed = 0usize;
-    while consumed < data.len() {
-        let n = decode::decode_frame(&data[consumed..], &mut decoded)?;
-        if n == 0 {
-            break;
+    crate::with_scratch(output, |decoded| {
+        let mut consumed = 0usize;
+        while consumed < data.len() {
+            let n = decode::decode_frame(&data[consumed..], decoded)?;
+            if n == 0 {
+                break;
+            }
+            consumed += n;
         }
-        consumed += n;
-    }
-    output.write_all(&decoded)?;
-    Ok(decoded.len())
+        Ok(())
+    })
 }
 
 /// Compress data into a zstd frame using our native encoder.

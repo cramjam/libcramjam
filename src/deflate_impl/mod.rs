@@ -40,10 +40,10 @@ pub fn deflate_decompress<W: Write + ?Sized, R: Read>(
 ) -> io::Result<usize> {
     let mut data = Vec::new();
     input.read_to_end(&mut data)?;
-    let mut decompressed = Vec::with_capacity(std::cmp::max(data.len().saturating_mul(4), 32768));
-    inflate::inflate_into(&data, &mut decompressed)?;
-    output.write_all(&decompressed)?;
-    Ok(decompressed.len())
+    crate::with_scratch(output, |decompressed| {
+        decompressed.reserve(std::cmp::max(data.len().saturating_mul(4), 32768));
+        inflate::inflate_into(&data, decompressed).map(|_| ())
+    })
 }
 
 /// Worst-case compressed size for raw DEFLATE.
@@ -111,7 +111,8 @@ pub fn gzip_decompress<W: Write + ?Sized, R: Read>(
     } else {
         data.len().saturating_mul(3)
     };
-    let mut decompressed = Vec::with_capacity(size_hint);
+    crate::with_scratch(output, |decompressed| {
+    decompressed.reserve(size_hint);
     let mut pos = 0;
 
     while pos < data.len() {
@@ -173,7 +174,7 @@ pub fn gzip_decompress<W: Write + ?Sized, R: Read>(
         // Inflate, then CRC32 the result (separate pass — keeps inflate loop
         // unperturbed for maximum throughput; data is still in L2 cache).
         let out_start = decompressed.len();
-        let consumed = inflate::inflate_into(&data[hdr_end..], &mut decompressed)?;
+        let consumed = inflate::inflate_into(&data[hdr_end..], decompressed)?;
         let data_end = hdr_end + consumed;
         let member_len = decompressed.len() - out_start;
         let actual_crc = crc32::crc32(&decompressed[out_start..]);
@@ -199,10 +200,8 @@ pub fn gzip_decompress<W: Write + ?Sized, R: Read>(
 
         pos = data_end + 8;
     }
-
-    let n = decompressed.len();
-    output.write_all(&decompressed)?;
-    Ok(n)
+    Ok(())
+    })
 }
 
 /// Worst-case compressed size for gzip.
@@ -306,8 +305,9 @@ pub fn zlib_decompress<W: Write + ?Sized, R: Read>(
     }
 
     let hdr_size = ZLIB_HEADER_SIZE;
-    let mut decompressed = Vec::with_capacity(std::cmp::max(data.len().saturating_mul(4), 32768));
-    let consumed = inflate::inflate_into(&data[hdr_size..], &mut decompressed)?;
+    crate::with_scratch(output, |decompressed| {
+    decompressed.reserve(std::cmp::max(data.len().saturating_mul(4), 32768));
+    let consumed = inflate::inflate_into(&data[hdr_size..], decompressed)?;
     let data_end = hdr_size + consumed;
     let actual = adler32::adler32(&decompressed);
 
@@ -324,10 +324,8 @@ pub fn zlib_decompress<W: Write + ?Sized, R: Read>(
             format!("zlib: adler-32 mismatch (expected {:08x}, got {:08x})", expected, actual),
         ));
     }
-
-    let n = decompressed.len();
-    output.write_all(&decompressed)?;
-    Ok(n)
+    Ok(())
+    })
 }
 
 /// Worst-case compressed size for zlib.

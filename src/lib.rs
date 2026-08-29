@@ -11,6 +11,48 @@ pub mod bzip2;
 #[cfg(feature = "capi")]
 mod capi;
 
+/// Run `f` with a thread-local scratch `Vec<u8>` (cleared, capacity kept)
+/// and then write its contents to `output`.
+///
+/// The generic `Read`/`Write` decompress API forces every call through an
+/// intermediate buffer. Allocating that buffer fresh each call costs a page
+/// fault (plus kernel zeroing) per 4 KiB of output — a few ms per 10 MB,
+/// often 10-20% of a decode. Reusing one per thread keeps the pages mapped
+/// across calls, which is what the old C streaming wrappers effectively got
+/// from their fixed 128 KiB buffers. Buffers above `SCRATCH_KEEP_MAX` are
+/// released after use so a single huge decode doesn't pin memory forever.
+#[cfg(any(feature = "lz4", feature = "zstd", feature = "bzip2", feature = "xz", feature = "deflate-static", feature = "deflate-shared"))]
+pub(crate) fn with_scratch<W: std::io::Write + ?Sized>(
+    output: &mut W,
+    f: impl FnOnce(&mut Vec<u8>) -> std::io::Result<()>,
+) -> std::io::Result<usize> {
+    use std::cell::RefCell;
+    const SCRATCH_KEEP_MAX: usize = 64 << 20;
+    thread_local! {
+        static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
+    SCRATCH.with(|cell| {
+        // `try_borrow_mut` so a (hypothetical) re-entrant call just gets a
+        // fresh temporary instead of panicking.
+        let mut guard = cell.try_borrow_mut().ok();
+        let mut tmp = Vec::new();
+        let buf: &mut Vec<u8> = match guard.as_deref_mut() {
+            Some(b) => b,
+            None => &mut tmp,
+        };
+        buf.clear();
+        let r = f(buf);
+        let out = match r {
+            Ok(()) => output.write_all(buf).map(|_| buf.len()),
+            Err(e) => Err(e),
+        };
+        if buf.capacity() > SCRATCH_KEEP_MAX {
+            *buf = Vec::new();
+        }
+        out
+    })
+}
+
 // Shared runtime CPU feature detection + SIMD wildcopy kernel used by the
 // pure-Rust lz4 and zstd decoders. No-op on non-x86_64/aarch64 targets.
 #[cfg(any(feature = "lz4", feature = "zstd"))]

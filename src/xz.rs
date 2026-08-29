@@ -21,9 +21,7 @@ pub const DEFAULT_COMPRESSION_LEVEL: u32 = 6;
 pub fn decompress<W: Write + ?Sized, R: Read>(mut input: R, output: &mut W) -> Result<usize> {
     let mut data = Vec::new();
     input.read_to_end(&mut data)?;
-    let decoded = crate::xz_impl::decode_xz(&data)?;
-    output.write_all(&decoded)?;
-    Ok(decoded.len())
+    crate::with_scratch(output, |decoded| crate::xz_impl::decode_xz_into(&data, decoded))
 }
 
 /// Compress an input stream as `.xz`.
