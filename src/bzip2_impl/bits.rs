@@ -168,39 +168,40 @@ impl BitWriter {
     pub fn write_bits(&mut self, value: u64, n: u32) {
         debug_assert!(n <= 56);
         debug_assert!(n == 64 || value >> n == 0, "extra bits set above n");
-        // Append at the LOW end of the container.
+        // Invariant between calls: `bits_in_container < 32` and the
+        // container holds exactly those bits (upper bits clear).  Fields
+        // wider than 32 bits (the 48-bit magics) are split so the shift
+        // below never overflows (< 32 + 32 = 64 bits).
+        if n > 32 {
+            self.write_bits(value >> 32, n - 32);
+            self.write_bits(value & 0xFFFF_FFFF, 32);
+            return;
+        }
         self.container = (self.container << n) | value;
         self.bits_in_container += n;
-        // Drain a full 4-byte chunk if we have ≥32 bits queued.  This is
-        // both fewer drain operations than the per-byte loop AND a single
-        // 4-byte append to the output Vec instead of four `push` calls.
-        // For typical Huffman fields (≤17 bits) one drain per call is
-        // enough; longer fields fall through to the byte loop.
-        if self.bits_in_container >= 32 {
+        // Drain 4 bytes at a time while >= 32 bits are queued: one iteration
+        // for typical Huffman fields, two for the rare wide field.
+        while self.bits_in_container >= 32 {
             self.bits_in_container -= 32;
             let chunk = ((self.container >> self.bits_in_container) as u32).to_be_bytes();
             self.output.extend_from_slice(&chunk);
-            self.container &= (1u64 << self.bits_in_container).wrapping_sub(1);
         }
-        // Drain any remaining whole bytes (used for the rare wide field).
-        while self.bits_in_container >= 8 {
-            self.bits_in_container -= 8;
-            let byte = (self.container >> self.bits_in_container) as u8;
-            self.output.push(byte);
-        }
-        if self.bits_in_container == 0 {
-            self.container = 0;
-        } else {
-            self.container &= (1u64 << self.bits_in_container).wrapping_sub(1);
-        }
+        // `bits_in_container < 32`, so the shift is in range (0 → mask 0).
+        self.container &= (1u64 << self.bits_in_container) - 1;
     }
 
     /// Pad to the next byte boundary with zero bits.
     pub fn align_to_byte(&mut self) {
-        if self.bits_in_container > 0 {
-            let pad = 8 - self.bits_in_container;
-            self.write_bits(0, pad);
+        let extra = self.bits_in_container % 8;
+        if extra > 0 {
+            self.write_bits(0, 8 - extra);
         }
+        // Flush the (now whole) queued bytes, MSB-first.
+        while self.bits_in_container >= 8 {
+            self.bits_in_container -= 8;
+            self.output.push((self.container >> self.bits_in_container) as u8);
+        }
+        self.container = 0;
     }
 
     /// Drop the writer and return the encoded bytes.  Caller must have
