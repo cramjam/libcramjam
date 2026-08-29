@@ -4,7 +4,13 @@
 //! Compression: our own native encoder (`encode::encode_frame`) — raw blocks
 //! at level 0, LZ77 + predefined-FSE sequences at level >= 1.
 
+mod bitc;
 mod bits;
+mod cparams;
+mod entropy;
+mod parse_fast;
+mod parse_lazy;
+mod seqstore;
 mod decode;
 pub mod encode;
 mod fse;
