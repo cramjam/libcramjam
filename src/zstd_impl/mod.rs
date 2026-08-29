@@ -62,6 +62,12 @@ pub fn compress<W: Write + ?Sized, R: Read>(
     Ok(compressed.len())
 }
 
+/// Compress a byte slice into a new `Vec` (no intermediate input copy).
+pub fn compress_bytes(input: &[u8], level: Option<i32>) -> Vec<u8> {
+    let level = level.unwrap_or(DEFAULT_COMPRESSION_LEVEL);
+    encode::encode_frame(input, level, Some(input.len() as u64))
+}
+
 /// Worst-case compressed size.
 pub fn compress_bound(len: usize) -> usize {
     encode::compress_bound(len)

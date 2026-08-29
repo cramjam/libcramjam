@@ -15,6 +15,8 @@ fn main() {
     let level: i32 = std::env::var("LEVEL").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
     let iters: usize = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
     let time_c = std::env::var_os("TIME_C").is_some();
+    // DIRECT=1: call the slice API (no Read→Vec copy / write_all copy).
+    let direct = std::env::var_os("DIRECT").is_some();
     let bz2 = std::fs::read(format!("benches/data/{file}.bz2")).expect("read corpus");
     let mut input = Vec::new();
     bzip2::read::BzDecoder::new(&bz2[..]).read_to_end(&mut input).unwrap();
@@ -25,12 +27,20 @@ fn main() {
     let mut ours_size = 0;
     let mut c_size = 0;
     for _ in 0..iters {
-        let mut out = Vec::with_capacity(input.len());
-        let t = Instant::now();
-        libcramjam::zstd::compress(&mut Cursor::new(&input), &mut out, Some(level), Some(input.len())).unwrap();
-        ours.push(t.elapsed());
-        ours_size = out.len();
-        std::hint::black_box(out);
+        if direct {
+            let t = Instant::now();
+            let out = libcramjam::zstd::compress_bytes(&input, Some(level));
+            ours.push(t.elapsed());
+            ours_size = out.len();
+            std::hint::black_box(out);
+        } else {
+            let mut out = Vec::with_capacity(input.len());
+            let t = Instant::now();
+            libcramjam::zstd::compress(&mut Cursor::new(&input), &mut out, Some(level), Some(input.len())).unwrap();
+            ours.push(t.elapsed());
+            ours_size = out.len();
+            std::hint::black_box(out);
+        }
         if time_c {
             let t = Instant::now();
             let mut enc = zstd::stream::read::Encoder::new(&input[..], level).unwrap();

@@ -11,6 +11,11 @@ pub fn compress_bound(len: usize) -> usize {
     crate::zstd_impl::compress_bound(len)
 }
 
+/// Compress a byte slice into a new `Vec`, skipping the generic `Read` copy.
+pub fn compress_bytes(input: &[u8], level: Option<i32>) -> Vec<u8> {
+    crate::zstd_impl::compress_bytes(input, level)
+}
+
 /// Decompress zstd data
 #[inline(always)]
 pub fn decompress<W: Write + ?Sized, R: Read>(input: R, output: &mut W) -> Result<usize, Error> {
