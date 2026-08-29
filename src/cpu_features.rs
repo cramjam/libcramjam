@@ -143,6 +143,47 @@ unsafe fn copy8(src: *const u8, dst: *mut u8) {
 const INC32: [usize; 8] = [0, 1, 2, 1, 0, 4, 4, 4];
 const DEC64: [isize; 8] = [0, 0, 0, -1, -4, 1, 2, 3];
 
+/// zstd's match copy (`ZSTD_execSequence`): like [`copy_match_unchecked`]
+/// but the non-overlapping path copies 16 bytes then continues in 32-byte
+/// steps (two ordered 16-byte moves, so `offset >= 16` stays correct) —
+/// half the loop iterations, and therefore half the loop-exit branch
+/// mispredicts, on matches longer than 16 bytes.
+///
+/// # Safety
+/// As [`copy_match_unchecked`], but may write up to **31** bytes past
+/// `dst + match_len` (callers need 32 bytes of headroom).
+#[inline(always)]
+pub unsafe fn copy_match_unchecked_32(src: *const u8, dst: *mut u8, offset: usize, match_len: usize) {
+    if offset >= 16 {
+        unsafe {
+            let a: [u8; 16] = core::ptr::read_unaligned(src.cast());
+            core::ptr::write_unaligned(dst.cast::<[u8; 16]>(), a);
+            if match_len <= 16 {
+                return;
+            }
+            if match_len > 64 && offset >= match_len {
+                core::ptr::copy_nonoverlapping(src.add(16), dst.add(16), match_len - 16);
+                return;
+            }
+            let end = dst.add(match_len);
+            let mut s = src.add(16);
+            let mut d = dst.add(16);
+            loop {
+                let a: [u8; 16] = core::ptr::read_unaligned(s.cast());
+                core::ptr::write_unaligned(d.cast::<[u8; 16]>(), a);
+                let b: [u8; 16] = core::ptr::read_unaligned(s.add(16).cast());
+                core::ptr::write_unaligned(d.add(16).cast::<[u8; 16]>(), b);
+                s = s.add(32);
+                d = d.add(32);
+                if d >= end {
+                    return;
+                }
+            }
+        }
+    }
+    unsafe { copy_match_unchecked(src, dst, offset, match_len) }
+}
+
 /// Match-execution kernel shared by lz4 and zstd decoders.
 ///
 /// Copies `match_len` bytes from `src` (points at `dst - offset`) into `dst`.

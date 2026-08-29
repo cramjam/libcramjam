@@ -385,7 +385,7 @@ struct Seq {
     offset: u32,
 }
 type SeqBatch = [Seq; SEQ_BATCH];
-const SEQ_BATCH: usize = 32;
+const SEQ_BATCH: usize = 64;
 
 /// Decode ONE sequence with the general-purpose reader: handles the
 /// stream-start slow refill, the rare > 31-bit extras mid-refill and the
@@ -628,12 +628,14 @@ unsafe fn decode_sequence_batch_bmi2(st: &mut FseState, tabs: *const SeqEntry, o
             "3:",
             "test r14d, r14d",
             "jnz 4f",
-            // of code 0: rep0, or swap(rep0, rep1) when lit_len == 0
+            // of code 0: rep0, or swap(rep0, rep1) when lit_len == 0 —
+            // branchless (cmov), the swap is unpredictable on text.
             "mov r15d, r11d",
+            "mov r14d, r12d",
             "cmp dword ptr [rsi + r8*8 + 4], 0",
-            "jne 5f",
-            "mov r15d, r12d",
-            "mov r12d, r11d",
+            "cmove r15d, r12d",
+            "cmove r14d, r11d",
+            "mov r12d, r14d",
             "mov r11d, r15d",
             "jmp 5f",
             "4:",
@@ -790,7 +792,7 @@ unsafe fn decode_sequences(
             }
             unsafe {
                 crate::cpu_features::wildcopy_chunks::<16>(lit_ptr.add(lit_pos), out_base.add(dst), lit_len);
-                crate::cpu_features::copy_match_unchecked(
+                crate::cpu_features::copy_match_unchecked_32(
                     out_base.add(post_lit - off),
                     out_base.add(post_lit),
                     off,
