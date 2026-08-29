@@ -328,7 +328,14 @@ fn write_dynamic_block(
     for &(sym, _) in &rle {
         cl_freq[sym as usize] += 1;
     }
-    let cl_lengths_arr = huffman::build_lengths(&cl_freq, 7);
+    let mut cl_lengths_arr = huffman::build_lengths(&cl_freq, 7);
+    // Strict inflaters require the code-length code itself to be complete
+    // even when only one symbol is used (miniz_oxide: `bt == HUFFLEN_TABLE`).
+    // A lone 1-bit code is incomplete, so pair it with an unused symbol.
+    if cl_lengths_arr.iter().filter(|&&l| l > 0).count() == 1 {
+        let dummy = (0..19).find(|&i| cl_lengths_arr[i] == 0).expect("19-symbol alphabet");
+        cl_lengths_arr[dummy] = 1;
+    }
     let cl_codes = huffman::canonical_codes(&cl_lengths_arr);
 
     // Determine HCLEN.

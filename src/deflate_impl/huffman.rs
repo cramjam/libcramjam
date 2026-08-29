@@ -346,45 +346,67 @@ pub fn build_lengths(freqs: &[u32], max_len: u8) -> Vec<u8> {
     lengths
 }
 
-/// Adjust code lengths so none exceeds `max_len` while keeping the code valid.
+/// Adjust code lengths so none exceeds `max_len` while keeping the code a
+/// *complete* prefix code (Kraft sum exactly 1). Strict inflaters (zlib,
+/// miniz_oxide) reject both over-subscribed and incomplete codes.
+///
+/// Capping lengths to `max_len` over-subscribes the code; the symbols that
+/// were capped are already at `max_len`, so the repair lengthens the
+/// least-frequent symbols that still have room, then hands any leftover
+/// Kraft budget back to the most-frequent symbols (a suboptimal-length
+/// code compresses slightly worse, an invalid one is corrupt output).
 fn limit_lengths(lengths: &mut [u8], freqs: &[u32], max_len: u8) {
-    // Sort symbols by frequency descending: most-frequent symbols keep short
-    // codes; least-frequent are lengthened first.
-    let mut syms: Vec<(u32, usize)> = lengths
-        .iter()
-        .enumerate()
-        .filter(|(_, &l)| l > 0)
-        .map(|(i, &_l)| (freqs[i], i))
-        .collect();
-    syms.sort_by(|a, b| b.0.cmp(&a.0));
+    // Least frequent first.
+    let mut syms: Vec<usize> = (0..lengths.len()).filter(|&i| lengths[i] > 0).collect();
+    syms.sort_by_key(|&s| freqs[s]);
 
-    // Cap every length.
-    for &(_, sym) in &syms {
-        if lengths[sym] > max_len {
-            lengths[sym] = max_len;
+    for &s in &syms {
+        if lengths[s] > max_len {
+            lengths[s] = max_len;
         }
     }
 
-    // Kraft sum in units of 1 (with 2^max_len total).
+    // Kraft sum in units of 2^-max_len; `target` means exactly 1.
     let target = 1u64 << max_len;
-    let kraft = |lengths: &[u8], syms: &[(u32, usize)]| -> u64 {
-        syms.iter()
-            .map(|&(_, s)| 1u64 << (max_len - lengths[s]))
-            .sum()
-    };
+    let mut current: u64 = syms.iter().map(|&s| 1u64 << (max_len - lengths[s])).sum();
 
-    let mut current = kraft(lengths, &syms);
+    // Over-subscribed: lengthen least-frequent symbols, one step per pass.
+    while current > target {
+        let mut progressed = false;
+        for &s in &syms {
+            if current <= target {
+                break;
+            }
+            if lengths[s] < max_len {
+                current -= 1u64 << (max_len - lengths[s] - 1);
+                lengths[s] += 1;
+                progressed = true;
+            }
+        }
+        debug_assert!(progressed, "cannot fit {} symbols in {} bits", syms.len(), max_len);
+        if !progressed {
+            break;
+        }
+    }
 
-    // Lengthen the least-frequent symbols until within budget.
-    let mut i = syms.len();
-    while current > target && i > 0 {
-        i -= 1;
-        let sym = syms[i].1;
-        while lengths[sym] < max_len && current > target {
-            let old_cost = 1u64 << (max_len - lengths[sym]);
-            lengths[sym] += 1;
-            let new_cost = 1u64 << (max_len - lengths[sym]);
-            current -= old_cost - new_cost;
+    // Incomplete: shorten codes, most frequent first, whenever the doubled
+    // cost still fits. The deficit is always a multiple of the smallest
+    // cost in use, so this terminates with `current == target`.
+    while current < target {
+        let mut progressed = false;
+        for &s in syms.iter().rev() {
+            let cost = 1u64 << (max_len - lengths[s]);
+            if lengths[s] > 1 && cost <= target - current {
+                current += cost;
+                lengths[s] -= 1;
+                progressed = true;
+                if current == target {
+                    break;
+                }
+            }
+        }
+        if !progressed {
+            break;
         }
     }
 }
@@ -424,5 +446,51 @@ mod tests {
         let freqs = [100, 1, 1, 1];
         let lens = build_lengths(&freqs, 15);
         assert!(lens[0] < lens[1]);
+    }
+
+    fn kraft(lengths: &[u8], max_len: u8) -> u64 {
+        lengths.iter().filter(|&&l| l > 0).map(|&l| 1u64 << (max_len - l)).sum()
+    }
+
+    /// Strict inflaters (zlib, miniz_oxide) reject incomplete codes with more
+    /// than one used symbol, so every length set must have Kraft sum == 1,
+    /// including after the depth limit kicks in.
+    #[test]
+    fn build_lengths_is_complete_under_depth_limit() {
+        let mut seed = 0x9E37_79B9u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for trial in 0..2000 {
+            // 19-symbol alphabet under the 7-bit limit, up to 286 under 15.
+            let max_len: u8 = if trial % 2 == 0 { 7 } else { 15 };
+            let n = 2 + (next() % if max_len == 7 { 17 } else { 285 }) as usize;
+            let mut freqs = vec![0u32; n];
+            for (i, f) in freqs.iter_mut().enumerate() {
+                let r = next();
+                *f = if r % 4 == 0 { 0 } else { 1 + (r >> 8) / (1 + (i as u32 % 23)) };
+            }
+            // Heavy skew so the unconstrained tree exceeds the limit.
+            freqs[0] = 1 << 30;
+            freqs[1] = 1 << 29;
+            let used = freqs.iter().filter(|&&f| f > 0).count();
+            {
+                let lens = build_lengths(&freqs, max_len);
+                assert!(lens.iter().all(|&l| l <= max_len), "trial {trial}: length over limit");
+                for (i, &l) in lens.iter().enumerate() {
+                    assert_eq!(l > 0, freqs[i] > 0, "trial {trial}: used/unused mismatch");
+                }
+                if used >= 2 {
+                    assert_eq!(
+                        kraft(&lens, max_len),
+                        1u64 << max_len,
+                        "trial {trial} max_len {max_len}: incomplete code"
+                    );
+                }
+            }
+        }
     }
 }
