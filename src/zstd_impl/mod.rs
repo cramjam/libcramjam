@@ -4,7 +4,13 @@
 //! Compression: our own native encoder (`encode::encode_frame`) — raw blocks
 //! at level 0, LZ77 + predefined-FSE sequences at level >= 1.
 
+mod bitc;
 mod bits;
+mod cparams;
+mod entropy;
+mod parse_fast;
+mod parse_lazy;
+mod seqstore;
 mod decode;
 pub mod encode;
 mod fse;
@@ -61,6 +67,12 @@ pub fn compress<W: Write + ?Sized, R: Read>(
     let compressed = encode::encode_frame(&data, level, Some(data.len() as u64));
     output.write_all(&compressed)?;
     Ok(compressed.len())
+}
+
+/// Compress a byte slice into a new `Vec` (no intermediate input copy).
+pub fn compress_bytes(input: &[u8], level: Option<i32>) -> Vec<u8> {
+    let level = level.unwrap_or(DEFAULT_COMPRESSION_LEVEL);
+    encode::encode_frame(input, level, Some(input.len() as u64))
 }
 
 /// Worst-case compressed size.
