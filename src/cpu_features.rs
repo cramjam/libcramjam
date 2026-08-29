@@ -79,80 +79,93 @@ pub fn has_simd128() -> bool {
 // ---------------------------------------------------------------------------
 
 /// Copy `length` bytes from `src` into `dst` in fixed `N`-byte chunks using
-/// unaligned loads and stores. May write up to `N - 1` bytes past the end of
-/// the requested region.
-///
-/// For `N = 16` on x86_64 this lowers to `movdqu` pairs; on aarch64 to
-/// unaligned `ldr q?`/`str q?`. For `N = 32` on a target with AVX2 enabled it
-/// lowers to `vmovdqu` pairs. The const-generic `N` lets the compiler
-/// specialize the loop body for a specific chunk size.
+/// unaligned loads and stores. Always copies at least one full chunk (even
+/// when `length == 0`) and may write up to `N - 1` bytes past the end of the
+/// requested region — the copy-first-then-test shape is what makes the
+/// common `length <= N` case a single load/store pair with one predictable
+/// branch (mirrors `ZSTD_wildcopy` / `LZ4_wildCopy`).
 ///
 /// # Safety
 ///
-/// * `[src, src + length + N)` must be a valid read region.
-/// * `[dst, dst + length + N)` must be a valid write region.
+/// * `[src, src + max(length, N) + N)` must be a valid read region.
+/// * `[dst, dst + max(length, N) + N)` must be a valid write region.
 /// * For match (back-reference) copies the regions MAY overlap, but only if
 ///   `dst >= src + N`, i.e. every chunk reads from bytes that were fully
 ///   written by earlier chunks (or by the caller before the loop started).
-///   For `N = 16` this means callers must guard `offset >= 16` before using
-///   this helper on a self-referential match.
 #[inline(always)]
 pub unsafe fn wildcopy_chunks<const N: usize>(
     mut src: *const u8,
     mut dst: *mut u8,
     length: usize,
 ) {
-    if length == 0 {
-        return;
-    }
-    // SAFETY: caller guarantees `src + length + N` is valid to read.
-    let end = unsafe { src.add(length) };
+    let end = unsafe { dst.add(length) };
     loop {
-        // Const-N unaligned array load/store. LLVM reliably lowers these to
-        // a single wide move of the right width (movdqu/vmovdqu/ldp/stp).
         let chunk: [u8; N] = unsafe { core::ptr::read_unaligned(src.cast::<[u8; N]>()) };
         unsafe { core::ptr::write_unaligned(dst.cast::<[u8; N]>(), chunk) };
         src = unsafe { src.add(N) };
         dst = unsafe { dst.add(N) };
-        if src >= end {
+        if dst >= end {
             return;
         }
     }
 }
 
+#[inline(always)]
+unsafe fn copy8(src: *const u8, dst: *mut u8) {
+    let v = unsafe { core::ptr::read_unaligned(src as *const u64) };
+    unsafe { core::ptr::write_unaligned(dst as *mut u64, v) };
+}
+
+/// After the first 8 bytes of an overlapping copy with `offset < 8`, shift
+/// `src` so that the effective offset becomes >= 8 (lz4's `inc32table` /
+/// `dec64table`, zstd's `ZSTD_overlapCopy8`).
+const INC32: [usize; 8] = [0, 1, 2, 1, 0, 4, 4, 4];
+const DEC64: [isize; 8] = [0, 0, 0, -1, -4, 1, 2, 3];
+
 /// Match-execution kernel shared by lz4 and zstd decoders.
 ///
 /// Copies `match_len` bytes from `src` (points at `dst - offset`) into `dst`.
-/// Dispatches on three cases:
 ///
 /// 1. `offset >= 16`: non-overlapping 16-byte wildcopy.
-/// 2. `offset == 1`: single-byte RLE via `write_bytes`.
-/// 3. `2 <= offset < 16`: overlapping copy in `offset`-sized chunks so the
-///    pattern propagates. Falls through to a tail copy.
+/// 2. `offset < 16`: fix up the first 8 bytes so the effective offset is
+///    >= 8, then stream 8-byte chunks (each reads bytes already written).
+///
+/// May write up to 15 bytes past `dst + match_len`.
 ///
 /// # Safety
 ///
-/// * `src` must point `offset` bytes before `dst`.
-/// * `[src, dst + match_len + 16)` must be a valid in-allocation region.
+/// * `src` must point `offset` bytes before `dst`, `offset >= 1`.
+/// * `[src, dst + max(match_len, 16) + 16)` must be a valid in-allocation region.
 /// * Caller is responsible for advancing the destination cursor (e.g. via
 ///   `Vec::set_len`) after calling this function.
 #[inline(always)]
 pub unsafe fn copy_match_unchecked(src: *const u8, dst: *mut u8, offset: usize, match_len: usize) {
     if offset >= 16 {
         unsafe { wildcopy_chunks::<16>(src, dst, match_len) };
-    } else if offset == 1 {
-        // RLE — very common for runs of padding bytes, whitespace, zeros.
-        unsafe { core::ptr::write_bytes(dst, *src, match_len) };
-    } else {
-        // Overlapping: copy `offset` bytes at a time so each chunk reads
-        // already-written data and the pattern propagates correctly.
-        let mut w = 0usize;
-        while w + offset <= match_len {
-            unsafe { core::ptr::copy_nonoverlapping(src.add(w), dst.add(w), offset) };
-            w += offset;
+        return;
+    }
+    let mut src = src;
+    let mut dst = dst;
+    let end = unsafe { dst.add(match_len) };
+    unsafe {
+        if offset < 8 {
+            *dst = *src;
+            *dst.add(1) = *src.add(1);
+            *dst.add(2) = *src.add(2);
+            *dst.add(3) = *src.add(3);
+            src = src.add(*INC32.get_unchecked(offset));
+            let v = core::ptr::read_unaligned(src as *const u32);
+            core::ptr::write_unaligned(dst.add(4) as *mut u32, v);
+            src = src.offset(-*DEC64.get_unchecked(offset));
+        } else {
+            copy8(src, dst);
+            src = src.add(8);
         }
-        if w < match_len {
-            unsafe { core::ptr::copy_nonoverlapping(src.add(w), dst.add(w), match_len - w) };
+        dst = dst.add(8);
+        while dst < end {
+            copy8(src, dst);
+            src = src.add(8);
+            dst = dst.add(8);
         }
     }
 }

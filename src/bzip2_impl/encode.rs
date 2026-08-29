@@ -353,147 +353,154 @@ fn forward_bwt(input: &[u8]) -> (Vec<u8>, usize) {
 }
 
 // =========================================================================
-// mainSort BWT — port of C bzip2's blocksort algorithm
+// mainSort BWT — port of C bzip2's blocksort.c
 // =========================================================================
 //
-// Sorts cyclic rotations of `input` using:
-//   1. Radix sort by first 2 bytes into 65536 sub-buckets.
-//   2. Shell sort within each sub-bucket using byte-by-byte comparison.
-//   3. Quadrant array (u32 per position) for O(1) tiebreaking at depth > 2.
-//   4. Comparison budget — returns None if exceeded (caller falls back to SA-IS).
+// Sorts cyclic rotations of `input` exactly the way `BZ2_blockSort` does:
+//   1. Radix sort by first 2 bytes into 65536 small buckets (ftab).
+//   2. Process the 256 big buckets in ascending-size order (runningOrder).
+//   3. Sort each unsorted small bucket [ss, j != ss] with a 3-way quicksort
+//      on the byte at depth `d` (mainQSort3), dropping to a shell sort
+//      (mainSimpleSort + mainGtU) for ranges < 20 or depth > 14.
+//   4. After big bucket ss is sorted, synthesise every [t, ss] small bucket
+//      (including [ss, ss]) from predecessors in a bidirectional scan.
+//   5. Store each position's rank within its big bucket in a u16 quadrant
+//      (right-shifted so the largest bucket fits 16 bits — ordering is
+//      preserved, so it stays a valid tiebreak) for mainGtU's deep compares.
+//   6. Comparison budget (9n, one tick per 8 deep bytes). Returns None if
+//      exceeded so the caller falls back to SA-IS.
 //
-// Works directly on u8 input (no doubling), with a 34-byte cyclic overshoot
-// appended to the block for safe over-read in comparisons.
+// The block carries a 34-byte cyclic overshoot so the unrolled compares
+// never need a wrap check.
 
 const BZ_OVERSHOOT: usize = 34;
-const SHELL_INCS: [usize; 10] = [1, 4, 13, 40, 121, 364, 1093, 3280, 9841, 29524];
-/// Bit flag in ftab[] marking a sub-bucket as already sorted.
+const BZ_N_RADIX: i32 = 2;
+const BZ_N_QSORT: i32 = 12;
+const MAIN_QSORT_SMALL_THRESH: i32 = 20;
+const MAIN_QSORT_DEPTH_THRESH: i32 = BZ_N_RADIX + BZ_N_QSORT;
+const MAIN_QSORT_STACK_SIZE: usize = 100;
+const SHELL_INCS: [i32; 14] = [
+    1, 4, 13, 40, 121, 364, 1093, 3280, 9841, 29524, 88573, 265720, 797161, 2391484,
+];
+/// Bit flag in ftab[] marking a small bucket as already sorted.
 const SETMASK: u32 = 1 << 21;
 const CLEARMASK: u32 = !SETMASK;
 
 fn bwt_via_main_sort(input: &[u8]) -> Option<(Vec<u8>, usize)> {
     let n = input.len();
 
-    // Block with cyclic overshoot for safe over-read in comparisons.
     let mut block = vec![0u8; n + BZ_OVERSHOOT];
     block[..n].copy_from_slice(input);
     for i in 0..BZ_OVERSHOOT {
         block[n + i] = input[i % n];
     }
-
-    // Quadrant: per-position rank within its "big bucket" (all positions
-    // sharing the same first byte).  Used as tiebreaker in deep comparisons.
-    let mut quadrant = vec![0u32; n + BZ_OVERSHOOT];
-
-    // 2-byte pair frequency table.  ftab[(c0<<8)|c1] = number of positions
-    // where block[pos]==c0 and block[pos+1]==c1.
+    let mut quadrant = vec![0u16; n + BZ_OVERSHOOT];
     let mut ftab = vec![0u32; 65537];
-
-    // Output: sorted rotation indices.
     let mut ptr = vec![0u32; n];
+    // C: budget = nblock * ((workFactor - 1) / 3), workFactor = 30.
+    let mut budget: i32 = (n as i32).saturating_mul(9);
 
-    // Comparison budget: 7*n is the same heuristic C bzip2 uses.
-    let mut budget = (n as i32).saturating_mul(7);
-
-    // ---- Step 1: Count 2-byte pairs ----
     for i in 0..n {
         let j = ((block[i] as usize) << 8) | block[i + 1] as usize;
         ftab[j] += 1;
     }
-
-    // ---- Step 2: Cumulative sum → bucket start indices ----
     for i in 1..65537 {
         ftab[i] += ftab[i - 1];
     }
-
-    // ---- Step 3: Place each position into its sub-bucket ----
-    // Walk backwards so positions land in the correct initial order within
-    // each bucket (stable by descending position).
     for i in (0..n).rev() {
         let j = ((block[i] as usize) << 8) | block[i + 1] as usize;
         ftab[j] -= 1;
         ptr[ftab[j] as usize] = i as u32;
     }
 
-    // ---- Step 4: Sort sub-buckets + update quadrant ----
-    // The key optimization from C bzip2: after sorting big bucket `ss`,
-    // scan its positions' predecessors to derive the sorted order for
-    // sub-buckets [t, ss] (where big bucket t hasn't been processed yet).
-    // This avoids shell sort for roughly half the sub-buckets.
-    let mut big_done = [false; 256];
-    let mut copy_start = [0u32; 256];
+    // Big buckets in ascending size so the predecessor-copy trick handles
+    // as much of the large ones as possible.
+    let mut running_order: [u8; 256] = core::array::from_fn(|i| i as u8);
+    let big_freq: [u32; 256] = core::array::from_fn(|b| ftab[(b + 1) << 8] - ftab[b << 8]);
+    running_order.sort_by_key(|&b| big_freq[b as usize]);
 
-    for ss in 0..256usize {
-        // Sort sub-buckets [ss, j] that haven't been placed by the
-        // predecessor-copy trick from an earlier iteration.
+    let mut big_done = [false; 256];
+    let mut copy_start = [0i32; 256];
+    let mut copy_end = [0i32; 256];
+
+    for &ss in running_order.iter() {
+        let ss = ss as usize;
+
+        // Step 1: complete big bucket [ss] by sorting every small bucket
+        // [ss, j], j != ss, not already synthesised.
         for j in 0..256usize {
-            let sb = (ss << 8) | j;
-            if ftab[sb] & SETMASK != 0 {
+            if j == ss {
                 continue;
             }
-            let lo = (ftab[sb] & CLEARMASK) as usize;
-            let hi = (ftab[sb + 1] & CLEARMASK) as usize;
-            if hi > lo + 1 {
-                main_shell_sort(
-                    &mut ptr, &block, &quadrant, n, lo, hi - 1, 2, &mut budget,
-                );
-                if budget < 0 {
-                    return None;
+            let sb = (ss << 8) + j;
+            if ftab[sb] & SETMASK == 0 {
+                let lo = (ftab[sb] & CLEARMASK) as i32;
+                let hi = (ftab[sb + 1] & CLEARMASK) as i32 - 1;
+                if hi > lo {
+                    main_qsort3(&mut ptr, &block, &quadrant, n, lo, hi, BZ_N_RADIX, &mut budget);
+                    if budget < 0 {
+                        return None;
+                    }
                 }
             }
             ftab[sb] |= SETMASK;
         }
+        debug_assert!(!big_done[ss]);
 
-        // Update quadrant: assign per-position sequential ranks within the
-        // big bucket.  u32 prevents overflow (u16 would truncate for big
-        // buckets > 65535 positions, causing incorrect sort results).
-        {
-            let big_lo = (ftab[ss << 8] & CLEARMASK) as usize;
-            let big_hi = if ss < 255 {
-                (ftab[(ss + 1) << 8] & CLEARMASK) as usize
-            } else {
-                n
-            };
-            let mut rank = 0u32;
-            for k in big_lo..big_hi {
-                let p = ptr[k] as usize;
-                quadrant[p] = rank;
-                if p < BZ_OVERSHOOT {
-                    quadrant[p + n] = rank;
-                }
-                rank += 1;
+        // Step 2: scan big bucket [ss] to synthesise the sorted order of
+        // every small bucket [t, ss] — including, via the moving bounds,
+        // [ss, ss] itself.
+        for j in 0..256usize {
+            copy_start[j] = (ftab[(j << 8) + ss] & CLEARMASK) as i32;
+            copy_end[j] = (ftab[(j << 8) + ss + 1] & CLEARMASK) as i32 - 1;
+        }
+        let mut j = (ftab[ss << 8] & CLEARMASK) as i32;
+        while j < copy_start[ss] {
+            let p = ptr[j as usize] as usize;
+            let k = if p == 0 { n - 1 } else { p - 1 };
+            let c1 = block[k] as usize;
+            if !big_done[c1] {
+                ptr[copy_start[c1] as usize] = k as u32;
+                copy_start[c1] += 1;
             }
+            j += 1;
+        }
+        let mut j = (ftab[(ss + 1) << 8] & CLEARMASK) as i32 - 1;
+        while j > copy_end[ss] {
+            let p = ptr[j as usize] as usize;
+            let k = if p == 0 { n - 1 } else { p - 1 };
+            let c1 = block[k] as usize;
+            if !big_done[c1] {
+                ptr[copy_end[c1] as usize] = k as u32;
+                copy_end[c1] -= 1;
+            }
+            j -= 1;
+        }
+        debug_assert!(
+            copy_start[ss] - 1 == copy_end[ss] || (copy_start[ss] == 0 && copy_end[ss] == n as i32 - 1)
+        );
+        for j in 0..256usize {
+            ftab[(j << 8) + ss] |= SETMASK;
         }
 
+        // Step 3: big bucket [ss] is done — record ranks in the quadrant.
         big_done[ss] = true;
-
-        // Predecessor-copy: for each position p in the sorted big bucket ss,
-        // its predecessor pred = (p-1) mod n belongs to sub-bucket
-        // [block[pred], ss].  If big bucket block[pred] hasn't been processed
-        // yet, place pred directly — its order within [block[pred], ss] is
-        // determined by p's position in the sorted big bucket ss.
-        if ss < 255 {
-            for j in 0..256usize {
-                copy_start[j] = ftab[(j << 8) | ss] & CLEARMASK;
-            }
-            let big_lo = (ftab[ss << 8] & CLEARMASK) as usize;
-            let big_hi = (ftab[(ss + 1) << 8] & CLEARMASK) as usize;
-            for j in big_lo..big_hi {
-                let p = ptr[j] as usize;
-                let pred = if p == 0 { n - 1 } else { p - 1 };
-                let c1 = block[pred] as usize;
-                if !big_done[c1] {
-                    ptr[copy_start[c1] as usize] = pred as u32;
-                    copy_start[c1] += 1;
-                }
-            }
-            for j in 0..256usize {
-                ftab[(j << 8) | ss] |= SETMASK;
+        let bb_start = (ftab[ss << 8] & CLEARMASK) as usize;
+        let bb_size = (ftab[(ss + 1) << 8] & CLEARMASK) as usize - bb_start;
+        let mut shifts = 0u32;
+        while (bb_size >> shifts) > 65534 {
+            shifts += 1;
+        }
+        for j in (0..bb_size).rev() {
+            let a2update = ptr[bb_start + j] as usize;
+            let q = (j >> shifts) as u16;
+            quadrant[a2update] = q;
+            if a2update < BZ_OVERSHOOT {
+                quadrant[a2update + n] = q;
             }
         }
     }
 
-    // ---- Extract BWT output ----
     let mut last = Vec::with_capacity(n);
     let mut origin = 0usize;
     for (row, &p) in ptr.iter().enumerate() {
@@ -506,155 +513,265 @@ fn bwt_via_main_sort(input: &[u8]) -> Option<(Vec<u8>, usize)> {
     Some((last, origin))
 }
 
-/// Shell sort ptr[lo..=hi] by cyclic rotation order at the given depth.
-/// Positions in this range share the same first `depth` bytes, so comparisons
-/// start at byte `depth`.
+#[inline(always)]
+fn mmed3(mut a: u8, mut b: u8, c: u8) -> u8 {
+    if a > b {
+        core::mem::swap(&mut a, &mut b);
+    }
+    if b > c {
+        b = c;
+        if a > b {
+            b = a;
+        }
+    }
+    b
+}
+
+/// 3-way quicksort of ptr[lo..=hi] on the byte at depth `d` (C: mainQSort3).
+/// Every position in the range shares its first `d` bytes.
 #[inline(never)]
-fn main_shell_sort(
+fn main_qsort3(
     ptr: &mut [u32],
     block: &[u8],
-    quadrant: &[u32],
+    quadrant: &[u16],
     nblock: usize,
-    lo: usize,
-    hi: usize,
-    depth: usize,
+    lo_st: i32,
+    hi_st: i32,
+    d_st: i32,
     budget: &mut i32,
 ) {
-    let num = hi - lo + 1;
-    if num < 2 {
+    let mut stack = [(0i32, 0i32, 0i32); MAIN_QSORT_STACK_SIZE];
+    let mut sp = 0usize;
+    stack[sp] = (lo_st, hi_st, d_st);
+    sp += 1;
+
+    // SAFETY (all get_unchecked below): lo..=hi stay inside ptr (they come
+    // from ftab sub-bucket bounds), and ptr[x] + d ≤ nblock - 1 + 15 which
+    // is inside the 34-byte overshoot.
+    while sp > 0 {
+        assert!(sp < MAIN_QSORT_STACK_SIZE - 2);
+        sp -= 1;
+        let (lo, hi, d) = stack[sp];
+
+        if hi - lo < MAIN_QSORT_SMALL_THRESH || d > MAIN_QSORT_DEPTH_THRESH {
+            main_simple_sort(ptr, block, quadrant, nblock, lo, hi, d, budget);
+            if *budget < 0 {
+                return;
+            }
+            continue;
+        }
+
+        let at = |ptr: &[u32], i: i32| -> u8 {
+            unsafe { *block.get_unchecked(*ptr.get_unchecked(i as usize) as usize + d as usize) }
+        };
+        let med = mmed3(at(ptr, lo), at(ptr, hi), at(ptr, (lo + hi) >> 1)) as i32;
+
+        let mut un_lo = lo;
+        let mut lt_lo = lo;
+        let mut un_hi = hi;
+        let mut gt_hi = hi;
+        loop {
+            loop {
+                if un_lo > un_hi {
+                    break;
+                }
+                let v = at(ptr, un_lo) as i32 - med;
+                if v == 0 {
+                    ptr.swap(un_lo as usize, lt_lo as usize);
+                    lt_lo += 1;
+                    un_lo += 1;
+                    continue;
+                }
+                if v > 0 {
+                    break;
+                }
+                un_lo += 1;
+            }
+            loop {
+                if un_lo > un_hi {
+                    break;
+                }
+                let v = at(ptr, un_hi) as i32 - med;
+                if v == 0 {
+                    ptr.swap(un_hi as usize, gt_hi as usize);
+                    gt_hi -= 1;
+                    un_hi -= 1;
+                    continue;
+                }
+                if v < 0 {
+                    break;
+                }
+                un_hi -= 1;
+            }
+            if un_lo > un_hi {
+                break;
+            }
+            ptr.swap(un_lo as usize, un_hi as usize);
+            un_lo += 1;
+            un_hi -= 1;
+        }
+        debug_assert!(un_hi == un_lo - 1);
+
+        if gt_hi < lt_lo {
+            // Everything equal to the pivot: go one byte deeper.
+            stack[sp] = (lo, hi, d + 1);
+            sp += 1;
+            continue;
+        }
+
+        let n = (lt_lo - lo).min(un_lo - lt_lo);
+        vswap(ptr, lo, un_lo - n, n);
+        let m = (hi - gt_hi).min(gt_hi - un_hi);
+        vswap(ptr, un_lo, hi - m + 1, m);
+
+        let n = lo + un_lo - lt_lo - 1;
+        let m = hi - (gt_hi - un_hi) + 1;
+
+        let mut next = [(lo, n, d), (m, hi, d), (n + 1, m - 1, d + 1)];
+        let size = |t: &(i32, i32, i32)| t.1 - t.0;
+        if size(&next[0]) < size(&next[1]) {
+            next.swap(0, 1);
+        }
+        if size(&next[1]) < size(&next[2]) {
+            next.swap(1, 2);
+        }
+        if size(&next[0]) < size(&next[1]) {
+            next.swap(0, 1);
+        }
+        stack[sp] = next[0];
+        stack[sp + 1] = next[1];
+        stack[sp + 2] = next[2];
+        sp += 3;
+    }
+}
+
+#[inline(always)]
+fn vswap(ptr: &mut [u32], mut p1: i32, mut p2: i32, mut n: i32) {
+    while n > 0 {
+        ptr.swap(p1 as usize, p2 as usize);
+        p1 += 1;
+        p2 += 1;
+        n -= 1;
+    }
+}
+
+/// Shell sort ptr[lo..=hi] with full rotation comparison (C: mainSimpleSort).
+#[inline(never)]
+fn main_simple_sort(
+    ptr: &mut [u32],
+    block: &[u8],
+    quadrant: &[u16],
+    nblock: usize,
+    lo: i32,
+    hi: i32,
+    d: i32,
+    budget: &mut i32,
+) {
+    let big_n = hi - lo + 1;
+    if big_n < 2 {
         return;
     }
-
-    // Find the largest shell increment ≤ num.
     let mut hp = 0usize;
-    while hp < SHELL_INCS.len() - 1 && SHELL_INCS[hp + 1] <= num {
+    while SHELL_INCS[hp] < big_n {
         hp += 1;
     }
-
-    // Shell sort with decreasing increments.
+    let d = d as usize;
     loop {
-        let gap = SHELL_INCS[hp];
-        let mut i = lo + gap;
+        if hp == 0 {
+            break;
+        }
+        hp -= 1;
+        let h = SHELL_INCS[hp];
+        let mut i = lo + h;
         while i <= hi {
-            // Safety: lo..=hi are within ptr bounds (sub-bucket from ftab).
             unsafe {
-                let tmp = *ptr.get_unchecked(i);
+                let v = *ptr.get_unchecked(i as usize);
                 let mut j = i;
-                loop {
-                    if j < lo + gap {
+                while main_gt_u(
+                    block,
+                    quadrant,
+                    nblock,
+                    *ptr.get_unchecked((j - h) as usize) as usize + d,
+                    v as usize + d,
+                    budget,
+                ) {
+                    *ptr.get_unchecked_mut(j as usize) = *ptr.get_unchecked((j - h) as usize);
+                    j -= h;
+                    if j <= lo + h - 1 {
                         break;
                     }
-                    let prev = *ptr.get_unchecked(j - gap);
-                    if !main_gt_u(block, quadrant, nblock, prev as usize, tmp as usize, depth, budget) {
-                        break;
-                    }
-                    *ptr.get_unchecked_mut(j) = prev;
-                    j -= gap;
                 }
-                *ptr.get_unchecked_mut(j) = tmp;
+                *ptr.get_unchecked_mut(j as usize) = v;
             }
             i += 1;
             if *budget < 0 {
                 return;
             }
         }
-        if hp == 0 {
-            break;
-        }
-        hp -= 1;
     }
 }
 
-/// Compare two cyclic rotations starting at positions `i1` and `i2`,
-/// beginning at byte offset `depth` (which is already known to be equal).
-/// Returns true if rotation i1 > rotation i2.
-///
+/// True if rotation starting at `i1` sorts after the one at `i2` (C: mainGtU).
+/// `i1`/`i2` already include the depth offset.
+#[inline(always)]
 fn main_gt_u(
     block: &[u8],
-    quadrant: &[u32],
+    quadrant: &[u16],
     nblock: usize,
-    i1: usize,
-    i2: usize,
-    depth: usize,
+    mut i1: usize,
+    mut i2: usize,
     budget: &mut i32,
 ) -> bool {
-    debug_assert!(i1 < nblock && i2 < nblock);
-
-    // No initial wrap check needed: with BZ_OVERSHOOT=34, p1/p2 at most
-    // nblock+1, and the unrolled 12 bytes read up to nblock+13 — well
-    // within the overshoot.  The deep loop has its own wrap check.
-    let mut p1 = i1 + depth;
-    let mut p2 = i2 + depth;
-
-    // Unrolled first 12 bytes — safe because BZ_OVERSHOOT ≥ depth + 12.
+    debug_assert!(i1 != i2);
     unsafe {
         macro_rules! cmp1 {
             () => {
-                let c1 = *block.get_unchecked(p1);
-                let c2 = *block.get_unchecked(p2);
+                let c1 = *block.get_unchecked(i1);
+                let c2 = *block.get_unchecked(i2);
                 if c1 != c2 {
                     return c1 > c2;
                 }
-                p1 += 1;
-                p2 += 1;
+                i1 += 1;
+                i2 += 1;
             };
         }
-        cmp1!();
-        cmp1!();
-        cmp1!();
-        cmp1!();
-        cmp1!();
-        cmp1!();
-        cmp1!();
-        cmp1!();
-        cmp1!();
-        cmp1!();
-        cmp1!();
-        cmp1!();
-    }
+        cmp1!(); cmp1!(); cmp1!(); cmp1!(); cmp1!(); cmp1!();
+        cmp1!(); cmp1!(); cmp1!(); cmp1!(); cmp1!(); cmp1!();
 
-    // Continue comparing with wrap-around + quadrant tiebreaking.
-    let mut k = (nblock + 8) as i32;
-    loop {
-        unsafe {
-            macro_rules! cmp_q {
+        let mut k = nblock as i32 + 8;
+        loop {
+            macro_rules! cmpq {
                 () => {
-                    let c1 = *block.get_unchecked(p1);
-                    let c2 = *block.get_unchecked(p2);
+                    let c1 = *block.get_unchecked(i1);
+                    let c2 = *block.get_unchecked(i2);
                     if c1 != c2 {
                         return c1 > c2;
                     }
-                    let s1 = *quadrant.get_unchecked(p1);
-                    let s2 = *quadrant.get_unchecked(p2);
+                    let s1 = *quadrant.get_unchecked(i1);
+                    let s2 = *quadrant.get_unchecked(i2);
                     if s1 != s2 {
                         return s1 > s2;
                     }
-                    p1 += 1;
-                    p2 += 1;
+                    i1 += 1;
+                    i2 += 1;
                 };
             }
-            cmp_q!();
-            cmp_q!();
-            cmp_q!();
-            cmp_q!();
-        }
-
-        if p1 >= nblock {
-            p1 -= nblock;
-        }
-        if p2 >= nblock {
-            p2 -= nblock;
-        }
-        k -= 4;
-        *budget -= 1;
-        if k < 4 || *budget < 0 {
-            return false;
+            cmpq!(); cmpq!(); cmpq!(); cmpq!();
+            cmpq!(); cmpq!(); cmpq!(); cmpq!();
+            if i1 >= nblock {
+                i1 -= nblock;
+            }
+            if i2 >= nblock {
+                i2 -= nblock;
+            }
+            k -= 8;
+            *budget -= 1;
+            if k < 0 {
+                return false;
+            }
         }
     }
 }
-
-// is_high_entropy_input and bwt_via_prefix_doubling removed —
-// mainSort handles both text and high-entropy inputs.
 
 fn bwt_via_sais(input: &[u8]) -> (Vec<u8>, usize) {
     let n = input.len();
