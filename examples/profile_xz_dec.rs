@@ -24,4 +24,23 @@ fn main() {
     times.sort();
     let median = times[times.len() / 2];
     eprintln!("median: {:?} ({:.0} MB/s)", median, input.len() as f64 / 1048576.0 / median.as_secs_f64());
+
+    // Same measurement through C liblzma (xz2) for a same-conditions ratio.
+    let mut c_times = Vec::new();
+    for _ in 0..iters {
+        let mut out = Vec::with_capacity(input.len());
+        let t = Instant::now();
+        xz2::read::XzDecoder::new(&compressed[..]).read_to_end(&mut out).unwrap();
+        c_times.push(t.elapsed());
+        assert_eq!(out.len(), input.len());
+        std::hint::black_box(out);
+    }
+    c_times.sort();
+    let c_median = c_times[c_times.len() / 2];
+    eprintln!(
+        "C xz2 median: {:?} ({:.0} MB/s) -> ours/C = {:.2}x",
+        c_median,
+        input.len() as f64 / 1048576.0 / c_median.as_secs_f64(),
+        median.as_secs_f64() / c_median.as_secs_f64()
+    );
 }

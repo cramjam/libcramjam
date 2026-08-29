@@ -21,7 +21,7 @@
 
 use std::io;
 
-use super::lzma::{Dict, LzmaDecoder, LZMA_LCLP_MAX, LZMA_PB_MAX};
+use super::lzma::{LzmaDecoder, LZMA_LCLP_MAX, LZMA_PB_MAX};
 use super::range_coder::RangeDecoder;
 
 pub const ALONE_HEADER_LEN: usize = 13;
@@ -53,10 +53,13 @@ pub fn decode_alone(input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
     let target_size = if known_size { Some(unc_raw as usize) } else { None };
 
     // 4) Decode the LZMA payload that follows the 13-byte header.
-    let payload = &input[ALONE_HEADER_LEN..];
+    // Pad the payload so the range decoder's unchecked refill can never
+    // read past the end of the input (a corrupt stream may try).
+    let mut payload = input[ALONE_HEADER_LEN..].to_vec();
+    payload.resize(payload.len() + 16, 0);
     let mut decoder = LzmaDecoder::new(lc, lp, pb, dict_size)?;
-    decoder.dict = Dict::new(dict_size as usize);
-    let mut rd = RangeDecoder::new(payload)?;
+    decoder.dict_start = output.len();
+    let mut rd = RangeDecoder::new(&payload)?;
 
     // The maximum we'll ever produce.  When the size is unknown we use
     // a generous cap (1 GiB) so the decoder loop has a budget; the
@@ -65,10 +68,10 @@ pub fn decode_alone(input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
     // we'll typically stop earlier than the cap.
     let cap = target_size.unwrap_or(1usize << 30);
 
-    // `decode_to_dict` streams produced bytes directly into `output` as it
-    // decodes, so payloads larger than the dict size work correctly even
-    // when the size header is "unknown".
-    let (produced, hit_marker) = decoder.decode_to_dict(&mut rd, cap, output)?;
+    // `decode_into` writes produced bytes directly into `output` (which
+    // doubles as the dictionary), so payloads larger than the dict size
+    // work correctly even when the size header is "unknown".
+    let (produced, hit_marker) = decoder.decode_into(&mut rd, cap, output)?;
 
     if let Some(want) = target_size {
         if produced != want {
