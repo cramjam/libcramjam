@@ -141,7 +141,14 @@ pub fn decode_frame(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
     let dict_id_present = (flg & 0x01) != 0;
 
     let _ = block_indep;
-    let _ = bd;
+    // Block maximum size (BD byte, bits 4..6): 4 → 64 KiB … 7 → 4 MiB.
+    // Anything else is invalid per spec; treat it as 4 MiB for sizing only.
+    let block_max: usize = match (bd >> 4) & 7 {
+        4 => 64 << 10,
+        5 => 256 << 10,
+        6 => 1 << 20,
+        _ => 4 << 20,
+    };
 
     let mut content_size: Option<u64> = None;
     if content_size_present {
@@ -167,6 +174,12 @@ pub fn decode_frame(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
     p += 1;
 
     let out_start = output.len();
+    // Size the output once so the block decoder never has to grow it:
+    // exact when the frame carries its content size, else amortised via
+    // one block-max step per block.
+    if let Some(cs) = content_size {
+        output.reserve(cs.min(1 << 32) as usize + block::OUT_SLACK);
+    }
 
     // Blocks.
     loop {
@@ -192,6 +205,7 @@ pub fn decode_frame(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
         if uncompressed {
             output.extend_from_slice(block_data);
         } else {
+            output.reserve(block_max + block::OUT_SLACK);
             block::decompress_block(block_data, output)?;
         }
 

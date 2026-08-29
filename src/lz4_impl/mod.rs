@@ -68,7 +68,10 @@ pub fn decompress<W: Write + ?Sized, R: Read>(
 ) -> io::Result<usize> {
     let mut data = Vec::new();
     input.read_to_end(&mut data)?;
-    let mut decoded = Vec::new();
+    // Typical lz4 ratios are 1.5–3x; over-reserving virtual memory is far
+    // cheaper than the realloc copies of geometric growth on multi-MB
+    // outputs (untouched pages are never committed).
+    let mut decoded = Vec::with_capacity(data.len().saturating_mul(4).min(512 << 20));
     let mut consumed = 0usize;
     while consumed < data.len() {
         let n = frame::decode_frame(&data[consumed..], &mut decoded)?;

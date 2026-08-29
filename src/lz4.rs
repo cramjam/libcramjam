@@ -60,7 +60,7 @@ pub mod block {
         }
         let bytes: [u8; 4] = input[..4].try_into().unwrap();
         let len = u32::from_le_bytes(bytes) as usize;
-        let mut buf = Vec::with_capacity(len);
+        let mut buf = Vec::with_capacity(len + crate::lz4_impl::block::OUT_SLACK);
         crate::lz4_impl::block::decompress_block(&input[4..], &mut buf)?;
         if buf.len() != len {
             return Err(Error::new(
@@ -97,7 +97,7 @@ pub mod block {
 
         // Decompress into a Vec then copy into the slice — the block decoder
         // operates on Vec<u8> for the run-length copy logic.
-        let mut tmp: Vec<u8> = Vec::with_capacity(output.len());
+        let mut tmp: Vec<u8> = Vec::with_capacity(output.len() + crate::lz4_impl::block::OUT_SLACK);
         crate::lz4_impl::block::decompress_block(block_input, &mut tmp)?;
         if tmp.len() > output.len() {
             return Err(Error::new(

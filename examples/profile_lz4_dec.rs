@@ -1,4 +1,6 @@
-//! Decode-only lz4 profile harness (for callgrind).
+//! Decode-only lz4 profile harness (for callgrind) with an interleaved
+//! ours-vs-C timing so the ratio is meaningful even on a loaded machine.
+//! `ITERS` env var overrides the iteration count (default 100).
 use std::io::{Cursor, Read};
 use std::time::Instant;
 
@@ -25,17 +27,35 @@ fn main() {
     };
     eprintln!("Compressed: {} bytes", compressed.len());
 
-    eprintln!("\n--- ours lz4 decompress (100 iters) ---");
-    let mut times = Vec::new();
-    for _ in 0..100 {
+    let iters: usize = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(100);
+    let time_c = std::env::var("TIME_C").is_ok();
+    eprintln!("\n--- ours lz4 decompress ({iters} iters{}) ---", if time_c { ", interleaved with C" } else { "" });
+    let mut ours = Vec::new();
+    let mut theirs = Vec::new();
+    for _ in 0..iters {
         let mut out = Vec::with_capacity(input.len());
         let t = Instant::now();
         libcramjam::lz4::decompress(&mut Cursor::new(&compressed), &mut out).unwrap();
-        times.push(t.elapsed());
+        ours.push(t.elapsed());
+        assert_eq!(out.len(), input.len());
         std::hint::black_box(out);
+        if time_c {
+            let mut out = Vec::with_capacity(input.len());
+            let t = Instant::now();
+            lz4::Decoder::new(&compressed[..]).unwrap().read_to_end(&mut out).unwrap();
+            theirs.push(t.elapsed());
+            std::hint::black_box(out);
+        }
     }
-    times.sort();
-    let median = times[times.len() / 2];
+    ours.sort();
+    let median = ours[ours.len() / 2];
     let throughput = input.len() as f64 / 1024.0 / 1024.0 / median.as_secs_f64();
-    eprintln!("  median: {:?}  ({:.0} MB/s)", median, throughput);
+    eprintln!("  ours median: {:?}  ({:.0} MB/s)", median, throughput);
+    if time_c {
+        theirs.sort();
+        let cm = theirs[theirs.len() / 2];
+        eprintln!("  C    median: {:?}  ({:.0} MB/s)  ours/C = {:.2}x", cm,
+            input.len() as f64 / 1024.0 / 1024.0 / cm.as_secs_f64(),
+            median.as_secs_f64() / cm.as_secs_f64());
+    }
 }

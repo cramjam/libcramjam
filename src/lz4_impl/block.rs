@@ -47,157 +47,221 @@ const SKIP_TRIGGER: u32 = 6;
 // Decoder
 // =========================================================================
 
+/// Bytes of output headroom kept ahead of the write cursor at every point
+/// in the hot loop (mirrors `FASTLOOP_SAFE_DISTANCE` in lz4.c). Covers the
+/// unconditional 16-byte literal copy, the 18-byte match shortcut and the
+/// 15-byte wildcopy overshoot.
+pub const OUT_SLACK: usize = 64;
+
+/// `LZ4_wildCopy32`: copy in 32-byte steps as two 16-byte moves (so a
+/// back-reference with `offset >= 16` stays correct), overshooting by up to
+/// 31 bytes. Used for the long-literal / long-match paths, where the
+/// per-iteration overhead of 16-byte steps shows up on incompressible or
+/// highly repetitive data.
+///
+/// # Safety
+/// `[src, src + length + 32)` readable, `[dst, dst + length + 32)` writable,
+/// and `dst - src >= 16` when the regions overlap.
+#[inline(always)]
+unsafe fn wildcopy32(mut src: *const u8, mut dst: *mut u8, length: usize) {
+    let end = unsafe { dst.add(length) };
+    loop {
+        unsafe {
+            let a = core::ptr::read_unaligned(src as *const [u8; 16]);
+            core::ptr::write_unaligned(dst as *mut [u8; 16], a);
+            let b = core::ptr::read_unaligned(src.add(16) as *const [u8; 16]);
+            core::ptr::write_unaligned(dst.add(16) as *mut [u8; 16], b);
+            src = src.add(32);
+            dst = dst.add(32);
+        }
+        if dst >= end {
+            return;
+        }
+    }
+}
+
 /// Decompress an LZ4 block into `output`.  Returns the number of OUTPUT bytes
-/// written.  Reserves an aggressive amount of capacity up-front so the inner
-/// loop can avoid `Vec` growth checks via direct unchecked writes.
+/// written.
+///
+/// Structured after the fast loop of `LZ4_decompress_generic` in lz4.c: raw
+/// pointers, one input-bounds check per sequence in the common case
+/// (`lit_len < 15` and ≥ 17 bytes of input left ⇒ blind 16-byte literal copy,
+/// offset + match nibble readable), the `ml < 15 && offset >= 8` 18-byte
+/// match shortcut, and the shared `copy_match_unchecked` kernel otherwise.
+/// Output capacity is reserved up front and re-checked only when the
+/// `OUT_SLACK` invariant would break (rare), where the Vec simply grows —
+/// no separate "safe" decode path is needed.
+#[inline(never)]
 pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
-    // Reserve a generous amount of headroom so we never reallocate inside the
-    // hot loop.  Worst case is bounded by `input.len() * 256` (single token,
-    // 1 byte literal + 65535-byte match), but we cap at the LZ4 frame block
-    // limit + slack. The `+32` is dead-zone padding so the 16-byte SIMD
-    // wildcopy in `copy_match` can overshoot the last match without touching
-    // unallocated memory.
-    let upper_bound = (input.len() * 256 + 65_536).min(8 * 1024 * 1024) + 32;
-    output.reserve(upper_bound);
+    // Cheap floor: output is almost always ≥ input, and the `OUT_SLACK`
+    // invariant check grows the Vec geometrically beyond that (glibc
+    // realloc is an mremap for large buffers, so growth is nearly free).
+    // Reserving a huge worst-case bound here used to cost an mmap/munmap
+    // pair per call, which dominated small-block decode time.
+    output.reserve(input.len() + OUT_SLACK);
 
     let start = output.len();
-    let mut ip = 0usize;
     let in_len = input.len();
+    let ibase = input.as_ptr();
+    let mut ip = 0usize;
+
+    let mut base = output.as_mut_ptr();
+    let mut cap = output.capacity();
+    let mut op = start;
+
+    // Grow the output so that `cap - op >= need + OUT_SLACK`.
+    macro_rules! ensure_out {
+        ($need:expr) => {
+            let need: usize = $need;
+            if cap - op < need + OUT_SLACK {
+                // SAFETY: every byte in start..op has been written.
+                unsafe { output.set_len(op) };
+                output.reserve((need + OUT_SLACK).max(1 << 20));
+                base = output.as_mut_ptr();
+                cap = output.capacity();
+            }
+        };
+    }
+    macro_rules! fail {
+        ($kind:expr, $msg:expr) => {{
+            unsafe { output.set_len(op) };
+            return Err(io::Error::new($kind, $msg));
+        }};
+    }
 
     while ip < in_len {
-        let token = unsafe { *input.get_unchecked(ip) };
+        ensure_out!(0);
+        let token = unsafe { *ibase.add(ip) };
         ip += 1;
 
         // -- Literal run --
-        let mut lit_len = (token >> 4) as usize;
-        if lit_len == 15 {
+        let mut length = (token >> 4) as usize;
+        // True when the literal path guaranteed enough trailing input for
+        // the offset + match-length nibble without further checks.
+        let checked_tail;
+        if length == 15 {
             loop {
                 if ip >= in_len {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "lz4: unexpected end while reading literal length",
-                    ));
+                    fail!(io::ErrorKind::UnexpectedEof, "lz4: unexpected end while reading literal length");
                 }
-                let b = unsafe { *input.get_unchecked(ip) };
+                let b = unsafe { *ibase.add(ip) };
                 ip += 1;
-                lit_len += b as usize;
+                length += b as usize;
                 if b != 255 {
                     break;
                 }
             }
-        }
-
-        if ip + lit_len > in_len {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "lz4: literal run exceeds input",
-            ));
-        }
-        // Literal copy: use 16-byte SIMD wildcopy when both sides have enough
-        // slack (destination is always reserved; source needs `+16` headroom
-        // so we don't read past the end of the compressed block). The LZ4
-        // spec guarantees at least 5 trailing literal bytes, so the non-last
-        // iterations always have plenty of source slack; only the final
-        // iteration (which normally breaks before this line anyway) could
-        // straddle the boundary. The fall-back is a plain memcpy.
-        unsafe {
-            let dst_len = output.len();
-            let base = output.as_mut_ptr().add(dst_len);
-            if ip + lit_len + 16 <= in_len {
-                crate::cpu_features::wildcopy_chunks::<16>(
-                    input.as_ptr().add(ip),
-                    base,
-                    lit_len,
-                );
+            ensure_out!(length);
+            if ip + length + 32 <= in_len {
+                // Source has ≥ 32 bytes past the literals: wildcopy may
+                // over-read 31 and the offset/ML are still in bounds.
+                // Very long runs (incompressible data) are cheaper as a
+                // real memcpy (rep movsb / AVX loops).
+                unsafe {
+                    if length >= 1024 {
+                        core::ptr::copy_nonoverlapping(ibase.add(ip), base.add(op), length);
+                    } else {
+                        wildcopy32(ibase.add(ip), base.add(op), length);
+                    }
+                }
+                ip += length;
+                op += length;
+                checked_tail = true;
             } else {
-                core::ptr::copy_nonoverlapping(input.as_ptr().add(ip), base, lit_len);
+                if ip + length > in_len {
+                    fail!(io::ErrorKind::UnexpectedEof, "lz4: literal run exceeds input");
+                }
+                unsafe { core::ptr::copy_nonoverlapping(ibase.add(ip), base.add(op), length) };
+                ip += length;
+                op += length;
+                if ip == in_len {
+                    break;
+                }
+                checked_tail = false;
             }
-            output.set_len(dst_len + lit_len);
-        }
-        ip += lit_len;
-
-        // End of block: when there are no more bytes, we're done (the last
-        // sequence has only literals, no match field).
-        if ip == in_len {
-            break;
+        } else if ip + 17 <= in_len {
+            // Literals ≤ 14 bytes: blind 16-byte copy, and the 2-byte offset
+            // plus the match nibble are readable.
+            unsafe {
+                let v = core::ptr::read_unaligned(ibase.add(ip) as *const [u8; 16]);
+                core::ptr::write_unaligned(base.add(op) as *mut [u8; 16], v);
+            }
+            ip += length;
+            op += length;
+            checked_tail = true;
+        } else {
+            if ip + length > in_len {
+                fail!(io::ErrorKind::UnexpectedEof, "lz4: literal run exceeds input");
+            }
+            unsafe { core::ptr::copy_nonoverlapping(ibase.add(ip), base.add(op), length) };
+            ip += length;
+            op += length;
+            if ip == in_len {
+                // Last sequence: literals only.
+                break;
+            }
+            checked_tail = false;
         }
 
         // -- Match --
-        if ip + 2 > in_len {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "lz4: missing match offset",
-            ));
+        if !checked_tail && ip + 2 > in_len {
+            fail!(io::ErrorKind::UnexpectedEof, "lz4: missing match offset");
         }
-        let offset = u16::from_le_bytes([
-            unsafe { *input.get_unchecked(ip) },
-            unsafe { *input.get_unchecked(ip + 1) },
-        ]) as usize;
+        let offset = unsafe { u16::from_le_bytes([*ibase.add(ip), *ibase.add(ip + 1)]) } as usize;
         ip += 2;
-        if offset == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "lz4: zero match offset",
-            ));
+        // Rejects offset == 0 (wraps to usize::MAX) and offset > bytes produced.
+        if offset.wrapping_sub(1) >= op {
+            fail!(io::ErrorKind::InvalidData, "lz4: bad match offset");
         }
-
-        let mut match_len = (token & 0x0F) as usize;
-        if match_len == 15 {
+        let mut ml = (token & 0x0F) as usize;
+        if ml == 15 {
             loop {
                 if ip >= in_len {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "lz4: unexpected end while reading match length",
-                    ));
+                    fail!(io::ErrorKind::UnexpectedEof, "lz4: unexpected end while reading match length");
                 }
-                let b = unsafe { *input.get_unchecked(ip) };
+                let b = unsafe { *ibase.add(ip) };
                 ip += 1;
-                match_len += b as usize;
+                ml += b as usize;
                 if b != 255 {
                     break;
                 }
             }
+            ml += MIN_MATCH;
+            ensure_out!(ml);
+            unsafe {
+                let m = base.add(op - offset);
+                let d = base.add(op);
+                if offset >= 16 {
+                    wildcopy32(m, d, ml);
+                } else {
+                    crate::cpu_features::copy_match_unchecked(m, d, offset, ml);
+                }
+            }
+            op += ml;
+        } else {
+            ml += MIN_MATCH;
+            // `cap - op >= OUT_SLACK - 14 >= 33` here (loop-top invariant
+            // minus the ≤14-byte literal), enough for 18 bytes or a
+            // ≤18-byte match plus the kernel's 15-byte overshoot.
+            unsafe {
+                let m = base.add(op - offset);
+                let d = base.add(op);
+                if offset >= 8 {
+                    // Shortcut: 8 + 8 + 2 bytes covers any ml ≤ 18.
+                    core::ptr::copy_nonoverlapping(m, d, 8);
+                    core::ptr::copy_nonoverlapping(m.add(8), d.add(8), 8);
+                    core::ptr::copy_nonoverlapping(m.add(16), d.add(16), 2);
+                } else {
+                    crate::cpu_features::copy_match_unchecked(m, d, offset, ml);
+                }
+            }
+            op += ml;
         }
-        match_len += MIN_MATCH;
-
-        let cur = output.len();
-        if offset > cur {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "lz4: match offset beyond output",
-            ));
-        }
-        copy_match(output, offset, match_len);
     }
 
-    Ok(output.len() - start)
-}
-
-/// Copy a match (back-reference) into `output`.
-///
-/// Dispatches to the shared SIMD wildcopy kernel in `cpu_features`:
-///
-///   * `offset >= 16`: 16-byte unaligned chunked copy (one `movdqu` pair per
-///     iteration on SSE2/NEON, `vmovdqu` pair when AVX2 is enabled). May
-///     overshoot by up to 15 bytes — the caller reserves enough headroom
-///     upfront so the overshoot is always in-allocation.
-///   * `offset == 1`: single-byte RLE via `write_bytes`.
-///   * `2 ≤ offset < 16`: overlapping `offset`-sized chunk copy so the
-///     pattern propagates.
-///
-/// Caller must have reserved at least 16 bytes of headroom beyond
-/// `output.len() + match_len` in `output`.
-#[inline(always)]
-fn copy_match(output: &mut Vec<u8>, offset: usize, match_len: usize) {
-    let cur = output.len();
-    let end = cur + match_len;
-    unsafe {
-        let base = output.as_mut_ptr();
-        let src = base.add(cur - offset);
-        let dst = base.add(cur);
-        crate::cpu_features::copy_match_unchecked(src, dst, offset, match_len);
-        output.set_len(end);
-    }
+    // SAFETY: start..op fully written; op <= cap by the invariant.
+    unsafe { output.set_len(op) };
+    Ok(op - start)
 }
 
 // =========================================================================
