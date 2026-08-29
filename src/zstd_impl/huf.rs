@@ -11,8 +11,10 @@ use super::fse;
 /// Maximum Huffman table log (number of bits for table lookup).
 const HUF_MAX_TABLE_LOG: u32 = 12;
 
-/// Huffman decoding table entry.
+/// Huffman decoding table entry. `repr(C)` so the fast decoder can read it
+/// as a little-endian `u16` = `symbol | num_bits << 8`.
 #[derive(Clone, Copy, Default)]
+#[repr(C)]
 struct HufEntry {
     symbol: u8,
     num_bits: u8,
@@ -222,104 +224,103 @@ impl HufTable {
         }
     }
 
-    /// 4-stream interleaved Huffman decode. Decodes 4 independent bit streams
-    /// into 4 contiguous segments of `out_ptr[..regen_size]` by stepping all
-    /// streams in lockstep. This exposes memory-level parallelism so the OOO
-    /// engine can overlap the 4 table-load → shift → store dependency chains
-    /// that serialize within a single stream.
-    ///
-    /// `out_ptr` points at the start of the output buffer; segment starts at
-    /// offsets `0`, `s1`, `s1+s2`, `s1+s2+s3` (the first three of length
-    /// `seg_size`, the fourth of length `regen_size - 3*seg_size`).
+    /// Fast 4-stream decode (the shape of C zstd's
+    /// `HUF_decompress4X1_usingDTable_internal_fast`): four pre-shifted
+    /// 64-bit containers carrying a sentinel 1-bit that tracks consumption
+    /// (`trailing_zeros` = bits consumed since the last load), 5 symbols per
+    /// stream per iteration, one unconditional refill per stream per
+    /// iteration, and no per-symbol checks — the iteration count is bounded
+    /// up front by the smallest remaining output / input of any stream.
+    /// Stops with every reader re-synced so the per-symbol tail finishes.
     ///
     /// # Safety
-    /// * `out_ptr` must point to a writable region of at least `regen_size`
-    ///   bytes (the 4 segments are written in bounds).
-    /// * `r1`..`r4` must already have their padding skipped.
-    #[inline(always)]
-    pub unsafe fn decode_4stream_interleaved(
+    /// `out_ptr` must be valid for `end[i]` bytes; readers must have had their
+    /// padding skipped.
+    #[inline(never)]
+    unsafe fn decode_4stream_fast(
         &self,
-        r1: &mut ReverseBitReader,
-        r2: &mut ReverseBitReader,
-        r3: &mut ReverseBitReader,
-        r4: &mut ReverseBitReader,
+        readers: &mut [ReverseBitReader; 4],
         out_ptr: *mut u8,
-        seg_size: usize,
-        last_size: usize,
+        pos: &mut [usize; 4],
+        end: &[usize; 4],
     ) {
-        let max_bits = self.max_bits;
-        let table_ptr = self.table.as_ptr();
-        // Segment starts.
-        let mut p1 = 0usize;
-        let mut p2 = seg_size;
-        let mut p3 = seg_size * 2;
-        let mut p4 = seg_size * 3;
-        // Segment ends.
-        let e1 = seg_size;
-        let e2 = seg_size * 2;
-        let e3 = seg_size * 3;
-        let e4 = seg_size * 3 + last_size;
+        let shift = 64 - self.max_bits;
+        let table = self.table.as_ptr() as *const u16;
+        let mut acc = [0u64; 4];
+        let mut cur = [core::ptr::null::<u8>(); 4];
+        let mut lo = [core::ptr::null::<u8>(); 4];
+        for i in 0..4 {
+            if !readers[i].fast_ok() {
+                return;
+            }
+            let (index, consumed, container, src) = readers[i].raw_parts();
+            acc[i] = (container | 1) << consumed;
+            cur[i] = unsafe { src.add(index) };
+            lo[i] = src;
+        }
+        let [mut p0, mut p1, mut p2, mut p3] = *pos;
+        let [mut a0, mut a1, mut a2, mut a3] = acc;
+        let [mut c0, mut c1, mut c2, mut c3] = cur;
 
-        // Main interleaved loop: 5 symbols per stream per refill, all 4 in
-        // lockstep. 20 symbols per iteration. Runs while every stream has
-        // room for 5 more symbols. Stops short of the shortest segment end
-        // (the last segment is ≤ seg_size; segments 1-3 are exactly seg_size
-        // so p1..p3 reach `seg_size` first).
-        if max_bits * 5 <= 56 {
-            let batch_bits = max_bits * 5;
-            // Shortest segment end is e4 in general (last stream is always
-            // the short one). But be safe and check all 4.
-            while p1 + 5 <= e1
-                && p2 + 5 <= e2
-                && p3 + 5 <= e3
-                && p4 + 5 <= e4
-            {
-                r1.ensure_bits(batch_bits);
-                r2.ensure_bits(batch_bits);
-                r3.ensure_bits(batch_bits);
-                r4.ensure_bits(batch_bits);
-                unsafe {
-                    // Unroll 5 times. The inner order (r1, r2, r3, r4 per
-                    // symbol position) keeps independent dependency chains
-                    // adjacent so the CPU can overlap them.
-                    macro_rules! one {
-                        ($r:ident, $p:ident) => {{
-                            let idx = $r.peek_bits(max_bits);
-                            let e = *table_ptr.add(idx as usize);
-                            $r.consume(e.num_bits as u32);
-                            *out_ptr.add($p) = e.symbol;
-                            $p += 1;
-                        }};
-                    }
-                    one!(r1, p1); one!(r2, p2); one!(r3, p3); one!(r4, p4);
-                    one!(r1, p1); one!(r2, p2); one!(r3, p3); one!(r4, p4);
-                    one!(r1, p1); one!(r2, p2); one!(r3, p3); one!(r4, p4);
-                    one!(r1, p1); one!(r2, p2); one!(r3, p3); one!(r4, p4);
-                    one!(r1, p1); one!(r2, p2); one!(r3, p3); one!(r4, p4);
+        loop {
+            // Each iteration emits 5 symbols per stream and moves each cursor
+            // down by at most 7 bytes (5 * 12 bits < 64).
+            let mut iters = usize::MAX;
+            for i in 0..4 {
+                let p = [p0, p1, p2, p3][i];
+                let c = [c0, c1, c2, c3][i];
+                iters = iters.min((end[i] - p) / 5);
+                iters = iters.min(unsafe { c.offset_from(lo[i]) } as usize / 7);
+            }
+            if iters == 0 {
+                break;
+            }
+            for _ in 0..iters {
+                macro_rules! refill {
+                    ($a:ident, $c:ident) => {{
+                        let ctz = $a.trailing_zeros();
+                        $c = unsafe { $c.sub((ctz >> 3) as usize) };
+                        let raw = unsafe { u64::from_le(core::ptr::read_unaligned($c as *const u64)) };
+                        $a = (raw | 1) << (ctz & 7);
+                    }};
                 }
+                refill!(a0, c0);
+                refill!(a1, c1);
+                refill!(a2, c2);
+                refill!(a3, c3);
+                macro_rules! sym {
+                    ($a:ident, $p:ident, $k:expr) => {{
+                        let e = unsafe { *table.add(($a >> shift) as usize) };
+                        $a <<= e >> 8;
+                        unsafe { *out_ptr.add($p + $k) = e as u8 };
+                    }};
+                }
+                sym!(a0, p0, 0); sym!(a1, p1, 0); sym!(a2, p2, 0); sym!(a3, p3, 0);
+                sym!(a0, p0, 1); sym!(a1, p1, 1); sym!(a2, p2, 1); sym!(a3, p3, 1);
+                sym!(a0, p0, 2); sym!(a1, p1, 2); sym!(a2, p2, 2); sym!(a3, p3, 2);
+                sym!(a0, p0, 3); sym!(a1, p1, 3); sym!(a2, p2, 3); sym!(a3, p3, 3);
+                sym!(a0, p0, 4); sym!(a1, p1, 4); sym!(a2, p2, 4); sym!(a3, p3, 4);
+                p0 += 5;
+                p1 += 5;
+                p2 += 5;
+                p3 += 5;
             }
         }
 
-        // Tail: each stream to completion, one symbol at a time.
-        unsafe {
-            while p1 < e1 {
-                *out_ptr.add(p1) = self.decode_symbol(r1);
-                p1 += 1;
-            }
-            while p2 < e2 {
-                *out_ptr.add(p2) = self.decode_symbol(r2);
-                p2 += 1;
-            }
-            while p3 < e3 {
-                *out_ptr.add(p3) = self.decode_symbol(r3);
-                p3 += 1;
-            }
-            while p4 < e4 {
-                *out_ptr.add(p4) = self.decode_symbol(r4);
-                p4 += 1;
-            }
+        // Re-sync the readers: consumed = sentinel position; the container
+        // is re-read (the sentinel may have clobbered bit 0).
+        let accs = [a0, a1, a2, a3];
+        let curs = [c0, c1, c2, c3];
+        for i in 0..4 {
+            let ctz = accs[i].trailing_zeros();
+            let c = unsafe { curs[i].sub((ctz >> 3) as usize) };
+            let index = unsafe { c.offset_from(lo[i]) } as usize;
+            let raw = unsafe { u64::from_le(core::ptr::read_unaligned(c as *const u64)) };
+            readers[i].set_raw_parts(index, ctz & 7, raw);
         }
+        *pos = [p0, p1, p2, p3];
     }
+
 }
 
 /// Decode Huffman weights using a 2-state FSE-compressed backward bitstream
@@ -435,15 +436,18 @@ pub fn decode_literals_4stream_into(
     // SAFETY: output has exactly regen_size bytes and segment bounds are
     // `seg_size * 3 + last_size = regen_size`.
     unsafe {
-        table.decode_4stream_interleaved(
-            &mut r1,
-            &mut r2,
-            &mut r3,
-            &mut r4,
-            output.as_mut_ptr(),
-            seg_size,
-            last_size,
-        );
+        let mut readers = [r1, r2, r3, r4];
+        let mut pos = [0, seg_size, seg_size * 2, seg_size * 3];
+        let end = [seg_size, seg_size * 2, seg_size * 3, seg_size * 3 + last_size];
+        table.decode_4stream_fast(&mut readers, output.as_mut_ptr(), &mut pos, &end);
+        // Tail: each stream to completion, one symbol at a time.
+        let out_ptr = output.as_mut_ptr();
+        for i in 0..4 {
+            while pos[i] < end[i] {
+                *out_ptr.add(pos[i]) = table.decode_symbol(&mut readers[i]);
+                pos[i] += 1;
+            }
+        }
     }
     Ok(())
 }

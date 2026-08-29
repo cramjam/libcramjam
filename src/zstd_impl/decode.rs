@@ -244,12 +244,10 @@ fn decode_compressed_block(
     // Decode directly into the frame-lifetime scratch (reused across blocks)
     // so we avoid one Vec alloc per block. `decode_literals_section_into`
     // sets the length to the real literal count.
-    let lit_total = decode_literals_section_into(&mut r, huf_table, literals_buf)?;
-    // Pad with 32 trailing dead-zone bytes so the per-sequence 16-byte
-    // wildcopy in the hot loop can safely over-read past the last literal
-    // without the caller having to branch on "short literal".
-    literals_buf.resize(lit_total + 32, 0);
-    let literals: &[u8] = literals_buf;
+    let (lit_ptr, lit_total) = decode_literals_section_into(&mut r, data, huf_table, literals_buf)?;
+    // SAFETY: `lit_ptr` points at `lit_total` literal bytes followed by at
+    // least 16 readable bytes (see `decode_literals_section_into`).
+    let literals: &[u8] = unsafe { core::slice::from_raw_parts(lit_ptr, lit_total) };
 
     // Reserve the worst-case output for this block upfront so neither the
     // literal copies nor the per-sequence match wildcopy need to re-check
@@ -761,16 +759,18 @@ unsafe fn decode_sequences(
 // Literals section
 // ---------------------------------------------------------------------------
 
-/// Decode the literals section directly into `buf`, truncating/growing as
-/// needed. Returns the real decoded-literal count. `buf` may have trailing
-/// garbage past the returned length (the caller pads to +32 before the
-/// sequence loop anyway).
+/// Decode the literals section. Returns `(ptr, len)` of the literals; the
+/// pointer is followed by at least 16 readable bytes so the sequence loop's
+/// 16-byte wildcopy may over-read. Raw literals are referenced in place in
+/// the block (`block`) when enough input follows them — like C zstd, no
+/// copy; otherwise (and for RLE / Huffman literals) they go into `buf`.
 #[inline(never)]
 fn decode_literals_section_into(
     r: &mut ForwardByteReader,
+    block: &[u8],
     huf_table: &mut Option<HufTable>,
     buf: &mut Vec<u8>,
-) -> io::Result<usize> {
+) -> io::Result<(*const u8, usize)> {
     let byte0 = r.read_u8()?;
     let lit_type = byte0 & 3;
     let size_format = (byte0 >> 2) & 3;
@@ -780,17 +780,21 @@ fn decode_literals_section_into(
             // Raw literals.
             let regen_size = decode_lit_size_raw(byte0, size_format, r)?;
             let raw = r.read_bytes(regen_size)?;
+            if r.position() + 16 <= block.len() {
+                return Ok((raw.as_ptr(), regen_size));
+            }
             buf.clear();
             buf.extend_from_slice(raw);
-            Ok(regen_size)
+            buf.resize(regen_size + 32, 0);
+            Ok((buf.as_ptr(), regen_size))
         }
         1 => {
             // RLE literals.
             let regen_size = decode_lit_size_raw(byte0, size_format, r)?;
             let byte = r.read_u8()?;
             buf.clear();
-            buf.resize(regen_size, byte);
-            Ok(regen_size)
+            buf.resize(regen_size + 32, byte);
+            Ok((buf.as_ptr(), regen_size))
         }
         2 | 3 => {
             // Compressed or Treeless literals.
@@ -813,18 +817,22 @@ fn decode_literals_section_into(
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "zstd: treeless literals without prior Huffman table"))?;
 
             let stream_data = &lit_data[pos..];
-            // Resize to exactly `regen_size` so the inner decoders see an
-            // uninitialized (but valid) region to fill. We're about to
-            // overwrite every byte; the `resize` zeroes fresh bytes which
-            // is fine — the wildcopy-tail padding is applied by the caller.
+            // The decoders write every one of the `regen_size` bytes, so
+            // skip the zero-fill: reserve + set_len, then append the
+            // 16+ byte dead zone the sequence loop over-reads.
             buf.clear();
-            buf.resize(regen_size, 0);
+            buf.reserve(regen_size + 32);
+            // SAFETY: capacity reserved; every byte is written by the
+            // decoder below before it is read (on error the buffer is
+            // never read).
+            unsafe { buf.set_len(regen_size) };
             if four_streams {
                 super::huf::decode_literals_4stream_into(table, stream_data, buf)?;
             } else {
                 super::huf::decode_literals_1stream_into(table, stream_data, buf)?;
             }
-            Ok(regen_size)
+            buf.resize(regen_size + 32, 0);
+            Ok((buf.as_ptr(), regen_size))
         }
         _ => unreachable!(),
     }

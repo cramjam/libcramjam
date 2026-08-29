@@ -36,13 +36,16 @@ fn main() {
 
     let mut ours = Vec::new();
     let mut theirs = Vec::new();
+    let only_c = std::env::var_os("ONLY_C").is_some();
     for _ in 0..iters {
-        let mut out = Vec::with_capacity(input.len());
-        let t = Instant::now();
-        libcramjam::zstd::decompress(&mut Cursor::new(&compressed), &mut out).unwrap();
-        ours.push(t.elapsed());
-        assert_eq!(out.len(), input.len());
-        std::hint::black_box(out);
+        if !only_c {
+            let mut out = Vec::with_capacity(input.len());
+            let t = Instant::now();
+            libcramjam::zstd::decompress(&mut Cursor::new(&compressed), &mut out).unwrap();
+            ours.push(t.elapsed());
+            assert_eq!(out.len(), input.len());
+            std::hint::black_box(out);
+        }
         if time_c {
             let mut out = Vec::with_capacity(input.len());
             let t = Instant::now();
@@ -51,8 +54,8 @@ fn main() {
             std::hint::black_box(out);
         }
     }
-    let m = median(&mut ours);
     let mb = input.len() as f64 / 1048576.0;
+    let m = if only_c { Duration::ZERO } else { median(&mut ours) };
     eprintln!("ours: median {:?} ({:.0} MB/s)", m, mb / m.as_secs_f64());
     if time_c {
         let c = median(&mut theirs);

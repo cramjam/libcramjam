@@ -481,6 +481,7 @@ impl LzmaDecoder {
     ///
     /// Returns `(bytes_emitted, hit_end_marker)`.
     #[inline(never)]
+    #[allow(unused_assignments)]
     pub fn decode_into(
         &mut self,
         rd: &mut RangeDecoder,

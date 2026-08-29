@@ -208,6 +208,13 @@ impl<'a> ReverseBitReader<'a> {
         (self.index, self.bits_consumed as u32, self.bit_container, self.source.as_ptr())
     }
 
+    /// True while the one-load refill fast path is still available (source
+    /// >= 8 bytes and the stream start has not been reached).
+    #[inline(always)]
+    pub fn fast_ok(&self) -> bool {
+        self.refill_limit != 0 && self.index + 8 <= self.source.len()
+    }
+
     /// Write back state taken via [`raw_parts`].
     #[inline(always)]
     pub fn set_raw_parts(&mut self, index: usize, bits_consumed: u32, container: u64) {
