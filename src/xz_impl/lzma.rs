@@ -126,6 +126,153 @@ pub fn update_short_rep(state: u32) -> u32 {
 }
 
 // =========================================================================
+// Range decoder hot-path state
+// =========================================================================
+
+/// Range-decoder registers held in locals for the duration of one
+/// `decode_into` call. `RangeDecoder`'s fields are copied in at entry and
+/// written back at exit so the per-bit path never touches memory except
+/// for the probability itself and the input byte on normalize.
+///
+/// Every method is `unsafe`: the caller guarantees `inp` has at least
+/// `RC_PADDING`-style slack past the real data (see lzma2.rs) so the
+/// normalize refill never needs a bounds check.
+#[derive(Clone, Copy)]
+struct Rc {
+    range: u32,
+    code: u32,
+    pos: usize,
+}
+
+const RC_TOP: u32 = 1 << 24;
+const RC_MODEL_BITS: u32 = 11;
+const RC_MOVE: u32 = 5;
+const RC_MODEL_OFFSET: u32 = (1 << RC_MOVE) - 1; // 31
+
+/// All ones if `a < b`, else 0.
+///
+/// On x86-64 this is a two-instruction `cmp; sbb` asm block. The asm is
+/// deliberately opaque: written in plain Rust, LLVM recognises the mask
+/// pattern as a select, and its x86 cmov-conversion pass then turns the
+/// selects back into *branches* inside the decode loop — cachegrind showed
+/// ~45% of all decoder mispredicts on the "branchless" direct-bits path.
+#[inline(always)]
+fn lt_mask(a: u32, b: u32) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mask: u32;
+        // SAFETY: pure register arithmetic; `sbb m, m` yields -CF whatever
+        // `m` held before, so the uninitialised output read is harmless.
+        unsafe {
+            core::arch::asm!(
+                "cmp {a:e}, {b:e}",
+                "sbb {m:e}, {m:e}",
+                a = in(reg) a,
+                b = in(reg) b,
+                m = out(reg) mask,
+                options(pure, nomem, nostack),
+            );
+        }
+        mask
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0u32.wrapping_sub((a < b) as u32)
+    }
+}
+
+impl Rc {
+    #[inline(always)]
+    unsafe fn normalize(&mut self, inp: *const u8) {
+        if self.range < RC_TOP {
+            self.range <<= 8;
+            self.code = (self.code << 8) | unsafe { *inp.add(self.pos) } as u32;
+            self.pos += 1;
+        }
+    }
+
+    /// Branchless bit decode (xz 5.6 `rc_c_bit` shape). Probability update
+    /// is bit-exact with the classic branchy form:
+    ///   bit 0: p += (2048 - p) >> 5  ==  p - ((p + 31) >> 5) + 64
+    ///   bit 1: p -= p >> 5
+    #[inline(always)]
+    unsafe fn bit(&mut self, p: *mut Prob, inp: *const u8) -> u32 {
+        unsafe { self.normalize(inp) };
+        let prob = unsafe { *p } as u32;
+        let bound = (self.range >> RC_MODEL_BITS) * prob;
+        // t = all ones for bit 0 (code < bound), 0 for bit 1. NB: this must
+        // be a real compare — the sign-bit trick `(code - bound) >> 31` is
+        // wrong once `range >= 2^31`.
+        let t = lt_mask(self.code, bound);
+        let nt = !t;
+        // bit 0: range = bound;   bit 1: range -= bound, code -= bound
+        self.range = bound.wrapping_add(nt & self.range.wrapping_sub(bound << 1));
+        self.code = self.code.wrapping_sub(nt & bound);
+        unsafe { *p = (prob - ((prob + (t & RC_MODEL_OFFSET)) >> RC_MOVE) + (t & 64)) as Prob };
+        nt & 1
+    }
+
+    /// Classic branchy bit decode — better for well-predicted bits
+    /// (is_match / is_rep / length choice), where a branch costs nothing
+    /// and saves the mask arithmetic.
+    #[inline(always)]
+    unsafe fn bit_br(&mut self, p: *mut Prob, inp: *const u8) -> u32 {
+        unsafe { self.normalize(inp) };
+        let prob = unsafe { *p } as u32;
+        let bound = (self.range >> RC_MODEL_BITS) * prob;
+        if self.code < bound {
+            self.range = bound;
+            unsafe { *p = (prob + ((2048 - prob) >> RC_MOVE)) as Prob };
+            0
+        } else {
+            self.range -= bound;
+            self.code -= bound;
+            unsafe { *p = (prob - (prob >> RC_MOVE)) as Prob };
+            1
+        }
+    }
+
+    /// Forward bittree over `probs[1 .. 2^num_bits]`.
+    #[inline(always)]
+    unsafe fn bittree(&mut self, probs: *mut Prob, num_bits: u32, inp: *const u8) -> u32 {
+        let mut symbol = 1u32;
+        for _ in 0..num_bits {
+            let b = unsafe { self.bit(probs.add(symbol as usize), inp) };
+            symbol = (symbol << 1) | b;
+        }
+        symbol - (1 << num_bits)
+    }
+
+    /// Reverse bittree (LSB first).
+    #[inline(always)]
+    unsafe fn bittree_rev(&mut self, probs: *mut Prob, num_bits: u32, inp: *const u8) -> u32 {
+        let mut symbol = 1u32;
+        let mut result = 0u32;
+        for i in 0..num_bits {
+            let b = unsafe { self.bit(probs.add(symbol as usize), inp) };
+            symbol = (symbol << 1) | b;
+            result |= b << i;
+        }
+        result
+    }
+
+    /// Uniform "direct" bits.
+    #[inline(always)]
+    unsafe fn direct(&mut self, num_bits: u32, inp: *const u8) -> u32 {
+        let mut result = 0u32;
+        for _ in 0..num_bits {
+            unsafe { self.normalize(inp) };
+            self.range >>= 1;
+            // t = all ones when code < range (bit 0).
+            let t = lt_mask(self.code, self.range);
+            self.code = self.code.wrapping_sub(self.range & !t);
+            result = (result << 1) | (t.wrapping_add(1) & 1);
+        }
+        result
+    }
+}
+
+// =========================================================================
 // Length sub-coder
 // =========================================================================
 
@@ -163,20 +310,19 @@ impl LenDecoder {
 
     /// Decode a match length, returning the *raw* length (not adjusted by
     /// MATCH_LEN_MIN).  Caller adds MATCH_LEN_MIN to get the actual length.
-    #[inline]
-    pub fn decode(&mut self, rd: &mut RangeDecoder, pos_state: usize) -> u32 {
-        if rd.decode_bit_fast(&mut self.choice) == 0 {
-            // 2..9
-            rd.decode_bittree_fast(&mut self.low[pos_state], LEN_LOW_BITS)
-        } else if rd.decode_bit_fast(&mut self.choice2) == 0 {
-            // 10..17
-            LEN_LOW_SYMBOLS as u32
-                + rd.decode_bittree_fast(&mut self.mid[pos_state], LEN_MID_BITS)
-        } else {
-            // 18..273
-            LEN_LOW_SYMBOLS as u32
-                + LEN_MID_SYMBOLS as u32
-                + rd.decode_bittree_fast(&mut self.high, LEN_HIGH_BITS)
+    #[inline(always)]
+    unsafe fn decode(&mut self, rc: &mut Rc, pos_state: usize, inp: *const u8) -> u32 {
+        unsafe {
+            if rc.bit_br(&mut self.choice, inp) == 0 {
+                rc.bittree(self.low.get_unchecked_mut(pos_state).as_mut_ptr(), LEN_LOW_BITS, inp)
+            } else if rc.bit_br(&mut self.choice2, inp) == 0 {
+                LEN_LOW_SYMBOLS as u32
+                    + rc.bittree(self.mid.get_unchecked_mut(pos_state).as_mut_ptr(), LEN_MID_BITS, inp)
+            } else {
+                LEN_LOW_SYMBOLS as u32
+                    + LEN_MID_SYMBOLS as u32
+                    + rc.bittree(self.high.as_mut_ptr(), LEN_HIGH_BITS, inp)
+            }
         }
     }
 }
@@ -185,8 +331,18 @@ impl LenDecoder {
 // LZMA decoder
 // =========================================================================
 
-/// LZMA stream decoder.  Holds the entire probability model + the LZ
-/// dictionary buffer.  Drives a `RangeDecoder` over a fixed input slice.
+/// Headroom kept past the write cursor so a full-length match copy
+/// (`MATCH_LEN_MAX` = 273) plus the copy kernel's 15-byte overshoot never
+/// needs a bounds check.
+const OUT_HEADROOM: usize = 320;
+
+/// LZMA stream decoder.  Holds the probability model and the LZ state.
+///
+/// There is no separate dictionary buffer: the decoder writes straight into
+/// the caller's flat `output` Vec and reads back-references from it. The
+/// window is `output[dict_start..]`, capped at `dict_size` bytes behind the
+/// cursor. Positions used for `lp`/`pb` context are relative to
+/// `dict_start`, which mirrors liblzma resetting `dict.pos` on a dict reset.
 pub struct LzmaDecoder {
     // Coding parameters.
     pub lc: u32,
@@ -210,8 +366,6 @@ pub struct LzmaDecoder {
     /// Reverse-bittree probabilities for the middle-range distance slots.
     /// Sized as `FULL_DISTANCES` (not `FULL_DISTANCES - DIST_MODEL_END`)
     /// so the slot-13 slice `[base - slot..base - slot + 32]` fits cleanly.
-    /// liblzma stores the array at the smaller size and walks via UB
-    /// pointer arithmetic — we trade ~28 bytes for safe Rust slicing.
     pub dist_special: [Prob; FULL_DISTANCES],
     /// Alignment-bits reverse bittree for the very large distances.
     pub dist_align: [Prob; ALIGN_SIZE],
@@ -226,8 +380,11 @@ pub struct LzmaDecoder {
     pub state: u32,
     pub reps: [u32; REPS],
 
-    // Dictionary buffer (LZ77 sliding window).
-    pub dict: Dict,
+    /// Offset into the output Vec where the current dictionary window
+    /// starts (set by the caller on every dict reset).
+    pub dict_start: usize,
+    /// Maximum back-reference distance.
+    pub dict_size: usize,
 }
 
 impl LzmaDecoder {
@@ -259,15 +416,14 @@ impl LzmaDecoder {
             literal: vec![prob_init(); literal_coders * LITERAL_CODER_SIZE],
             state: 0,
             reps: [0; REPS],
-            dict: Dict::new(dict_size as usize),
-            // shut up unused field reads:
-            // (lp_mask/pb_mask are used in literal_subcoder + pos_state)
+            dict_start: 0,
+            dict_size: dict_size.max(1) as usize,
         })
     }
 
-    /// Reset every probability and the state machine.  Does NOT clear the
-    /// dictionary — LZMA2 controls dict reset separately via its chunk
-    /// control byte.
+    /// Reset every probability and the state machine.  Does NOT touch the
+    /// dictionary window — LZMA2 controls dict reset separately via its
+    /// chunk control byte (`dict_start`).
     pub fn reset_state(&mut self) {
         prob_reset_slice(&mut self.is_match);
         prob_reset_slice(&mut self.is_rep);
@@ -287,336 +443,215 @@ impl LzmaDecoder {
         self.reps = [0; REPS];
     }
 
-    /// Compute the literal sub-coder index based on `lc`, `lp_mask`, the
-    /// stream position (low bits) and the previous output byte.
-    #[inline]
-    fn literal_subcoder_offset(&self, pos_low: u32, prev_byte: u8) -> usize {
-        // (((pos & lp_mask) << lc) + (prev_byte >> (8 - lc))) * LITERAL_CODER_SIZE
-        let coder = ((pos_low & self.lp_mask) << self.lc)
-            + ((prev_byte as u32) >> (8 - self.lc));
-        (coder as usize) * LITERAL_CODER_SIZE
-    }
-
-    /// Decode one literal byte and write it to the dictionary.
-    #[inline]
-    fn decode_literal(&mut self, rd: &mut RangeDecoder) -> io::Result<()> {
-        let pos_low = self.dict.position() as u32;
-        let prev = self.dict.last_or_zero();
-        let base = self.literal_subcoder_offset(pos_low, prev);
-
-        let mut symbol: u32 = 1;
-        // SAFETY: `base + symbol` and `base + ((1+match_bit) << 8) + symbol`
-        // are always < `literal.len() = (1 << (lc + lp)) * LITERAL_CODER_SIZE`
-        // because:
-        //   * symbol is in [1, 0x1FF] during the loop (capped before each load)
-        //   * base = coder * LITERAL_CODER_SIZE where coder < (1 << (lc + lp))
-        //   * LITERAL_CODER_SIZE = 0x300, so each sub-coder slot owns
-        //     indices [base, base + 0x300) which fully contains 0..0x300.
-        let lit_ptr = self.literal.as_mut_ptr();
-
-        if !is_literal_state(self.state) {
-            // Match-byte mode: previous LZMA event was a match.  Use the
-            // byte at distance reps[0]+1 from the current dict position
-            // ("match byte") to influence which probability sub-tree we
-            // descend into.
-            let mut match_byte = self.dict.byte_at(self.reps[0] as usize + 1) as u32;
-            loop {
-                let match_bit = (match_byte >> 7) & 1;
-                match_byte <<= 1;
-                let prob_idx = base + ((1 + match_bit) << 8) as usize + symbol as usize;
-                let bit = unsafe { rd.decode_bit_fast(&mut *lit_ptr.add(prob_idx)) };
-                symbol = (symbol << 1) | bit;
-                if match_bit != bit {
-                    break;
-                }
-                if symbol >= 0x100 {
-                    break;
-                }
+    /// Decode the match-distance using the slot/direct/align scheme.
+    #[inline(always)]
+    unsafe fn decode_distance(&mut self, rc: &mut Rc, len: u32, inp: *const u8) -> u32 {
+        let dist_state = get_dist_state(len) as usize;
+        unsafe {
+            let slot = rc.bittree(
+                self.dist_slot.get_unchecked_mut(dist_state).as_mut_ptr(),
+                DIST_SLOT_BITS,
+                inp,
+            );
+            if slot < DIST_MODEL_START {
+                return slot;
+            }
+            let num_direct = (slot >> 1) - 1;
+            let base: u32 = (2 | (slot & 1)) << num_direct;
+            if slot < DIST_MODEL_END {
+                // probs[base - slot ..], indexed 1..=2^num_direct by the
+                // reverse bittree; base - slot + 2^num_direct <= 128.
+                let probs = self.dist_special.as_mut_ptr().add(base as usize - slot as usize);
+                base + rc.bittree_rev(probs, num_direct, inp)
+            } else {
+                let direct_bits = num_direct - ALIGN_BITS;
+                let direct = rc.direct(direct_bits, inp) << ALIGN_BITS;
+                let align = rc.bittree_rev(self.dist_align.as_mut_ptr(), ALIGN_BITS, inp);
+                base + direct + align
             }
         }
-
-        // Continue (or do the entire) plain literal decode.
-        while symbol < 0x100 {
-            let prob_idx = base + symbol as usize;
-            let bit = unsafe { rd.decode_bit_fast(&mut *lit_ptr.add(prob_idx)) };
-            symbol = (symbol << 1) | bit;
-        }
-
-        self.dict.push(symbol as u8 & 0xff);
-        self.state = update_literal(self.state);
-        Ok(())
     }
 
-    /// Decode the match-distance using the slot/direct/align scheme.
-    #[inline]
-    fn decode_distance(&mut self, rd: &mut RangeDecoder, len: u32) -> u32 {
-        let dist_state = get_dist_state(len) as usize;
-        let slot = rd.decode_bittree_fast(&mut self.dist_slot[dist_state], DIST_SLOT_BITS);
-        if slot < DIST_MODEL_START {
-            return slot;
-        }
-        let num_direct = (slot >> 1) - 1;
-        let base: u32 = (2 | (slot & 1)) << num_direct;
-        if slot < DIST_MODEL_END {
-            let begin = base as usize - slot as usize;
-            let end = begin + (1usize << num_direct);
-            let probs = &mut self.dist_special[begin..end];
-            let extra = rd.decode_bittree_reverse_fast(probs, num_direct);
-            base + extra
-        } else {
-            let direct_bits = num_direct - ALIGN_BITS;
-            let direct = rd.decode_direct_bits_fast(direct_bits) << ALIGN_BITS;
-            let align = rd.decode_bittree_reverse_fast(&mut self.dist_align, ALIGN_BITS);
-            base + direct + align
-        }
-    }
-
-    /// Decode bytes from `input` until either:
-    ///   (a) `uncompressed_remaining` bytes have been emitted, or
+    /// Decode bytes from `rd` straight into `output` until either:
+    ///   (a) `limit` bytes have been emitted, or
     ///   (b) the end-of-stream marker (distance == u32::MAX) is encountered.
     ///
-    /// The caller MUST ensure `rd.input` has enough trailing bytes for the
-    /// range decoder to refill freely.
+    /// `rd.input` MUST have enough trailing slack bytes for the range
+    /// decoder to refill freely (the hot path has no EOF check).
     ///
     /// Returns `(bytes_emitted, hit_end_marker)`.
-    pub fn decode_to_dict(
+    #[inline(never)]
+    pub fn decode_into(
         &mut self,
         rd: &mut RangeDecoder,
-        uncompressed_remaining: usize,
+        limit: usize,
         output: &mut Vec<u8>,
     ) -> io::Result<(usize, bool)> {
-        let mut produced = 0usize;
-        let dict_cap = self.dict.buf.len();
-        while produced < uncompressed_remaining {
-            let pos_state = (self.dict.position() as u32 & self.pb_mask) as usize;
-            let is_match_idx = self.state as usize * POS_STATES_MAX + pos_state;
-            let bit = rd.decode_bit_fast(&mut self.is_match[is_match_idx]);
+        let start = output.len();
+        let end = start.saturating_add(limit);
+        let dict_start = self.dict_start;
+        debug_assert!(dict_start <= start);
+        let dict_size = self.dict_size;
+        let inp = rd.input.as_ptr();
+        let mut rc = Rc { range: rd.range, code: rd.code, pos: rd.pos };
+        let lc = self.lc;
+        let lp_mask = self.lp_mask as usize;
+        let pb_mask = self.pb_mask as usize;
+        let lit = self.literal.as_mut_ptr();
+        let mut state = self.state;
+        let mut reps = self.reps;
+        let mut hit_marker = false;
 
-            if bit == 0 {
-                // Literal.
-                self.decode_literal(rd)?;
-                // Mirror the freshly-written byte into the user output so
-                // we never have to read it back out of the cyclic dict
-                // (which may have wrapped on a long enough chunk).
-                output.push(self.dict.byte_at(1));
-                produced += 1;
-                continue;
-            }
+        output.reserve((end - start).min(1 << 22) + OUT_HEADROOM);
+        let mut base = output.as_mut_ptr();
+        let mut cap = output.capacity();
+        let mut pos = start;
 
-            // Some kind of match.
-            let len: u32;
-            if rd.decode_bit_fast(&mut self.is_rep[self.state as usize]) != 0 {
-                // Repeat.
-                if rd.decode_bit_fast(&mut self.is_rep0[self.state as usize]) == 0 {
-                    // rep0 — same distance as last time.
-                    let rep0_long_idx =
-                        self.state as usize * POS_STATES_MAX + pos_state;
-                    if rd.decode_bit_fast(&mut self.is_rep0_long[rep0_long_idx]) == 0 {
-                        // Short rep — exactly one byte.
-                        self.state = update_short_rep(self.state);
-                        let b = self.dict.byte_at(self.reps[0] as usize + 1);
-                        self.dict.push(b);
-                        output.push(b);
-                        produced += 1;
-                        continue;
-                    }
-                    len = MATCH_LEN_MIN + self.rep_len.decode(rd, pos_state);
-                } else {
-                    // rep1, rep2 or rep3.
-                    let dist;
-                    if rd.decode_bit_fast(&mut self.is_rep1[self.state as usize]) == 0 {
-                        dist = self.reps[1];
-                    } else {
-                        if rd.decode_bit_fast(&mut self.is_rep2[self.state as usize]) == 0 {
-                            dist = self.reps[2];
-                        } else {
-                            dist = self.reps[3];
-                            self.reps[3] = self.reps[2];
+        // Only expanded inside the `unsafe` block below.
+        macro_rules! fail {
+            ($msg:expr) => {{
+                output.set_len(pos);
+                return Err(io::Error::new(io::ErrorKind::InvalidData, $msg));
+            }};
+        }
+
+        // SAFETY: every write is at `pos < cap - OUT_HEADROOM` (checked at
+        // loop top) and every read is at `>= dict_start >= 0` and `< pos`
+        // (distance validated against `pos - dict_start`).
+        unsafe {
+            while pos < end {
+                if pos + OUT_HEADROOM > cap {
+                    output.set_len(pos);
+                    output.reserve((end - pos).min(1 << 22) + OUT_HEADROOM);
+                    base = output.as_mut_ptr();
+                    cap = output.capacity();
+                }
+                let rel = pos - dict_start;
+                let pos_state = rel & pb_mask;
+                let st = state as usize;
+
+                if rc.bit_br(self.is_match.as_mut_ptr().add(st * POS_STATES_MAX + pos_state), inp) == 0 {
+                    // ---- Literal ----
+                    let prev = if rel == 0 { 0 } else { *base.add(pos - 1) as u32 };
+                    let coder = ((rel & lp_mask) << lc) + (prev >> (8 - lc)) as usize;
+                    let probs = lit.add(coder * LITERAL_CODER_SIZE);
+                    let mut symbol = 1u32;
+                    if state < LIT_STATES {
+                        macro_rules! lit_bit {
+                            () => {
+                                let b = rc.bit(probs.add(symbol as usize), inp);
+                                symbol = (symbol << 1) | b;
+                            };
                         }
-                        self.reps[2] = self.reps[1];
+                        lit_bit!(); lit_bit!(); lit_bit!(); lit_bit!();
+                        lit_bit!(); lit_bit!(); lit_bit!(); lit_bit!();
+                    } else {
+                        // Matched literal: the byte at rep0 steers which
+                        // sub-tree we descend until the first mismatch,
+                        // after which `offset` drops to 0 and the plain
+                        // tree is used (liblzma's formulation).
+                        let mut match_byte = *base.add(pos - reps[0] as usize - 1) as u32;
+                        let mut offset = 0x100u32;
+                        macro_rules! mlit_bit {
+                            () => {
+                                match_byte <<= 1;
+                                let match_bit = match_byte & offset;
+                                let idx = offset + match_bit + symbol;
+                                let b = rc.bit(probs.add(idx as usize), inp);
+                                symbol = (symbol << 1) | b;
+                                // b == 1: offset &= match_bit; b == 0: offset &= !match_bit
+                                offset &= match_bit ^ 0u32.wrapping_sub(b ^ 1);
+                            };
+                        }
+                        mlit_bit!(); mlit_bit!(); mlit_bit!(); mlit_bit!();
+                        mlit_bit!(); mlit_bit!(); mlit_bit!(); mlit_bit!();
                     }
-                    self.reps[1] = self.reps[0];
-                    self.reps[0] = dist;
-                    len = MATCH_LEN_MIN + self.rep_len.decode(rd, pos_state);
+                    *base.add(pos) = symbol as u8;
+                    pos += 1;
+                    state = update_literal(state);
+                    continue;
                 }
-                self.state = update_long_rep(self.state);
-            } else {
-                // Plain match.  Shift the rep distances.
-                self.reps[3] = self.reps[2];
-                self.reps[2] = self.reps[1];
-                self.reps[1] = self.reps[0];
-                let raw_len = self.match_len.decode(rd, pos_state);
-                len = MATCH_LEN_MIN + raw_len;
-                self.reps[0] = self.decode_distance(rd, len);
-                if self.reps[0] == u32::MAX {
-                    // End-of-payload marker.
-                    return Ok((produced, true));
-                }
-                self.state = update_match(self.state);
-            }
 
-            // Copy `len` bytes from the dictionary at offset `reps[0] + 1`.
-            let copy_len = (len as usize).min(uncompressed_remaining - produced);
-            self.dict.repeat(self.reps[0] as usize + 1, copy_len)?;
-            // Mirror the freshly-written copy_len bytes into output.  Since
-            // copy_len ≤ MATCH_LEN_MAX (273) ≤ dict_cap (xz min 4 KiB),
-            // the just-written bytes are guaranteed to all still live in
-            // the dict's cyclic buffer — at most a 2-slice wrap.
-            let total_after = self.dict.total as usize;
-            let start = (total_after - copy_len) % dict_cap;
-            if start + copy_len <= dict_cap {
-                output.extend_from_slice(&self.dict.buf[start..start + copy_len]);
-            } else {
-                let first = dict_cap - start;
-                output.extend_from_slice(&self.dict.buf[start..dict_cap]);
-                output.extend_from_slice(&self.dict.buf[..copy_len - first]);
-            }
-            produced += copy_len;
-            if (copy_len as u32) < len {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "lzma: match copy overruns chunk size",
-                ));
-            }
-        }
-        Ok((produced, false))
-    }
-}
-
-// =========================================================================
-// LZ77 dictionary
-// =========================================================================
-
-/// Sliding-window LZ77 dictionary.  Holds the most recent `dict_size`
-/// decoded bytes plus a write cursor.  We allocate the full configured
-/// dict size up-front (xz dict_size is at most 4 GiB but in practice
-/// preset 9 = 64 MiB).
-pub struct Dict {
-    pub buf: Vec<u8>,
-    /// Total bytes ever written (used to compute the wrapped position).
-    pub total: u64,
-    /// `buf.len() - 1` when capacity is a power of two (fast modulo via
-    /// bitwise AND), or 0 to signal that real modulo is needed.
-    mask: usize,
-}
-
-impl Dict {
-    pub fn new(size: usize) -> Self {
-        let cap = size.max(1);
-        let mut buf: Vec<u8> = Vec::with_capacity(cap);
-        unsafe { buf.set_len(cap); }
-        let mask = if cap.is_power_of_two() { cap - 1 } else { 0 };
-        Self { buf, total: 0, mask }
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.buf.len()
-    }
-
-    /// Fast cyclic-buffer index: uses bitwise AND for power-of-2 buffers.
-    #[inline(always)]
-    fn wrap(&self, pos: usize) -> usize {
-        if self.mask != 0 { pos & self.mask } else { pos % self.buf.len() }
-    }
-
-    /// Position within the cyclic buffer for the NEXT byte to be written.
-    pub fn position(&self) -> usize {
-        self.wrap(self.total as usize)
-    }
-
-    /// Most recently written byte (or 0 if dict is empty).
-    pub fn last_or_zero(&self) -> u8 {
-        if self.total == 0 {
-            0
-        } else {
-            let pos = self.wrap((self.total - 1) as usize);
-            self.buf[pos]
-        }
-    }
-
-    /// Read the byte at `back_offset` bytes BEFORE the current write
-    /// position.  `back_offset == 1` is the byte just written.  Returns 0
-    /// if `back_offset` exceeds the bytes ever written.
-    #[inline(always)]
-    pub fn byte_at(&self, back_offset: usize) -> u8 {
-        if back_offset == 0 || (back_offset as u64) > self.total {
-            return 0;
-        }
-        let pos = self.wrap(self.total as usize + self.buf.len() - back_offset);
-        unsafe { *self.buf.as_ptr().add(pos) }
-    }
-
-    #[inline(always)]
-    pub fn push(&mut self, b: u8) {
-        let pos = self.wrap(self.total as usize);
-        unsafe { *self.buf.as_mut_ptr().add(pos) = b; }
-        self.total += 1;
-    }
-
-    /// Repeat `len` bytes from `back_offset` bytes ago — the LZ77 copy.
-    /// `back_offset` must be in `1..=total` and `1..=capacity`.
-    pub fn repeat(&mut self, back_offset: usize, len: usize) -> io::Result<()> {
-        if back_offset == 0 || (back_offset as u64) > self.total || back_offset > self.buf.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "lzma: distance {} out of range (total={}, cap={})",
-                    back_offset,
-                    self.total,
-                    self.buf.len()
-                ),
-            ));
-        }
-        let cap = self.buf.len();
-        let mut dst = self.wrap(self.total as usize);
-        let mut src = self.wrap(self.total as usize + cap - back_offset);
-
-        // Fast path: neither src nor dst wraps the cyclic buffer.
-        let no_wrap_dst = dst + len <= cap;
-        let no_wrap_src = src + len <= cap;
-        if no_wrap_dst && no_wrap_src {
-            unsafe {
-                let p = self.buf.as_mut_ptr();
-                if back_offset == 1 {
-                    let b = *p.add(src);
-                    std::ptr::write_bytes(p.add(dst), b, len);
-                } else if back_offset >= len {
-                    std::ptr::copy_nonoverlapping(p.add(src), p.add(dst), len);
+                // ---- Some kind of match ----
+                let len: u32;
+                if rc.bit_br(self.is_rep.as_mut_ptr().add(st), inp) != 0 {
+                    if rel == 0 {
+                        fail!("lzma: repeat match with empty dictionary");
+                    }
+                    if rc.bit_br(self.is_rep0.as_mut_ptr().add(st), inp) == 0 {
+                        if rc.bit_br(
+                            self.is_rep0_long.as_mut_ptr().add(st * POS_STATES_MAX + pos_state),
+                            inp,
+                        ) == 0
+                        {
+                            // Short rep — exactly one byte at rep0.
+                            let dist = reps[0] as usize + 1;
+                            if dist > rel || dist > dict_size {
+                                fail!("lzma: short-rep distance out of range");
+                            }
+                            *base.add(pos) = *base.add(pos - dist);
+                            pos += 1;
+                            state = update_short_rep(state);
+                            continue;
+                        }
+                    } else {
+                        let dist;
+                        if rc.bit_br(self.is_rep1.as_mut_ptr().add(st), inp) == 0 {
+                            dist = reps[1];
+                        } else {
+                            if rc.bit_br(self.is_rep2.as_mut_ptr().add(st), inp) == 0 {
+                                dist = reps[2];
+                            } else {
+                                dist = reps[3];
+                                reps[3] = reps[2];
+                            }
+                            reps[2] = reps[1];
+                        }
+                        reps[1] = reps[0];
+                        reps[0] = dist;
+                    }
+                    len = MATCH_LEN_MIN + self.rep_len.decode(&mut rc, pos_state, inp);
+                    state = update_long_rep(state);
                 } else {
-                    // Overlapping: copy in back_offset-sized chunks so
-                    // the repeating pattern propagates correctly.
-                    let mut w = 0usize;
-                    while w + back_offset <= len {
-                        std::ptr::copy_nonoverlapping(
-                            p.add(src + w), p.add(dst + w), back_offset,
-                        );
-                        w += back_offset;
+                    reps[3] = reps[2];
+                    reps[2] = reps[1];
+                    reps[1] = reps[0];
+                    len = MATCH_LEN_MIN + self.match_len.decode(&mut rc, pos_state, inp);
+                    let d = self.decode_distance(&mut rc, len, inp);
+                    if d == u32::MAX {
+                        hit_marker = true;
+                        break;
                     }
-                    if w < len {
-                        std::ptr::copy_nonoverlapping(
-                            p.add(src + w), p.add(dst + w), len - w,
-                        );
-                    }
+                    reps[0] = d;
+                    state = update_match(state);
+                }
+
+                let dist = reps[0] as usize + 1;
+                if dist > rel || dist > dict_size {
+                    fail!("lzma: match distance out of range");
+                }
+                let len = len as usize;
+                let copy_len = len.min(end - pos);
+                crate::cpu_features::copy_match_unchecked(
+                    base.add(pos - dist),
+                    base.add(pos),
+                    dist,
+                    copy_len,
+                );
+                pos += copy_len;
+                if copy_len < len {
+                    fail!("lzma: match copy overruns chunk size");
                 }
             }
-            self.total += len as u64;
-            return Ok(());
+            output.set_len(pos);
         }
 
-        // Slow path: at least one side wraps.  Uses wrap() (bitwise AND
-        // for power-of-2 dicts) instead of modulo per byte.
-        for _ in 0..len {
-            let s = self.wrap(src);
-            let d = self.wrap(dst);
-            unsafe {
-                let p = self.buf.as_mut_ptr();
-                *p.add(d) = *p.add(s);
-            }
-            src += 1;
-            dst += 1;
-            self.total += 1;
-        }
-        Ok(())
+        rd.range = rc.range;
+        rd.code = rc.code;
+        rd.pos = rc.pos;
+        self.state = state;
+        self.reps = reps;
+        Ok((pos - start, hit_marker))
     }
 }
 
