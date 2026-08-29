@@ -267,13 +267,6 @@ impl ForwardBitWriter {
         }
     }
 
-    pub fn with_capacity(cap: usize) -> Self {
-        Self {
-            output: Vec::with_capacity(cap),
-            partial: 0,
-            bits_in_partial: 0,
-        }
-    }
 
     /// Write the low `n` bits of `bits` (n ≤ 56).  Caller must ensure that
     /// the upper bits beyond `n` are zero.

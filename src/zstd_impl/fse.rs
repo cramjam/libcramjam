@@ -425,7 +425,6 @@ pub struct FseEncoder {
     /// Smallest decoder index for each symbol — used by `start_state`.
     start_states: Vec<u16>,
     table_size: u32,
-    pub accuracy_log: u32,
 }
 
 impl FseEncoder {
@@ -484,7 +483,6 @@ impl FseEncoder {
             table,
             start_states,
             table_size: table_size_u32,
-            accuracy_log: acc_log,
         }
     }
 
@@ -528,7 +526,7 @@ mod encoder_tests {
             state = enc.encode_symbol(state, sym, &mut w);
         }
         // Final state goes last so the decoder reads it first.
-        w.write_bits(state as u64, enc.accuracy_log);
+        w.write_bits(state as u64, dec.accuracy_log);
         let bytes = w.finalize();
 
         // Now decode forward and check we recover the input.

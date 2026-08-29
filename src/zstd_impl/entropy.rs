@@ -65,13 +65,6 @@ impl HufCTable {
         Some(HufCTable { elt, max_symbol, table_log: max_bits })
     }
 
-    fn estimate_compressed_size(&self, counts: &[u32]) -> usize {
-        let mut nb_bits = 0usize;
-        for (s, &c) in counts.iter().enumerate() {
-            nb_bits += self.nb_bits(s) as usize * c as usize;
-        }
-        nb_bits >> 3
-    }
 
     /// `HUF_writeCTable`: weights for symbols `0..max_symbol` (the last one
     /// is implicit), FSE-compressed when that is smaller, else 4-bit direct.
