@@ -1,10 +1,19 @@
 //! DEFLATE decompression (RFC 1951)
 
 use std::io;
+use std::sync::OnceLock;
 
 use super::bitreader::BitReader;
-use super::huffman::HuffmanDecoder;
+use super::huffman::{self, Alphabet, HuffmanDecoder};
 use super::tables;
+
+const LITLEN_TABLE_BITS: u32 = 10;
+const DIST_TABLE_BITS: u32 = 8;
+const PRECODE_TABLE_BITS: u32 = 7;
+
+/// Two literals + the longest match (258) + the wildcopy overshoot of the
+/// match kernel — what one loop iteration may write past `op`.
+const OUT_HEADROOM: usize = 2 + 258 + 16;
 
 /// Decompress a raw DEFLATE stream, appending to `output`.
 /// Returns the number of input bytes consumed.
@@ -60,10 +69,21 @@ fn inflate_stored(reader: &mut BitReader, output: &mut Vec<u8>) -> io::Result<()
 // Block type 1: fixed Huffman codes
 // ---------------------------------------------------------------------------
 
+fn fixed_tables() -> &'static (HuffmanDecoder, HuffmanDecoder) {
+    static TABLES: OnceLock<(HuffmanDecoder, HuffmanDecoder)> = OnceLock::new();
+    TABLES.get_or_init(|| {
+        (
+            HuffmanDecoder::from_lengths(&tables::fixed_literal_lengths(), Alphabet::LitLen, LITLEN_TABLE_BITS)
+                .expect("fixed literal table"),
+            HuffmanDecoder::from_lengths(&tables::fixed_distance_lengths(), Alphabet::Distance, DIST_TABLE_BITS)
+                .expect("fixed distance table"),
+        )
+    })
+}
+
 fn inflate_fixed(reader: &mut BitReader, output: &mut Vec<u8>) -> io::Result<()> {
-    let lit_dec = HuffmanDecoder::from_lengths(&tables::fixed_literal_lengths())?;
-    let dist_dec = HuffmanDecoder::from_lengths(&tables::fixed_distance_lengths())?;
-    decode_block(reader, &lit_dec, &dist_dec, output)
+    let (lit_dec, dist_dec) = fixed_tables();
+    decode_block(reader, lit_dec, dist_dec, output)
 }
 
 // ---------------------------------------------------------------------------
@@ -79,7 +99,7 @@ fn inflate_dynamic(reader: &mut BitReader, output: &mut Vec<u8>) -> io::Result<(
     for i in 0..hclen {
         cl_lengths[tables::CODE_LENGTH_ORDER[i]] = reader.read_bits(3)? as u8;
     }
-    let cl_dec = HuffmanDecoder::from_lengths(&cl_lengths)?;
+    let cl_dec = HuffmanDecoder::from_lengths(&cl_lengths, Alphabet::Precode, PRECODE_TABLE_BITS)?;
 
     let total = hlit + hdist;
     let mut all_lengths: Vec<u8> = Vec::with_capacity(total);
@@ -121,8 +141,8 @@ fn inflate_dynamic(reader: &mut BitReader, output: &mut Vec<u8>) -> io::Result<(
         }
     }
 
-    let lit_dec = HuffmanDecoder::from_lengths(&all_lengths[..hlit])?;
-    let dist_dec = HuffmanDecoder::from_lengths(&all_lengths[hlit..])?;
+    let lit_dec = HuffmanDecoder::from_lengths(&all_lengths[..hlit], Alphabet::LitLen, LITLEN_TABLE_BITS)?;
+    let dist_dec = HuffmanDecoder::from_lengths(&all_lengths[hlit..], Alphabet::Distance, DIST_TABLE_BITS)?;
     decode_block(reader, &lit_dec, &dist_dec, output)
 }
 
@@ -130,68 +150,134 @@ fn inflate_dynamic(reader: &mut BitReader, output: &mut Vec<u8>) -> io::Result<(
 // Decode compressed data within a block
 // ---------------------------------------------------------------------------
 
+#[cold]
+#[inline(never)]
+fn err(kind: io::ErrorKind, msg: &'static str) -> io::Error {
+    io::Error::new(kind, msg)
+}
+
+/// Raw-pointer output cursor over a `Vec<u8>` with a guaranteed headroom of
+/// `OUT_HEADROOM` bytes past `op` while decoding (grown on demand).
+struct OutCursor<'a> {
+    vec: &'a mut Vec<u8>,
+    base: *mut u8,
+    op: *mut u8,
+    end: *mut u8,
+}
+
+impl<'a> OutCursor<'a> {
+    fn new(vec: &'a mut Vec<u8>) -> Self {
+        let mut c = OutCursor { vec, base: std::ptr::null_mut(), op: std::ptr::null_mut(), end: std::ptr::null_mut() };
+        c.grow();
+        c
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self) {
+        let len = if self.base.is_null() { self.vec.len() } else { self.op as usize - self.base as usize };
+        // SAFETY: `len` bytes have been written below `op`.
+        unsafe { self.vec.set_len(len) };
+        self.vec.reserve((64 * 1024).max(OUT_HEADROOM));
+        self.base = self.vec.as_mut_ptr();
+        // SAFETY: len <= capacity.
+        self.op = unsafe { self.base.add(len) };
+        self.end = unsafe { self.base.add(self.vec.capacity()) };
+    }
+
+    #[inline(always)]
+    fn ensure_headroom(&mut self) {
+        if (self.end as usize - self.op as usize) < OUT_HEADROOM {
+            self.grow();
+        }
+    }
+
+    fn finish(self) {
+        let len = self.op as usize - self.base as usize;
+        // SAFETY: every byte below `op` was written.
+        unsafe { self.vec.set_len(len) };
+    }
+}
+
 fn decode_block(
     reader: &mut BitReader,
     lit_dec: &HuffmanDecoder,
     dist_dec: &HuffmanDecoder,
     output: &mut Vec<u8>,
 ) -> io::Result<()> {
+    use huffman::{EXTRA_MASK, EXTRA_SHIFT, KIND_BASE, KIND_LITERAL, KIND_MASK, KIND_SHIFT, LEN_MASK};
+
+    let mut out = OutCursor::new(output);
+
     loop {
-        let sym = lit_dec.decode(reader)?;
-        match sym {
-            0..=255 => {
-                output.push(sym as u8);
+        // One refill covers a whole sequence: litlen code (15) + length extra
+        // (5) + distance code (15) + distance extra (13) = 48 <= 56 bits.
+        if !reader.refill() {
+            return Err(err(io::ErrorKind::UnexpectedEof, "unexpected end of deflate stream"));
+        }
+        out.ensure_headroom();
+
+        let mut e = lit_dec.lookup::<LITLEN_TABLE_BITS>(reader);
+        reader.consume(e & LEN_MASK);
+        if e & KIND_MASK == KIND_LITERAL << KIND_SHIFT {
+            // SAFETY: headroom guaranteed above (covers 2 literals + a match).
+            unsafe {
+                *out.op = (e >> 16) as u8;
+                out.op = out.op.add(1);
             }
-            256 => {
+            // A second literal fits in the same refill (>= 41 bits left).
+            e = lit_dec.lookup::<LITLEN_TABLE_BITS>(reader);
+            reader.consume(e & LEN_MASK);
+            if e & KIND_MASK == KIND_LITERAL << KIND_SHIFT {
+                unsafe {
+                    *out.op = (e >> 16) as u8;
+                    out.op = out.op.add(1);
+                }
+                continue;
+            }
+            // Length (or special): top up for the rest of the sequence.
+            if !reader.refill() {
+                out.finish();
+                return Err(err(io::ErrorKind::UnexpectedEof, "unexpected end of deflate stream"));
+            }
+        }
+        let kind = e & KIND_MASK;
+        if kind != KIND_BASE << KIND_SHIFT {
+            // Special: end-of-block or invalid.
+            out.finish();
+            if reader.overread() {
+                return Err(err(io::ErrorKind::UnexpectedEof, "unexpected end of deflate stream"));
+            }
+            if (e >> 16) == huffman::EOB_ENTRY_VALUE {
                 return Ok(());
             }
-            257..=285 => {
-                let idx = (sym - 257) as usize;
-                if idx >= tables::LENGTH_BASE.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "invalid length code",
-                    ));
-                }
-                let length = tables::LENGTH_BASE[idx] as usize
-                    + reader.read_bits(tables::LENGTH_EXTRA[idx] as u32)? as usize;
+            return Err(err(io::ErrorKind::InvalidData, "invalid literal/length symbol"));
+        }
 
-                let dist_sym = dist_dec.decode(reader)?;
-                if dist_sym as usize >= tables::DISTANCE_BASE.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "invalid distance code",
-                    ));
-                }
-                let distance = tables::DISTANCE_BASE[dist_sym as usize] as usize
-                    + reader.read_bits(tables::DISTANCE_EXTRA[dist_sym as usize] as u32)? as usize;
+        let length = (e >> 16) as usize + reader.bits((e >> EXTRA_SHIFT) & EXTRA_MASK) as usize;
 
-                if distance > output.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "distance too far back",
-                    ));
-                }
+        let d = dist_dec.lookup::<DIST_TABLE_BITS>(reader);
+        reader.consume(d & LEN_MASK);
+        if d & KIND_MASK != KIND_BASE << KIND_SHIFT {
+            out.finish();
+            return Err(err(io::ErrorKind::InvalidData, "invalid distance code"));
+        }
+        let distance = (d >> 16) as usize + reader.bits((d >> EXTRA_SHIFT) & EXTRA_MASK) as usize;
 
-                let start = output.len() - distance;
-                if distance >= length {
-                    output.extend_from_within(start..start + length);
-                } else {
-                    let mut remaining = length;
-                    while remaining > 0 {
-                        let copy_len = remaining.min(distance);
-                        let src = output.len() - distance;
-                        output.extend_from_within(src..src + copy_len);
-                        remaining -= copy_len;
-                    }
-                }
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid literal/length symbol",
-                ))
-            }
+        let produced = out.op as usize - out.base as usize;
+        if distance > produced {
+            out.finish();
+            return Err(err(io::ErrorKind::InvalidData, "distance too far back"));
+        }
+        if reader.overread() {
+            out.finish();
+            return Err(err(io::ErrorKind::UnexpectedEof, "unexpected end of deflate stream"));
+        }
+        // SAFETY: `distance <= produced` so the source is inside the written
+        // region; `OUT_HEADROOM` guarantees `length + 16` bytes past `op`.
+        unsafe {
+            crate::cpu_features::copy_match_unchecked(out.op.sub(distance), out.op, distance, length);
+            out.op = out.op.add(length);
         }
     }
 }
@@ -199,22 +285,49 @@ fn decode_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn test_inflate_flate2_level1_text() {
-        let compressed: Vec<u8> = vec![
-            0x0d, 0xc9, 0xcb, 0x15, 0x84, 0x20, 0x0c, 0x05, 0xd0, 0x56, 0x5e, 0x01, 0x73, 0xa6,
-            0x12, 0x97, 0x36, 0x80, 0x18, 0x35, 0x0a, 0x04, 0x93, 0xe0, 0xaf, 0x7a, 0xdd, 0xde,
-            0xdb, 0x2f, 0x84, 0xbd, 0x71, 0xdc, 0x30, 0xa8, 0x9c, 0x05, 0x93, 0x5c, 0x58, 0x5b,
-            0xae, 0x06, 0x39, 0x48, 0xe1, 0x5f, 0xa7, 0xf0, 0xdc, 0x18, 0x65, 0xfe, 0xa3, 0x13,
-            0xa5, 0x0c, 0xae, 0xd6, 0xf2, 0x07, 0x49, 0x14, 0xc6, 0x8e, 0x90, 0xc9, 0x7f, 0x88,
-            0x52, 0x8c, 0xa2, 0x93, 0x37, 0x45, 0x18, 0xb9, 0xb2, 0x45, 0x2e, 0x33, 0x28, 0xb1,
-            0xbf,
-        ];
+        let text = b"The quick brown fox jumps over the lazy dog. ".repeat(200);
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(1));
+        enc.write_all(&text).unwrap();
+        let compressed = enc.finish().unwrap();
 
-        let expected = b"The quick brown fox jumps over the lazy dog. Lorem ipsum dolor sit amet, consectetur adipiscing elit";
-        let mut output = Vec::new();
-        inflate_into(&compressed, &mut output).unwrap();
-        assert_eq!(&output, expected);
+        let mut out = Vec::new();
+        let consumed = inflate_into(&compressed, &mut out).unwrap();
+        assert_eq!(consumed, compressed.len());
+        assert_eq!(out, text);
+    }
+
+    #[test]
+    fn test_inflate_all_levels_with_trailing_garbage() {
+        let mut data = Vec::new();
+        for i in 0..50_000u32 {
+            data.push((i.wrapping_mul(2654435761) >> 13) as u8 & 0x1F | 0x40);
+        }
+        for level in 0..=9 {
+            let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(level));
+            enc.write_all(&data).unwrap();
+            let mut compressed = enc.finish().unwrap();
+            let clen = compressed.len();
+            compressed.extend_from_slice(&[0xAA; 20]);
+            let mut out = Vec::new();
+            let consumed = inflate_into(&compressed, &mut out).unwrap();
+            assert_eq!(consumed, clen, "level {level}");
+            assert_eq!(out, data, "level {level}");
+        }
+    }
+
+    #[test]
+    fn test_inflate_truncated_is_error() {
+        let text = b"hello hello hello hello hello world".repeat(100);
+        let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(6));
+        enc.write_all(&text).unwrap();
+        let compressed = enc.finish().unwrap();
+        for cut in [1usize, 5, compressed.len() / 2, compressed.len() - 1] {
+            let mut out = Vec::new();
+            assert!(inflate_into(&compressed[..cut], &mut out).is_err(), "cut at {cut}");
+        }
     }
 }
