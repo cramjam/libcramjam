@@ -11,7 +11,11 @@ pub use crate::bzip2_impl::Bzip2StreamCompressor;
 pub fn decompress<W: Write + ?Sized, R: Read>(mut input: R, output: &mut W) -> Result<usize, Error> {
     let mut data = Vec::new();
     input.read_to_end(&mut data)?;
-    crate::with_scratch(output, |decoded| crate::bzip2_impl::decode::decode_stream(&data, decoded).map(|_| ()))
+    let mut sink = crate::SinkRef(output);
+    crate::scratch_with(|buf| {
+        let (_, produced) = crate::bzip2_impl::decode::decode_stream_streaming(&data, buf, Some(&mut sink))?;
+        Ok(produced)
+    })
 }
 
 /// Compress via bzip2.

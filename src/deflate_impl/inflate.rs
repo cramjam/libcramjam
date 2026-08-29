@@ -17,8 +17,25 @@ const OUT_HEADROOM: usize = 2 + 258 + 16;
 
 /// Decompress a raw DEFLATE stream, appending to `output`.
 /// Returns the number of input bytes consumed.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn inflate_into(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
+    inflate_streaming(input, output, None, &mut |_| {}).map(|(n, _)| n)
+}
+
+/// [`inflate_into`] with optional streaming output: with a sink, `output`
+/// is a scratch buffer flushed every few MB down to the 32 KiB window (see
+/// `crate::Streamer`); `on_flush` sees every flushed byte once (for the
+/// gzip CRC / zlib Adler-32). Returns `(input consumed, output produced)`;
+/// the tail is left in `output` for the caller to hash and flush.
+pub fn inflate_streaming(
+    input: &[u8],
+    output: &mut Vec<u8>,
+    sink: Option<&mut dyn std::io::Write>,
+    on_flush: &mut dyn FnMut(&[u8]),
+) -> io::Result<(usize, usize)> {
     let mut reader = BitReader::new(input);
+    let mut st = crate::Streamer::new(sink, 32 << 10, 4 << 20);
+    let out_start = output.len();
 
     loop {
         let bfinal = reader.read_bits(1)?;
@@ -39,9 +56,10 @@ pub fn inflate_into(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
         if bfinal == 1 {
             break;
         }
+        st.maybe_flush(output, &mut *on_flush)?;
     }
 
-    Ok(reader.bytes_consumed())
+    Ok((reader.bytes_consumed(), st.flushed + output.len() - out_start))
 }
 
 // ---------------------------------------------------------------------------

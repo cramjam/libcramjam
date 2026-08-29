@@ -26,6 +26,16 @@ pub(crate) fn with_scratch<W: std::io::Write + ?Sized>(
     output: &mut W,
     f: impl FnOnce(&mut Vec<u8>) -> std::io::Result<()>,
 ) -> std::io::Result<usize> {
+    scratch_with(|buf| {
+        f(buf)?;
+        output.write_all(buf)?;
+        Ok(buf.len())
+    })
+}
+
+/// Raw access to the thread-local scratch buffer (cleared on entry).
+#[cfg(any(feature = "lz4", feature = "zstd", feature = "bzip2", feature = "xz", feature = "deflate-static", feature = "deflate-shared"))]
+pub(crate) fn scratch_with<R>(f: impl FnOnce(&mut Vec<u8>) -> std::io::Result<R>) -> std::io::Result<R> {
     use std::cell::RefCell;
     const SCRATCH_KEEP_MAX: usize = 64 << 20;
     thread_local! {
@@ -41,16 +51,72 @@ pub(crate) fn with_scratch<W: std::io::Write + ?Sized>(
             None => &mut tmp,
         };
         buf.clear();
-        let r = f(buf);
-        let out = match r {
-            Ok(()) => output.write_all(buf).map(|_| buf.len()),
-            Err(e) => Err(e),
-        };
+        let out = f(buf);
         if buf.capacity() > SCRATCH_KEEP_MAX {
             *buf = Vec::new();
         }
         out
     })
+}
+
+/// Streaming-output helper shared by the frame decoders: decoders append to
+/// a scratch `Vec`; `maybe_flush` writes everything but the last `keep`
+/// bytes (the LZ window) to the sink once more than `chunk` bytes are
+/// pending and compacts the buffer. Keeps the decoder's working set at a
+/// few MB (cache-resident) instead of the whole output, which otherwise
+/// costs ~3x the DRAM traffic on outputs larger than L3 — this is what C's
+/// streaming decoders get from their ring buffers.
+#[cfg(any(feature = "lz4", feature = "zstd", feature = "bzip2", feature = "xz", feature = "deflate-static", feature = "deflate-shared"))]
+pub(crate) struct Streamer<'a> {
+    pub sink: Option<&'a mut dyn std::io::Write>,
+    keep: usize,
+    chunk: usize,
+    /// Bytes written to the sink so far.
+    pub flushed: usize,
+}
+
+#[cfg(any(feature = "lz4", feature = "zstd", feature = "bzip2", feature = "xz", feature = "deflate-static", feature = "deflate-shared"))]
+impl<'a> Streamer<'a> {
+    pub fn new(sink: Option<&'a mut dyn std::io::Write>, keep: usize, chunk: usize) -> Self {
+        Self { sink, keep, chunk, flushed: 0 }
+    }
+
+    /// Flush `buf` down to `keep` bytes when more than `keep + chunk` are
+    /// pending. `on_flush` sees every flushed byte exactly once (checksums).
+    #[inline]
+    pub fn maybe_flush(&mut self, buf: &mut Vec<u8>, mut on_flush: impl FnMut(&[u8])) -> std::io::Result<()> {
+        if let Some(sink) = self.sink.as_mut() {
+            if buf.len() > self.keep + self.chunk {
+                let n = buf.len() - self.keep;
+                on_flush(&buf[..n]);
+                sink.write_all(&buf[..n])?;
+                self.flushed += n;
+                buf.copy_within(n.., 0);
+                buf.truncate(self.keep);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Sized adapter so an unsized `&mut W` can be passed as `&mut dyn Write`.
+#[cfg(any(feature = "lz4", feature = "zstd", feature = "bzip2", feature = "xz", feature = "deflate-static", feature = "deflate-shared"))]
+pub(crate) struct SinkRef<'a, W: std::io::Write + ?Sized>(pub &'a mut W);
+
+#[cfg(any(feature = "lz4", feature = "zstd", feature = "bzip2", feature = "xz", feature = "deflate-static", feature = "deflate-shared"))]
+impl<W: std::io::Write + ?Sized> std::io::Write for SinkRef<'_, W> {
+    #[inline]
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.write(b)
+    }
+    #[inline]
+    fn write_all(&mut self, b: &[u8]) -> std::io::Result<()> {
+        self.0.write_all(b)
+    }
+    #[inline]
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
 }
 
 // Shared runtime CPU feature detection + SIMD wildcopy kernel used by the

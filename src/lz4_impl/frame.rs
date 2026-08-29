@@ -104,7 +104,22 @@ pub fn encode_frame_at(input: &[u8], level: Option<u32>) -> Vec<u8> {
 // Decoder
 // =========================================================================
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn decode_frame(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
+    decode_frame_streaming(input, output, None).map(|(n, _)| n)
+}
+
+/// [`decode_frame`] with optional streaming output: with a sink, `output`
+/// is a scratch buffer that is flushed every few MB down to the 64 KiB
+/// block-dependency window (see `crate::Streamer`). Returns
+/// `(input consumed, output produced)`; the tail is left in `output`.
+pub fn decode_frame_streaming(
+    input: &[u8],
+    output: &mut Vec<u8>,
+    sink: Option<&mut dyn std::io::Write>,
+) -> io::Result<(usize, usize)> {
+    let streaming = sink.is_some();
+    let mut st = crate::Streamer::new(sink, 64 << 10, 4 << 20);
     if input.len() < 7 {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "lz4: frame too short"));
     }
@@ -116,7 +131,7 @@ pub fn decode_frame(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "lz4: skippable frame truncated"));
             }
             let size = u32::from_le_bytes([input[4], input[5], input[6], input[7]]) as usize;
-            return Ok(8 + size);
+            return Ok((8 + size, 0));
         }
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -173,12 +188,16 @@ pub fn decode_frame(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
     }
     p += 1;
 
+    if streaming {
+        output.clear();
+    }
     let out_start = output.len();
     // Size the output once so the block decoder never has to grow it:
     // exact when the frame carries its content size, else amortised via
     // one block-max step per block.
     if let Some(cs) = content_size {
-        output.reserve(cs.min(1 << 32) as usize + block::OUT_SLACK);
+        let cs = cs.min(1 << 32) as usize;
+        output.reserve(if streaming { cs.min(8 << 20) } else { cs } + block::OUT_SLACK);
     }
 
     // Blocks.
@@ -216,6 +235,7 @@ pub fn decode_frame(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
             // We don't verify the per-block checksum (non-critical).
             p += 4;
         }
+        st.maybe_flush(output, |_| {})?;
     }
 
     if content_checksum {
@@ -226,9 +246,9 @@ pub fn decode_frame(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
         p += 4;
     }
 
+    let produced = st.flushed + output.len() - out_start;
     if let Some(cs) = content_size {
-        let produced = (output.len() - out_start) as u64;
-        if produced != cs {
+        if produced as u64 != cs {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("lz4: content size mismatch (header={}, produced={})", cs, produced),
@@ -236,7 +256,7 @@ pub fn decode_frame(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
         }
     }
 
-    Ok(p)
+    Ok((p, produced))
 }
 
 // =========================================================================

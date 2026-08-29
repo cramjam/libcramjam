@@ -68,20 +68,21 @@ pub fn decompress<W: Write + ?Sized, R: Read>(
 ) -> io::Result<usize> {
     let mut data = Vec::new();
     input.read_to_end(&mut data)?;
-    crate::with_scratch(output, |decoded| {
-        // Typical lz4 ratios are 1.5–3x; over-reserving virtual memory is
-        // far cheaper than the realloc copies of geometric growth on
-        // multi-MB outputs (untouched pages are never committed).
-        decoded.reserve(data.len().saturating_mul(4).min(512 << 20));
+    let mut sink = crate::SinkRef(output);
+    crate::scratch_with(|buf| {
         let mut consumed = 0usize;
+        let mut total = 0usize;
         while consumed < data.len() {
-            let n = frame::decode_frame(&data[consumed..], decoded)?;
+            let (n, produced) = frame::decode_frame_streaming(&data[consumed..], buf, Some(&mut sink))?;
             if n == 0 {
                 break;
             }
+            sink.0.write_all(buf)?;
+            buf.clear();
             consumed += n;
+            total += produced;
         }
-        Ok(())
+        Ok(total)
     })
 }
 

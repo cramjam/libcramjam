@@ -40,9 +40,12 @@ pub fn deflate_decompress<W: Write + ?Sized, R: Read>(
 ) -> io::Result<usize> {
     let mut data = Vec::new();
     input.read_to_end(&mut data)?;
-    crate::with_scratch(output, |decompressed| {
-        decompressed.reserve(std::cmp::max(data.len().saturating_mul(4), 32768));
-        inflate::inflate_into(&data, decompressed).map(|_| ())
+    let mut sink = crate::SinkRef(output);
+    crate::scratch_with(|buf| {
+        let (_, produced) = inflate::inflate_streaming(&data, buf, Some(&mut sink), &mut |_| {})?;
+        sink.0.write_all(buf)?;
+        buf.clear();
+        Ok(produced)
     })
 }
 
@@ -111,8 +114,10 @@ pub fn gzip_decompress<W: Write + ?Sized, R: Read>(
     } else {
         data.len().saturating_mul(3)
     };
-    crate::with_scratch(output, |decompressed| {
-    decompressed.reserve(size_hint);
+    let _ = size_hint;
+    let mut sink = crate::SinkRef(output);
+    crate::scratch_with(|decompressed| {
+    let mut total = 0usize;
     let mut pos = 0;
 
     while pos < data.len() {
@@ -171,13 +176,17 @@ pub fn gzip_decompress<W: Write + ?Sized, R: Read>(
             return Err(io::Error::new(io::ErrorKind::InvalidData, "gzip: truncated header fields"));
         }
 
-        // Inflate, then CRC32 the result (separate pass — keeps inflate loop
-        // unperturbed for maximum throughput; data is still in L2 cache).
-        let out_start = decompressed.len();
-        let consumed = inflate::inflate_into(&data[hdr_end..], decompressed)?;
+        // Inflate with streaming flushes; the CRC32 is folded over each
+        // flushed chunk while it is still in cache, then over the tail.
+        let mut hasher = crc32fast::Hasher::new();
+        let (consumed, member_len) =
+            inflate::inflate_streaming(&data[hdr_end..], decompressed, Some(&mut sink), &mut |c| hasher.update(c))?;
         let data_end = hdr_end + consumed;
-        let member_len = decompressed.len() - out_start;
-        let actual_crc = crc32::crc32(&decompressed[out_start..]);
+        hasher.update(decompressed);
+        sink.0.write_all(decompressed)?;
+        decompressed.clear();
+        total += member_len;
+        let actual_crc = hasher.finalize();
 
         // Footer: CRC32 + ISIZE.
         if data_end + 8 > data.len() {
@@ -200,7 +209,7 @@ pub fn gzip_decompress<W: Write + ?Sized, R: Read>(
 
         pos = data_end + 8;
     }
-    Ok(())
+    Ok(total)
     })
 }
 
@@ -305,11 +314,16 @@ pub fn zlib_decompress<W: Write + ?Sized, R: Read>(
     }
 
     let hdr_size = ZLIB_HEADER_SIZE;
-    crate::with_scratch(output, |decompressed| {
-    decompressed.reserve(std::cmp::max(data.len().saturating_mul(4), 32768));
-    let consumed = inflate::inflate_into(&data[hdr_size..], decompressed)?;
+    let mut sink = crate::SinkRef(output);
+    crate::scratch_with(|decompressed| {
+    let mut adler = simd_adler32::Adler32::new();
+    let (consumed, produced) =
+        inflate::inflate_streaming(&data[hdr_size..], decompressed, Some(&mut sink), &mut |c| adler.write(c))?;
     let data_end = hdr_size + consumed;
-    let actual = adler32::adler32(&decompressed);
+    adler.write(decompressed);
+    sink.0.write_all(decompressed)?;
+    decompressed.clear();
+    let actual = adler.finish();
 
     if data_end + 4 > data.len() {
         return Err(io::Error::new(
@@ -324,7 +338,7 @@ pub fn zlib_decompress<W: Write + ?Sized, R: Read>(
             format!("zlib: adler-32 mismatch (expected {:08x}, got {:08x})", expected, actual),
         ));
     }
-    Ok(())
+    Ok(produced)
     })
 }
 

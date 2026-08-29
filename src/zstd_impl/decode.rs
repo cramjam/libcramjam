@@ -109,12 +109,34 @@ fn parse_frame_header(r: &mut ForwardByteReader) -> io::Result<FrameHeader> {
 
 /// Decode an entire zstd frame, appending decompressed data to `output`.
 /// Returns the number of input bytes consumed.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn decode_frame(data: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
+    decode_frame_streaming(data, output, None).map(|(consumed, _)| consumed)
+}
+
+/// Largest window for which the streaming mode compacts the buffer; above
+/// this the whole frame is buffered (the copy per flush would dominate).
+const STREAM_MAX_WINDOW: usize = 8 << 20;
+
+/// Decode one frame. Without a `sink`, everything is appended to `buf`.
+/// With a `sink`, `buf` is a scratch buffer: whenever it holds more than
+/// `window + chunk` bytes the prefix is written to the sink and the last
+/// `window` bytes are moved to the front, so the working set stays around
+/// three windows (L2/L3-resident for typical windows) instead of the whole
+/// output — like C zstd's streaming ring buffer. Returns
+/// `(input bytes consumed, output bytes produced)`; in streaming mode the
+/// tail of the frame is left in `buf` for the caller to flush.
+pub fn decode_frame_streaming(
+    data: &[u8],
+    buf: &mut Vec<u8>,
+    mut sink: Option<&mut dyn std::io::Write>,
+) -> io::Result<(usize, usize)> {
+    let output = buf;
     let mut r = ForwardByteReader::new(data);
     let header = match parse_frame_header(&mut r) {
         Err(e) if e.kind() == io::ErrorKind::Other => {
             // Skippable frame — return bytes consumed.
-            return Ok(r.position());
+            return Ok((r.position(), 0));
         }
         result => result?,
     };
@@ -126,9 +148,20 @@ pub fn decode_frame(data: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
         ));
     }
 
-    if let Some(cs) = header.content_size {
+    // Streaming: flush when the buffer exceeds `keep + chunk`, keeping the
+    // last `keep` (= window) bytes. `chunk = 2 * keep` bounds the compaction
+    // copy at a third of the bytes flushed.
+    let keep = header.window_size as usize;
+    let streaming = sink.is_some() && keep <= STREAM_MAX_WINDOW;
+    let chunk = (2 * keep).max(1 << 20);
+    if streaming {
+        output.clear();
+        output.reserve(keep + chunk + ZSTD_BLOCKSIZE_MAX + 32);
+    } else if let Some(cs) = header.content_size {
         output.reserve(cs as usize);
     }
+    let mut hasher = if header.content_checksum && streaming { Some(Xxh64::new()) } else { None };
+    let mut flushed_total: usize = 0;
 
     let out_start = output.len();
 
@@ -193,12 +226,29 @@ pub fn decode_frame(data: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
         if last_block {
             break;
         }
+
+        if streaming && output.len() > keep + chunk {
+            let flush_len = output.len() - keep;
+            if let Some(h) = hasher.as_mut() {
+                h.update(&output[..flush_len]);
+            }
+            sink.as_mut().unwrap().write_all(&output[..flush_len])?;
+            flushed_total += flush_len;
+            output.copy_within(flush_len.., 0);
+            output.truncate(keep);
+        }
     }
 
     // Content checksum (xxhash64, lower 32 bits).
     if header.content_checksum {
         let expected = r.read_u32_le()?;
-        let actual = xxhash(&output[out_start..]);
+        let actual = match hasher.as_mut() {
+            Some(h) => {
+                h.update(&output[..]);
+                h.finish() as u32
+            }
+            None => xxhash64(&output[out_start..], 0) as u32,
+        };
         if actual != expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -207,10 +257,10 @@ pub fn decode_frame(data: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
         }
     }
 
+    let produced = if streaming { flushed_total + output.len() } else { output.len() - out_start };
     // Verify content size if declared.
     if let Some(cs) = header.content_size {
-        let produced = (output.len() - out_start) as u64;
-        if produced != cs {
+        if produced as u64 != cs {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("zstd: content size mismatch (header={}, produced={})", cs, produced),
@@ -218,7 +268,7 @@ pub fn decode_frame(data: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
         }
     }
 
-    Ok(r.position())
+    Ok((r.position(), produced))
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,8 +1051,101 @@ fn seq_validation_error(
 // XXHash64 (lower 32 bits) for content checksum
 // ---------------------------------------------------------------------------
 
-fn xxhash(data: &[u8]) -> u32 {
-    xxhash64_public(data, 0) as u32
+/// Incremental XXH64 (seed 0) for the frame content checksum when the
+/// output is flushed to the sink before the frame ends.
+struct Xxh64 {
+    v: [u64; 4],
+    buf: [u8; 32],
+    buf_len: usize,
+    total: u64,
+}
+
+impl Xxh64 {
+    const P1: u64 = 0x9E3779B185EBCA87;
+    const P2: u64 = 0xC2B2AE3D27D4EB4F;
+    const P3: u64 = 0x165667B19E3779F9;
+    const P4: u64 = 0x85EBCA77C2B2AE63;
+    const P5: u64 = 0x27D4EB2F165667C5;
+
+    fn new() -> Self {
+        Self {
+            v: [Self::P1.wrapping_add(Self::P2), Self::P2, 0, 0u64.wrapping_sub(Self::P1)],
+            buf: [0; 32],
+            buf_len: 0,
+            total: 0,
+        }
+    }
+
+    fn stripe(&mut self, b: &[u8]) {
+        for k in 0..4 {
+            self.v[k] = xxh64_round(self.v[k], read_u64_le(b, k * 8));
+        }
+    }
+
+    fn update(&mut self, mut data: &[u8]) {
+        self.total += data.len() as u64;
+        if self.buf_len > 0 {
+            let take = (32 - self.buf_len).min(data.len());
+            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
+            self.buf_len += take;
+            data = &data[take..];
+            if self.buf_len < 32 {
+                return;
+            }
+            let b = self.buf;
+            self.stripe(&b);
+            self.buf_len = 0;
+        }
+        let mut i = 0;
+        while i + 32 <= data.len() {
+            self.stripe(&data[i..i + 32]);
+            i += 32;
+        }
+        let rest = data.len() - i;
+        self.buf[..rest].copy_from_slice(&data[i..]);
+        self.buf_len = rest;
+    }
+
+    fn finish(&self) -> u64 {
+        let mut h = if self.total >= 32 {
+            let [v1, v2, v3, v4] = self.v;
+            let mut h = v1.rotate_left(1)
+                .wrapping_add(v2.rotate_left(7))
+                .wrapping_add(v3.rotate_left(12))
+                .wrapping_add(v4.rotate_left(18));
+            h = xxh64_merge(h, v1);
+            h = xxh64_merge(h, v2);
+            h = xxh64_merge(h, v3);
+            xxh64_merge(h, v4)
+        } else {
+            Self::P5
+        };
+        h = h.wrapping_add(self.total);
+        let data = &self.buf[..self.buf_len];
+        let mut i = 0;
+        while i + 8 <= data.len() {
+            h ^= xxh64_round(0, read_u64_le(data, i));
+            h = h.rotate_left(27).wrapping_mul(Self::P1).wrapping_add(Self::P4);
+            i += 8;
+        }
+        while i + 4 <= data.len() {
+            let k = u32::from_le_bytes(data[i..i + 4].try_into().unwrap()) as u64;
+            h ^= k.wrapping_mul(Self::P1);
+            h = h.rotate_left(23).wrapping_mul(Self::P2).wrapping_add(Self::P3);
+            i += 4;
+        }
+        while i < data.len() {
+            h ^= (data[i] as u64).wrapping_mul(Self::P5);
+            h = h.rotate_left(11).wrapping_mul(Self::P1);
+            i += 1;
+        }
+        h ^= h >> 33;
+        h = h.wrapping_mul(Self::P2);
+        h ^= h >> 29;
+        h = h.wrapping_mul(Self::P3);
+        h ^= h >> 32;
+        h
+    }
 }
 
 /// XXHash64 — public for use by the encoder checksum.

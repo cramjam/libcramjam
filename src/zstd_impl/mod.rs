@@ -24,16 +24,23 @@ pub fn decompress<W: Write + ?Sized, R: Read>(
     let mut data = Vec::new();
     input.read_to_end(&mut data)?;
 
-    crate::with_scratch(output, |decoded| {
+    let mut sink = crate::SinkRef(output);
+    crate::scratch_with(|buf| {
         let mut consumed = 0usize;
+        let mut total = 0usize;
         while consumed < data.len() {
-            let n = decode::decode_frame(&data[consumed..], decoded)?;
+            let (n, produced) = decode::decode_frame_streaming(&data[consumed..], buf, Some(&mut sink))?;
             if n == 0 {
                 break;
             }
+            // Flush what the frame left in the scratch (streaming mode) or
+            // the whole frame (buffered mode: large windows / no sink).
+            sink.0.write_all(buf)?;
+            buf.clear();
             consumed += n;
+            total += produced;
         }
-        Ok(())
+        Ok(total)
     })
 }
 

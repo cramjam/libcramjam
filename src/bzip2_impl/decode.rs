@@ -31,19 +31,36 @@ const HUFFMAN_GROUP_SIZE: usize = 50;
 /// Decode an entire bzip2 stream (one or more concatenated frames) into
 /// `output`, returning the total number of input bytes consumed.
 pub fn decode_stream(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
+    decode_stream_streaming(input, output, None).map(|(n, _)| n)
+}
+
+/// [`decode_stream`] with optional streaming output: with a sink, every
+/// finished block is written out immediately (blocks are independent, so
+/// nothing needs to be kept). Returns `(input consumed, output produced)`.
+pub fn decode_stream_streaming(
+    input: &[u8],
+    output: &mut Vec<u8>,
+    mut sink: Option<&mut dyn io::Write>,
+) -> io::Result<(usize, usize)> {
     let mut consumed = 0usize;
+    let mut produced = 0usize;
     while consumed < input.len() {
-        match decode_one_frame(&input[consumed..], output)? {
+        match decode_one_frame(&input[consumed..], output, &mut sink, &mut produced)? {
             0 => break,
             n => consumed += n,
         }
     }
-    Ok(consumed)
+    Ok((consumed, produced))
 }
 
 /// Decode exactly ONE bzip2 frame (`BZh*` header through end-of-stream
 /// marker).  Returns the number of input bytes consumed.
-fn decode_one_frame(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
+fn decode_one_frame(
+    input: &[u8],
+    output: &mut Vec<u8>,
+    sink: &mut Option<&mut dyn io::Write>,
+    produced: &mut usize,
+) -> io::Result<usize> {
     if input.len() < 4 {
         return Ok(0);
     }
@@ -350,6 +367,11 @@ fn decode_one_frame(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
         }
         // Combined CRC: rotate left by 1 and XOR (per the spec).
         combined_crc = combined_crc.rotate_left(1) ^ stored_block_crc;
+        *produced += output.len() - block_start;
+        if let Some(sink) = sink.as_mut() {
+            sink.write_all(&output[block_start..])?;
+            output.truncate(block_start);
+        }
     }
 }
 
