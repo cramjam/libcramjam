@@ -368,6 +368,7 @@ fn decode_weights_fse(data: &[u8]) -> io::Result<Vec<u8>> {
 /// Decode 1-stream Huffman literals into a caller-provided buffer of
 /// exactly the regenerated size. Uses the bulk `decode_symbols_into` path
 /// which batches 5 symbols per bit-reader refill check.
+#[inline(never)]
 pub fn decode_literals_1stream_into(
     table: &HufTable,
     data: &[u8],
@@ -387,6 +388,7 @@ pub fn decode_literals_1stream_into(
 /// table-load → shift → store dependency chains that serialize within a
 /// single stream. A sequential 4-stream walk would only reach ~25% of the
 /// interleaved throughput on modern OOO cores.
+#[inline(never)]
 pub fn decode_literals_4stream_into(
     table: &HufTable,
     data: &[u8],

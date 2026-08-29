@@ -228,17 +228,6 @@ impl FseTable {
         entry.baseline as u32 + low_bits
     }
 
-    /// Raw table entry at a state — for callers that want to interleave
-    /// FSE table loads across multiple tables before serializing through
-    /// the shared bit reader.
-    ///
-    /// # Safety invariant
-    /// `state < table.len()` (same as [`symbol`]).
-    #[inline(always)]
-    pub fn entry_at(&self, state: u32) -> FseEntry {
-        debug_assert!((state as usize) < self.table.len());
-        unsafe { *self.table.get_unchecked(state as usize) }
-    }
 }
 
 /// Build an FSE table from a single repeated symbol (RLE mode).
@@ -324,6 +313,85 @@ pub const MATCHLEN_TABLE: [(u32, u8); 53] = [
     (67, 4), (83, 4), (99, 5), (131, 7), (259, 8), (515, 9), (1027, 10), (2051, 11),
     (4099, 12), (8195, 13), (16387, 14), (32771, 15), (65539, 16),
 ];
+
+
+// ---------------------------------------------------------------------------
+// Fused sequence-decoding tables (C zstd's `ZSTD_seqSymbol`)
+// ---------------------------------------------------------------------------
+
+/// One entry of a sequence-decoding FSE table with the symbol's value
+/// decoding pre-baked: `base_value` + `nb_additional` extra bits give the
+/// literal length / match length / offset directly, and `next_state` +
+/// `nb_bits` advance the FSE state. One 8-byte load per symbol instead of a
+/// state→symbol→(base, extra) dependent chain.
+#[derive(Clone, Copy, Default, Debug)]
+#[repr(C)]
+pub struct SeqEntry {
+    pub next_state: u16,
+    pub nb_additional: u8,
+    pub nb_bits: u8,
+    pub base_value: u32,
+}
+
+pub struct SeqTable {
+    pub table: Vec<SeqEntry>,
+    pub accuracy_log: u32,
+}
+
+#[derive(Clone, Copy)]
+pub enum SeqKind {
+    LitLen,
+    MatchLen,
+    Offset,
+}
+
+impl SeqTable {
+    pub fn from_fse(t: &FseTable, kind: SeqKind) -> Self {
+        let table = t
+            .table
+            .iter()
+            .map(|e| {
+                let code = e.symbol as usize;
+                let (base_value, nb_additional) = match kind {
+                    SeqKind::LitLen => LITLEN_TABLE[code],
+                    SeqKind::MatchLen => MATCHLEN_TABLE[code],
+                    // Offset codes: value = (1 << code) + extra - 3 for real
+                    // offsets (code >= 2); codes 0/1 select repeat offsets
+                    // and carry base 0/1 (see `decode_one_sequence`).
+                    SeqKind::Offset => (
+                        if code >= 2 { (1u32 << code) - 3 } else { code as u32 },
+                        code as u8,
+                    ),
+                };
+                SeqEntry {
+                    next_state: e.baseline,
+                    nb_additional,
+                    nb_bits: e.num_bits,
+                    base_value,
+                }
+            })
+            .collect();
+        Self { table, accuracy_log: t.accuracy_log }
+    }
+
+    pub fn rle(symbol: u8, kind: SeqKind) -> Self {
+        Self::from_fse(&fse_rle_table(symbol), kind)
+    }
+
+
+    pub fn predefined(kind: SeqKind) -> Self {
+        use std::sync::OnceLock;
+        static LL: OnceLock<SeqTable> = OnceLock::new();
+        static ML: OnceLock<SeqTable> = OnceLock::new();
+        static OF: OnceLock<SeqTable> = OnceLock::new();
+        let t = match kind {
+            SeqKind::LitLen => LL.get_or_init(|| Self::from_fse(&predefined_litlen_table(), kind)),
+            SeqKind::MatchLen => ML.get_or_init(|| Self::from_fse(&predefined_matchlen_table(), kind)),
+            SeqKind::Offset => OF.get_or_init(|| Self::from_fse(&predefined_offset_table(), kind)),
+        };
+        Self { table: t.table.clone(), accuracy_log: t.accuracy_log }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // FSE encoder side

@@ -48,6 +48,27 @@ pub fn has_avx2() -> bool {
     }
 }
 
+/// `true` if the host supports BMI2 (`shlx`/`shrx`/`bzhi`). Cached like
+/// [`has_avx2`]. Returns `false` on non-x86_64 targets.
+#[inline(always)]
+pub fn has_bmi2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static CACHE: AtomicU32 = AtomicU32::new(u32::MAX);
+        let cached = CACHE.load(Ordering::Relaxed);
+        if cached != u32::MAX {
+            return cached != 0;
+        }
+        let detected = std::is_x86_feature_detected!("bmi2");
+        CACHE.store(detected as u32, Ordering::Relaxed);
+        detected
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 /// `true` if the host supports 128-bit SIMD (SSE2 on x86_64 is baseline, NEON
 /// on aarch64 is baseline for most targets). This is effectively a compile-
 /// time query except on aarch64 without `target_feature = "neon"`.
