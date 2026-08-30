@@ -400,7 +400,7 @@ pub fn compress_block(input: &[u8], output: &mut Vec<u8>) -> usize {
 ///
 /// SAFETY: caller must guarantee `pos + 4 <= buf.len()`.
 #[inline(always)]
-unsafe fn read_u32(buf: &[u8], pos: usize) -> u32 {
+pub(super) unsafe fn read_u32(buf: &[u8], pos: usize) -> u32 {
     debug_assert!(pos + 4 <= buf.len());
     std::ptr::read_unaligned(buf.as_ptr().add(pos) as *const u32).to_le()
 }
@@ -410,7 +410,7 @@ unsafe fn read_u32(buf: &[u8], pos: usize) -> u32 {
 ///
 /// SAFETY: caller must guarantee `pos + 8 <= buf.len()`.
 #[inline(always)]
-unsafe fn read_u64(buf: &[u8], pos: usize) -> u64 {
+pub(super) unsafe fn read_u64(buf: &[u8], pos: usize) -> u64 {
     debug_assert!(pos + 8 <= buf.len());
     std::ptr::read_unaligned(buf.as_ptr().add(pos) as *const u64).to_le()
 }
@@ -419,7 +419,7 @@ unsafe fn read_u64(buf: &[u8], pos: usize) -> u64 {
 /// are equal, stopping at `limit` (exclusive bound on `is`).  Reads 8 bytes
 /// at a time and finds the first differing byte via XOR + trailing-zero.
 #[inline(always)]
-fn count_match(input: &[u8], mut ms: usize, mut is: usize, limit: usize) -> usize {
+pub(super) fn count_match(input: &[u8], mut ms: usize, mut is: usize, limit: usize) -> usize {
     let start = is;
     while is + 8 <= limit {
         let diff = unsafe { read_u64(input, ms) ^ read_u64(input, is) };
@@ -439,7 +439,7 @@ fn count_match(input: &[u8], mut ms: usize, mut is: usize, limit: usize) -> usiz
 
 /// Emit a "literal-only" sequence (no match) — used for the trailing data and
 /// for inputs too small to compress.
-fn emit_literal_only(output: &mut Vec<u8>, literals: &[u8]) {
+pub(super) fn emit_literal_only(output: &mut Vec<u8>, literals: &[u8]) {
     let lit_len = literals.len();
     let token_lit_part: u8 = if lit_len < 15 { lit_len as u8 } else { 15 };
     output.push(token_lit_part << 4);
@@ -455,7 +455,7 @@ fn emit_literal_only(output: &mut Vec<u8>, literals: &[u8]) {
 }
 
 /// Emit a full sequence: literal run + match.
-fn emit_sequence(output: &mut Vec<u8>, literals: &[u8], lit_len: usize, offset: u16, match_len: usize) {
+pub(super) fn emit_sequence(output: &mut Vec<u8>, literals: &[u8], lit_len: usize, offset: u16, match_len: usize) {
     let ml_code = match_len - MIN_MATCH;
 
     // Token byte: high nibble = lit length code, low nibble = match length code.
@@ -518,198 +518,12 @@ unsafe fn hash4_lz4_at(input: &[u8], pos: usize) -> usize {
 // longer of the two matches — this is the single biggest ratio improvement
 // over a strict greedy parser.
 
-const HC_HASH_BITS: usize = 15;
-const HC_HASH_SIZE: usize = 1 << HC_HASH_BITS;
-const HC_HASH_MASK: usize = HC_HASH_SIZE - 1;
-const HC_WINDOW_SIZE: usize = 1 << 16; // 64 KiB == MAX_OFFSET + 1
-const HC_WINDOW_MASK: usize = HC_WINDOW_SIZE - 1;
-
-/// Per-level chain-walk depth.  Numbers track lz4hc.c's `LZ4HC_clTable`.
-#[inline]
-fn hc_chain_depth(level: u32) -> usize {
-    match level {
-        0..=3 => 4,
-        4 => 8,
-        5 => 16,
-        6 => 32,
-        7 => 64,
-        8 => 128,
-        9 => 256,
-        10 => 512,
-        11 => 1024,
-        _ => HC_HASH_SIZE, // level 12+
-    }
-}
-
-#[inline(always)]
-unsafe fn hc_hash4_at(input: &[u8], pos: usize) -> usize {
-    let v = read_u32(input, pos);
-    (v.wrapping_mul(2654435761) >> (32 - HC_HASH_BITS)) as usize & HC_HASH_MASK
-}
-
-struct HcMatchFinder {
-    head: Vec<u32>,
-    chain: Vec<u32>,
-}
-
-impl HcMatchFinder {
-    fn new() -> Self {
-        Self {
-            head: vec![NONE; HC_HASH_SIZE],
-            chain: vec![NONE; HC_WINDOW_SIZE],
-        }
-    }
-
-    /// Record `pos` as the most recent position with its hash, linking
-    /// the previous most-recent into its chain slot.
-    #[inline(always)]
-    fn insert(&mut self, input: &[u8], pos: usize, matchlimit: usize) {
-        if pos + MIN_MATCH > matchlimit {
-            return;
-        }
-        let h = unsafe { hc_hash4_at(input, pos) };
-        let prev = self.head[h];
-        self.head[h] = pos as u32;
-        self.chain[pos & HC_WINDOW_MASK] = prev;
-    }
-
-    /// Walk the chain at `pos` (up to `max_chain` candidates) and return the
-    /// best `(match_pos, match_len)` whose length is ≥ MIN_MATCH, or None.
-    fn find_longest(
-        &self,
-        input: &[u8],
-        pos: usize,
-        max_chain: usize,
-        matchlimit: usize,
-    ) -> Option<(usize, usize)> {
-        if pos + MIN_MATCH > matchlimit {
-            return None;
-        }
-        let h = unsafe { hc_hash4_at(input, pos) };
-        let mut cand = self.head[h];
-        let mut best_len = 0usize;
-        let mut best_pos = 0usize;
-        let mut tried = 0usize;
-        let min_pos = pos.saturating_sub(MAX_OFFSET);
-
-        while cand != NONE && tried < max_chain {
-            let mp = cand as usize;
-            if mp < min_pos || mp >= pos {
-                // Out of window or stale chain entry pointing forward.
-                break;
-            }
-            // Cheap 32-bit prefix probe before walking the full match.
-            if unsafe { read_u32(input, mp) == read_u32(input, pos) } {
-                let len = MIN_MATCH
-                    + count_match(input, mp + MIN_MATCH, pos + MIN_MATCH, matchlimit);
-                if len > best_len {
-                    best_len = len;
-                    best_pos = mp;
-                    // Long enough to stop early — extending further is rare
-                    // payoff per cycle.
-                    if len >= 256 {
-                        break;
-                    }
-                }
-            }
-            cand = self.chain[mp & HC_WINDOW_MASK];
-            tried += 1;
-        }
-
-        if best_len >= MIN_MATCH {
-            Some((best_pos, best_len))
-        } else {
-            None
-        }
-    }
-}
-
-/// HC compress one block.  `level` selects the chain-walk depth (see
-/// `hc_chain_depth`).  Levels < 3 are routed to `compress_block` instead;
-/// levels > 12 are clamped to the deepest search.
+/// HC compress one block (levels 3..=12, clamped) with a fresh context —
+/// the single-block API. Frames reuse one [`super::hc::HcCtx`] across
+/// blocks so later blocks can match into the previous 64 KiB.
 pub fn compress_block_hc(input: &[u8], output: &mut Vec<u8>, level: u32) -> usize {
-    let start_out = output.len();
-    let len = input.len();
-    output.reserve(compress_bound(len));
-
-    if len < MFLIMIT + MIN_MATCH {
-        emit_literal_only(output, input);
-        return output.len() - start_out;
-    }
-
-    let mflimit = len - MFLIMIT;
-    let matchlimit = len - LAST_LITERALS;
-    let max_chain = hc_chain_depth(level);
-    let lazy = level >= 4;
-
-    let mut mf = HcMatchFinder::new();
-    let mut anchor = 0usize;
-    let mut ip = 0usize;
-
-    while ip < mflimit {
-        // ----- Find longest match at ip -----
-        let m0 = mf.find_longest(input, ip, max_chain, matchlimit);
-        mf.insert(input, ip, matchlimit);
-
-        let (mut match_ip, mut match_pos, mut match_len) = match m0 {
-            Some((mp, ml)) => (ip, mp, ml),
-            None => {
-                ip += 1;
-                continue;
-            }
-        };
-
-        // ----- Lazy step: see if (ip+1) gives a longer match -----
-        if lazy && match_ip + 1 < mflimit {
-            let m1 = mf.find_longest(input, match_ip + 1, max_chain, matchlimit);
-            // Insert ip+1 either way so its hash is recorded.
-            mf.insert(input, match_ip + 1, matchlimit);
-            if let Some((mp1, ml1)) = m1 {
-                // Per lz4hc.c: the lazy match wins only if it's strictly longer.
-                if ml1 > match_len {
-                    match_ip += 1;
-                    match_pos = mp1;
-                    match_len = ml1;
-                }
-            }
-        }
-
-        // ----- Walk back into the literal run -----
-        let mut start_ip = match_ip;
-        let mut start_mp = match_pos;
-        while start_ip > anchor
-            && start_mp > 0
-            && unsafe { *input.get_unchecked(start_mp - 1) == *input.get_unchecked(start_ip - 1) }
-        {
-            start_ip -= 1;
-            start_mp -= 1;
-            match_len += 1;
-        }
-        let dist = start_ip - start_mp;
-        let lit_len = start_ip - anchor;
-
-        emit_sequence(output, &input[anchor..start_ip], lit_len, dist as u16, match_len);
-
-        // ----- Insert every covered position so future searches see them -----
-        // The match occupies bytes [start_ip, start_ip + match_len) — note
-        // that match_len has been bumped by the walk-back, so the end of
-        // the match is start_ip + match_len, NOT match_ip + match_len.
-        let new_ip = start_ip + match_len;
-        let mut p = start_ip + 1;
-        while p < new_ip && p + MIN_MATCH <= matchlimit {
-            mf.insert(input, p, matchlimit);
-            p += 1;
-        }
-
-        ip = new_ip;
-        anchor = ip;
-    }
-
-    if anchor < len {
-        emit_literal_only(output, &input[anchor..]);
-    }
-
-    output.len() - start_out
+    let mut ctx = super::hc::HcCtx::new();
+    super::hc::compress_block_hc_continue(&mut ctx, input, 0, input.len(), output, level)
 }
 
 #[cfg(test)]

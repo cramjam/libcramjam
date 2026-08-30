@@ -57,7 +57,11 @@ pub fn encode_frame_at(input: &[u8], level: Option<u32>) -> Vec<u8> {
     // Frame Descriptor.  We always emit:
     //   FLG: version=01, block_independence=1, no other flags
     //   BD : block_max_size = 4 (64 KiB)
-    let flg: u8 = FLG_VERSION_BITS | FLG_BLOCK_INDEPENDENCE;
+    // HC frames use *linked* blocks (each block may reference the previous
+    // 64 KiB), like the C reference encoder's default; the fast parser
+    // still compresses blocks independently.
+    let use_hc = matches!(level, Some(l) if l >= 3);
+    let flg: u8 = if use_hc { FLG_VERSION_BITS } else { FLG_VERSION_BITS | FLG_BLOCK_INDEPENDENCE };
     let bd: u8 = DEFAULT_BLOCK_SIZE_CODE << 4;
     out.push(flg);
     out.push(bd);
@@ -65,19 +69,20 @@ pub fn encode_frame_at(input: &[u8], level: Option<u32>) -> Vec<u8> {
     let hc = xxhash32(&out[4..6], 0);
     out.push(((hc >> 8) & 0xFF) as u8);
 
-    let use_hc = matches!(level, Some(l) if l >= 3);
     let hc_level = level.unwrap_or(0);
+    let mut hc_ctx = if use_hc { Some(super::hc::HcCtx::new()) } else { None };
 
     // Blocks.
     let mut pos = 0;
+    let mut compressed = Vec::with_capacity(block::compress_bound(DEFAULT_BLOCK_SIZE));
     while pos < input.len() {
         let chunk_end = (pos + DEFAULT_BLOCK_SIZE).min(input.len());
         let chunk = &input[pos..chunk_end];
 
         // Compress the block; if the compressed payload >= raw size, emit raw.
-        let mut compressed = Vec::with_capacity(block::compress_bound(chunk.len()));
-        if use_hc {
-            block::compress_block_hc(chunk, &mut compressed, hc_level);
+        compressed.clear();
+        if let Some(ctx) = hc_ctx.as_mut() {
+            super::hc::compress_block_hc_continue(ctx, input, pos, chunk_end, &mut compressed, hc_level);
         } else {
             block::compress_block(chunk, &mut compressed);
         }
