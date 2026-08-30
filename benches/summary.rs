@@ -29,17 +29,26 @@ fn median(times: &mut [Duration]) -> Duration {
     times[times.len() / 2]
 }
 
-fn bench_fn<F: FnMut()>(mut f: F) -> Duration {
+/// Time `ours` and `theirs` interleaved (ours, theirs, ours, theirs, ...)
+/// so both see the same CPU frequency / thermal / cache state; timing
+/// them in separate blocks biases the ratio by up to 10% on this class of
+/// machine. Returns (median ours, median theirs).
+fn bench_pair<F: FnMut(), G: FnMut()>(mut ours: F, mut theirs: G) -> (Duration, Duration) {
     for _ in 0..WARMUP {
-        f();
+        ours();
+        theirs();
     }
-    let mut times = Vec::with_capacity(ITERS);
+    let mut a = Vec::with_capacity(ITERS);
+    let mut b = Vec::with_capacity(ITERS);
     for _ in 0..ITERS {
         let t0 = Instant::now();
-        f();
-        times.push(t0.elapsed());
+        ours();
+        a.push(t0.elapsed());
+        let t0 = Instant::now();
+        theirs();
+        b.push(t0.elapsed());
     }
-    median(&mut times)
+    (median(&mut a), median(&mut b))
 }
 
 // ---------------------------------------------------------------------------
@@ -442,13 +451,11 @@ fn main() {
     // --- Deflate ---
     for &level in &[1u32, 6, 9] {
         eprint!("  deflate L{level}...");
-        let ours_c = bench_fn(|| { for (_, d) in &corpus { let _ = ours_deflate_compress(d, level); } });
+        let (ours_c, c_c) = bench_pair(|| { for (_, d) in &corpus { let _ = ours_deflate_compress(d, level); } }, || { for (_, d) in &corpus { let _ = c_deflate_compress(d, level); } });
         let compressed: Vec<Vec<u8>> = corpus.iter().map(|(_, d)| ours_deflate_compress(d, level)).collect();
-        let ours_d = bench_fn(|| { for c in &compressed { let _ = ours_deflate_decompress(c); } });
-        let ours_size: usize = compressed.iter().map(|c| c.len()).sum();
-        let c_c = bench_fn(|| { for (_, d) in &corpus { let _ = c_deflate_compress(d, level); } });
         let c_compressed: Vec<Vec<u8>> = corpus.iter().map(|(_, d)| c_deflate_compress(d, level)).collect();
-        let c_d = bench_fn(|| { for c in &c_compressed { let _ = c_deflate_decompress(c); } });
+        let (ours_d, c_d) = bench_pair(|| { for c in &compressed { let _ = ours_deflate_decompress(c); } }, || { for c in &c_compressed { let _ = c_deflate_decompress(c); } });
+        let ours_size: usize = compressed.iter().map(|c| c.len()).sum();
         let c_size: usize = c_compressed.iter().map(|c| c.len()).sum();
         eprintln!(" done");
         rows.push(Row {
@@ -461,13 +468,11 @@ fn main() {
     // --- Gzip ---
     for &level in &[1u32, 6, 9] {
         eprint!("  gzip L{level}...");
-        let ours_c = bench_fn(|| { for (_, d) in &corpus { let _ = ours_gzip_compress(d, level); } });
+        let (ours_c, c_c) = bench_pair(|| { for (_, d) in &corpus { let _ = ours_gzip_compress(d, level); } }, || { for (_, d) in &corpus { let _ = c_gzip_compress(d, level); } });
         let compressed: Vec<Vec<u8>> = corpus.iter().map(|(_, d)| ours_gzip_compress(d, level)).collect();
-        let ours_d = bench_fn(|| { for c in &compressed { let _ = ours_gzip_decompress(c); } });
-        let ours_size: usize = compressed.iter().map(|c| c.len()).sum();
-        let c_c = bench_fn(|| { for (_, d) in &corpus { let _ = c_gzip_compress(d, level); } });
         let c_compressed: Vec<Vec<u8>> = corpus.iter().map(|(_, d)| c_gzip_compress(d, level)).collect();
-        let c_d = bench_fn(|| { for c in &c_compressed { let _ = c_gzip_decompress(c); } });
+        let (ours_d, c_d) = bench_pair(|| { for c in &compressed { let _ = ours_gzip_decompress(c); } }, || { for c in &c_compressed { let _ = c_gzip_decompress(c); } });
+        let ours_size: usize = compressed.iter().map(|c| c.len()).sum();
         let c_size: usize = c_compressed.iter().map(|c| c.len()).sum();
         eprintln!(" done");
         rows.push(Row {
@@ -480,13 +485,11 @@ fn main() {
     // --- Zstd ---
     for &level in &[1i32, 3, 6, 9] {
         eprint!("  zstd L{level}...");
-        let ours_c = bench_fn(|| { for (_, d) in &corpus { let _ = ours_zstd_compress(d, level); } });
+        let (ours_c, c_c) = bench_pair(|| { for (_, d) in &corpus { let _ = ours_zstd_compress(d, level); } }, || { for (_, d) in &corpus { let _ = c_zstd_compress(d, level); } });
         let compressed: Vec<Vec<u8>> = corpus.iter().map(|(_, d)| ours_zstd_compress(d, level)).collect();
-        let ours_d = bench_fn(|| { for c in &compressed { let _ = ours_zstd_decompress(c); } });
-        let ours_size: usize = compressed.iter().map(|c| c.len()).sum();
-        let c_c = bench_fn(|| { for (_, d) in &corpus { let _ = c_zstd_compress(d, level); } });
         let c_compressed: Vec<Vec<u8>> = corpus.iter().map(|(_, d)| c_zstd_compress(d, level)).collect();
-        let c_d = bench_fn(|| { for c in &c_compressed { let _ = c_zstd_decompress(c); } });
+        let (ours_d, c_d) = bench_pair(|| { for c in &compressed { let _ = ours_zstd_decompress(c); } }, || { for c in &c_compressed { let _ = c_zstd_decompress(c); } });
+        let ours_size: usize = compressed.iter().map(|c| c.len()).sum();
         let c_size: usize = c_compressed.iter().map(|c| c.len()).sum();
         eprintln!(" done");
         rows.push(Row {
@@ -499,13 +502,11 @@ fn main() {
     // --- LZ4 ---
     for &level in &[1u32, 4, 9] {
         eprint!("  lz4 L{level}...");
-        let ours_c = bench_fn(|| { for (_, d) in &corpus { let _ = ours_lz4_compress(d, level); } });
+        let (ours_c, c_c) = bench_pair(|| { for (_, d) in &corpus { let _ = ours_lz4_compress(d, level); } }, || { for (_, d) in &corpus { let _ = c_lz4_compress(d, level); } });
         let compressed: Vec<Vec<u8>> = corpus.iter().map(|(_, d)| ours_lz4_compress(d, level)).collect();
-        let ours_d = bench_fn(|| { for c in &compressed { let _ = ours_lz4_decompress(c); } });
-        let ours_size: usize = compressed.iter().map(|c| c.len()).sum();
-        let c_c = bench_fn(|| { for (_, d) in &corpus { let _ = c_lz4_compress(d, level); } });
         let c_compressed: Vec<Vec<u8>> = corpus.iter().map(|(_, d)| c_lz4_compress(d, level)).collect();
-        let c_d = bench_fn(|| { for c in &c_compressed { let _ = c_lz4_decompress(c); } });
+        let (ours_d, c_d) = bench_pair(|| { for c in &compressed { let _ = ours_lz4_decompress(c); } }, || { for c in &c_compressed { let _ = c_lz4_decompress(c); } });
+        let ours_size: usize = compressed.iter().map(|c| c.len()).sum();
         let c_size: usize = c_compressed.iter().map(|c| c.len()).sum();
         eprintln!(" done");
         rows.push(Row {
@@ -518,13 +519,11 @@ fn main() {
     // --- Bzip2 ---
     for &level in &[1u32, 6, 9] {
         eprint!("  bzip2 L{level}...");
-        let ours_c = bench_fn(|| { for (_, d) in &corpus { let _ = ours_bzip2_compress(d, level); } });
+        let (ours_c, c_c) = bench_pair(|| { for (_, d) in &corpus { let _ = ours_bzip2_compress(d, level); } }, || { for (_, d) in &corpus { let _ = c_bzip2_compress(d, level); } });
         let compressed: Vec<Vec<u8>> = corpus.iter().map(|(_, d)| ours_bzip2_compress(d, level)).collect();
-        let ours_d = bench_fn(|| { for c in &compressed { let _ = ours_bzip2_decompress(c); } });
-        let ours_size: usize = compressed.iter().map(|c| c.len()).sum();
-        let c_c = bench_fn(|| { for (_, d) in &corpus { let _ = c_bzip2_compress(d, level); } });
         let c_compressed: Vec<Vec<u8>> = corpus.iter().map(|(_, d)| c_bzip2_compress(d, level)).collect();
-        let c_d = bench_fn(|| { for c in &c_compressed { let _ = c_bzip2_decompress(c); } });
+        let (ours_d, c_d) = bench_pair(|| { for c in &compressed { let _ = ours_bzip2_decompress(c); } }, || { for c in &c_compressed { let _ = c_bzip2_decompress(c); } });
+        let ours_size: usize = compressed.iter().map(|c| c.len()).sum();
         let c_size: usize = c_compressed.iter().map(|c| c.len()).sum();
         eprintln!(" done");
         rows.push(Row {
@@ -537,13 +536,11 @@ fn main() {
     // --- XZ ---
     for &level in &[1u32, 6] {
         eprint!("  xz L{level}...");
-        let ours_c = bench_fn(|| { for (_, d) in &corpus { let _ = ours_xz_compress(d, level); } });
+        let (ours_c, c_c) = bench_pair(|| { for (_, d) in &corpus { let _ = ours_xz_compress(d, level); } }, || { for (_, d) in &corpus { let _ = c_xz_compress(d, level); } });
         let compressed: Vec<Vec<u8>> = corpus.iter().map(|(_, d)| ours_xz_compress(d, level)).collect();
-        let ours_d = bench_fn(|| { for c in &compressed { let _ = ours_xz_decompress(c); } });
-        let ours_size: usize = compressed.iter().map(|c| c.len()).sum();
-        let c_c = bench_fn(|| { for (_, d) in &corpus { let _ = c_xz_compress(d, level); } });
         let c_compressed: Vec<Vec<u8>> = corpus.iter().map(|(_, d)| c_xz_compress(d, level)).collect();
-        let c_d = bench_fn(|| { for c in &c_compressed { let _ = c_xz_decompress(c); } });
+        let (ours_d, c_d) = bench_pair(|| { for c in &compressed { let _ = ours_xz_decompress(c); } }, || { for c in &c_compressed { let _ = c_xz_decompress(c); } });
+        let ours_size: usize = compressed.iter().map(|c| c.len()).sum();
         let c_size: usize = c_compressed.iter().map(|c| c.len()).sum();
         eprintln!(" done");
         rows.push(Row {
