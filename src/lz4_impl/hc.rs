@@ -38,6 +38,7 @@ const HC_BASE: u32 = 1 << 16;
 
 #[derive(Clone, Copy)]
 enum Strat {
+    Mid,
     HashChain,
     Optimal,
 }
@@ -45,7 +46,8 @@ enum Strat {
 /// `k_clTable`: (strategy, nbSearches, targetLength) per level.
 fn level_params(level: u32) -> (Strat, i32, usize) {
     match level.min(12) {
-        0..=3 => (Strat::HashChain, 4, 16),
+        0..=2 => (Strat::Mid, 2, 16),
+        3 => (Strat::HashChain, 4, 16),
         4 => (Strat::HashChain, 8, 16),
         5 => (Strat::HashChain, 16, 16),
         6 => (Strat::HashChain, 32, 16),
@@ -702,7 +704,7 @@ fn compress_optimal(
 }
 
 /// Compress `input[block_start..block_end]` as one LZ4 block at HC `level`
-/// (3..=12, clamped), appending to `output`. `ctx` carries the match
+/// (2..=12, clamped; 2 is `LZ4MID`), appending to `output`. `ctx` carries the match
 /// finder across consecutive blocks of the same `input` (linked blocks).
 /// Returns the number of bytes appended.
 pub fn compress_block_hc_continue(
@@ -724,10 +726,149 @@ pub fn compress_block_hc_continue(
     }
     let (strat, nb, target) = level_params(level);
     match strat {
+        Strat::Mid => compress_mid(ctx, input, block_start, block_end, output),
         Strat::HashChain => compress_hash_chain(ctx, input, block_start, block_end, output, nb),
         Strat::Optimal => compress_optimal(ctx, input, block_start, block_end, output, nb, target, level >= 12),
     }
     // `LZ4HC_Insert` is lazy; skipping the unhashed tail of this block is
     // what C does as well (`nextToUpdate` only advances on demand).
     output.len() - start_out
+}
+
+// =========================================================================
+// Level 2: `LZ4MID_compress` (lz4hc.c, lz4 1.10)
+// =========================================================================
+
+const MID_HASHLOG: u32 = HASH_LOG - 1;
+const MID_TABLE_SIZE: usize = 1 << MID_HASHLOG;
+const MID_HASHSIZE: usize = 8;
+
+#[inline(always)]
+fn mid_hash4(v: u32) -> usize {
+    (v.wrapping_mul(2654435761) >> (32 - MID_HASHLOG)) as usize
+}
+
+/// `LZ4MID_hash7`: hashes the low 56 bits of the little-endian 64-bit load.
+#[inline(always)]
+fn mid_hash8(v: u64) -> usize {
+    ((v << 8).wrapping_mul(58295818150454627u64) >> (64 - MID_HASHLOG)) as usize
+}
+
+/// `LZ4MID_compress` over `input[block_start..block_end]` (prefix mode: the
+/// match finder may reference earlier bytes of `input`, i.e. linked
+/// blocks). The two 2^14 tables share `ctx.hash` exactly like C's
+/// `hash4Table` / `hash8Table = hash4Table + LZ4MID_HASHTABLESIZE`, and
+/// positions are absolute indices offset by `HC_BASE`, so an empty slot (0)
+/// is never within `DISTANCE_MAX`.
+///
+/// Two C quirks are reproduced on purpose because they change the output:
+/// `ipIndex` is computed at the loop top and NOT refreshed after the
+/// `ip+1` longer-match step or the catch-back, yet the "beginning of match"
+/// table fills hash the adjusted `ip` with that stale index.
+fn compress_mid(ctx: &mut HcCtx, input: &[u8], block_start: usize, block_end: usize, out: &mut Vec<u8>) {
+    let (h4, h8) = ctx.hash.split_at_mut(MID_TABLE_SIZE);
+    let mflimit = block_end - MFLIMIT;
+    let matchlimit = block_end - LASTLITERALS;
+    let ilimit_idx = (block_end - MID_HASHSIZE) as u32 + HC_BASE;
+    let mut e = Emit { input, out, anchor: block_start };
+    let mut ip = block_start;
+
+    // SAFETY of the unchecked reads below: `ip <= mflimit = block_end - 12`
+    // in the main loop, so 8-byte loads at ip, ip+1, ip+2 stay inside the
+    // block; the end-of-match fills are guarded by `pos_m2 < ilimit_idx`.
+    while ip <= mflimit {
+        let ip_index = ip as u32 + HC_BASE;
+        let mut match_len;
+        let match_dist: u32;
+
+        // Long match candidate.
+        let hh8 = mid_hash8(unsafe { read_u64(input, ip) });
+        let pos8 = h8[hh8];
+        h8[hh8] = ip_index;
+        if ip_index.wrapping_sub(pos8) <= DISTANCE_MAX && pos8 >= HC_BASE {
+            let mp = (pos8 - HC_BASE) as usize;
+            match_len = count_match(input, mp, ip, matchlimit);
+            if match_len >= MINMATCH {
+                match_dist = ip_index - pos8;
+                encode_mid(&mut e, &mut ip, ip_index, match_len, match_dist, h4, h8, ilimit_idx);
+                continue;
+            }
+        }
+        // Short match candidate.
+        let hh4 = mid_hash4(unsafe { read_u32(input, ip) });
+        let pos4 = h4[hh4];
+        h4[hh4] = ip_index;
+        if ip_index.wrapping_sub(pos4) <= DISTANCE_MAX && pos4 >= HC_BASE {
+            let mp = (pos4 - HC_BASE) as usize;
+            match_len = count_match(input, mp, ip, matchlimit);
+            if match_len >= MINMATCH {
+                // Short match found; check ip+1 for a longer one.
+                let hh8b = mid_hash8(unsafe { read_u64(input, ip + 1) });
+                let pos8b = h8[hh8b];
+                let m2_dist = (ip_index + 1).wrapping_sub(pos8b);
+                let mut dist = ip_index - pos4;
+                if m2_dist <= DISTANCE_MAX && pos8b >= HC_BASE && ip < mflimit {
+                    let m2 = (pos8b - HC_BASE) as usize;
+                    let ml2 = count_match(input, m2, ip + 1, matchlimit);
+                    if ml2 > match_len {
+                        h8[hh8b] = ip_index + 1;
+                        ip += 1;
+                        match_len = ml2;
+                        dist = m2_dist;
+                    }
+                }
+                encode_mid(&mut e, &mut ip, ip_index, match_len, dist, h4, h8, ilimit_idx);
+                continue;
+            }
+        }
+        // No match: skip faster over incompressible data.
+        ip += 1 + ((ip - e.anchor) >> 9);
+    }
+
+    emit_literal_only(e.out, &input[e.anchor..block_end]);
+}
+
+/// `_lz4mid_encode_sequence`: catch-back, table fills around the match,
+/// emission. `ip_index` is the (stale, see above) loop-top index.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn encode_mid(
+    e: &mut Emit<'_>,
+    ip: &mut usize,
+    ip_index: u32,
+    mut match_len: usize,
+    match_dist: u32,
+    h4: &mut [u32],
+    h8: &mut [u32],
+    ilimit_idx: u32,
+) {
+    let input = e.input;
+    let d = match_dist as usize;
+    // Catch back.
+    while *ip > e.anchor && *ip > d && input[*ip - 1] == input[*ip - d - 1] {
+        *ip -= 1;
+        match_len += 1;
+    }
+    // Fill table with the beginning of the match.
+    unsafe {
+        h8[mid_hash8(read_u64(input, *ip + 1))] = ip_index + 1;
+        h8[mid_hash8(read_u64(input, *ip + 2))] = ip_index + 2;
+        h4[mid_hash4(read_u32(input, *ip + 1))] = ip_index + 1;
+    }
+    e.seq(ip, match_len, match_dist);
+    // Fill table with the end of the match.
+    let end_idx = *ip as u32 + HC_BASE;
+    let pos_m2 = end_idx - 2;
+    if pos_m2 < ilimit_idx {
+        let p = *ip;
+        unsafe {
+            if p > 5 {
+                h8[mid_hash8(read_u64(input, p - 5))] = end_idx - 5;
+            }
+            h8[mid_hash8(read_u64(input, p - 3))] = end_idx - 3;
+            h8[mid_hash8(read_u64(input, p - 2))] = end_idx - 2;
+            h4[mid_hash4(read_u32(input, p - 2))] = end_idx - 2;
+            h4[mid_hash4(read_u32(input, p - 1))] = end_idx - 1;
+        }
+    }
 }

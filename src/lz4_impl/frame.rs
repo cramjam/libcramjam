@@ -43,10 +43,10 @@ pub fn encode_frame(input: &[u8]) -> Vec<u8> {
 
 /// Encode an LZ4 frame at the requested level.
 ///
-/// `level == None` or `Some(0..=2)` uses the fast hash-table parser
-/// (`block::compress_block`).  `Some(3..=12)` selects the HC parser
-/// (`block::compress_block_hc`) — matching the lz4 frame format's
-/// "compression level" semantics.
+/// `level == None` or `Some(0..=1)` uses the fast parser
+/// (`block::compress_block_fast_continue`); `Some(2..=12)` selects the HC
+/// context (level 2 = `LZ4MID`, 3-9 hash chain, 10-12 optimal) — matching
+/// lz4frame's `LZ4HC_CLEVEL_MIN` routing.
 pub fn encode_frame_at(input: &[u8], level: Option<u32>) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len() + 32);
 
@@ -58,7 +58,8 @@ pub fn encode_frame_at(input: &[u8], level: Option<u32>) -> Vec<u8> {
     //   BD : block_max_size = 4 (64 KiB)
     // Blocks are *linked* (each block may reference the previous 64 KiB),
     // like the C reference encoder's default, for both parsers.
-    let use_hc = matches!(level, Some(l) if l >= 3);
+    // `LZ4HC_CLEVEL_MIN` = 2: C routes level 2 to the HC context (LZ4MID).
+    let use_hc = matches!(level, Some(l) if l >= 2);
     let flg: u8 = FLG_VERSION_BITS;
     let bd: u8 = DEFAULT_BLOCK_SIZE_CODE << 4;
     out.push(flg);
