@@ -84,6 +84,11 @@ unsafe fn wildcopy32(mut src: *const u8, mut dst: *mut u8, length: usize) {
 /// no separate "safe" decode path is needed.
 #[inline(never)]
 pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize> {
+    // Like `LZ4_decompress_safe`: an empty block is invalid (an empty
+    // payload is the 1-byte block `00`).
+    if input.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "lz4: empty block"));
+    }
     // Cheap floor: output is almost always ≥ input, and the `OUT_SLACK`
     // invariant check grows the Vec geometrically beyond that (glibc
     // realloc is an mremap for large buffers, so growth is nearly free).

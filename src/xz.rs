@@ -94,10 +94,9 @@ pub fn compress<W: Write + ?Sized, R: Read>(
             out
         }
         Format::ALONE => {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "xz: ALONE (.lzma) format encoder not yet implemented in the pure-Rust backend",
-            ));
+            let mut out = Vec::with_capacity(data.len() / 2 + 13);
+            crate::xz_impl::lzma_enc::encode_lzma_alone(&data, &lzma_options, &mut out)?;
+            out
         }
         Format::RAW => {
             return Err(io::Error::new(

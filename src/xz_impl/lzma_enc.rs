@@ -1215,6 +1215,37 @@ impl Lzma1Encoder {
         true
     }
 
+    /// End-of-payload marker (`encode_eopm`): a match of the minimum
+    /// length at distance `UINT32_MAX`.
+    fn encode_eopm(&mut self, position: u32) {
+        let pos_state = (position & self.pos_mask) as usize;
+        let s = self.state as usize;
+        self.rc.encode_bit(&mut self.is_match[s][pos_state], 1);
+        self.rc.encode_bit(&mut self.is_rep[s], 0);
+        self.encode_match(pos_state, u32::MAX, MATCH_LEN_MIN);
+    }
+
+    /// `lzma_lzma_encode` for a whole LZMA1 stream (the `.lzma` alone
+    /// format): no chunk limits; ends with the end-of-payload marker and
+    /// the range-coder flush.
+    fn encode_stream(&mut self, buf: &[u8], mf: &mut Mf) {
+        if !self.is_initialized {
+            self.encode_init(buf, mf);
+        }
+        let mut position = mf.position();
+        while !(mf.read_pos >= mf.write_pos && mf.read_ahead == 0) {
+            let (back, len) = if self.fast_mode {
+                self.optimum_fast(buf, mf)
+            } else {
+                self.optimum_normal(buf, mf, position)
+            };
+            self.encode_symbol(buf, mf, back, len, position);
+            position = position.wrapping_add(len);
+        }
+        self.encode_eopm(position);
+        self.rc.finish();
+    }
+
     /// `lzma_lzma_encode` for one LZMA2 chunk: encodes symbols into `rc`
     /// until the uncompressed `limit` (absolute position) or the compressed
     /// chunk limit is reached, then flushes the range coder.
@@ -2083,5 +2114,29 @@ pub fn encode_lzma_to_lzma2(input: &[u8], opts: &LzmaOptions, output: &mut Vec<u
         output.extend_from_slice(&enc.rc.output);
     }
     output.push(0x00);
+    Ok(())
+}
+
+/// Encode `input` in the legacy `.lzma` ("alone") format: the 13-byte
+/// header (properties byte, dictionary size, unknown uncompressed size) and
+/// one LZMA1 stream terminated by the end-of-payload marker — the layout
+/// Python's `lzma.compress(format=FORMAT_ALONE)` / liblzma's alone encoder
+/// produce.
+pub fn encode_lzma_alone(input: &[u8], opts: &LzmaOptions, output: &mut Vec<u8>) -> io::Result<()> {
+    let dict_size = opts.dict_size.max(4096);
+    let nice_len = opts.nice_len.clamp(MATCH_LEN_MIN, MATCH_LEN_MAX);
+    let mut eopts = opts.clone();
+    // Match-finder tables only need to cover the input.
+    eopts.dict_size = dict_size.min(input.len().max(4096) as u32);
+    eopts.nice_len = nice_len;
+
+    output.push(((opts.pb * 5 + opts.lp) * 9 + opts.lc) as u8);
+    output.extend_from_slice(&dict_size.to_le_bytes());
+    output.extend_from_slice(&u64::MAX.to_le_bytes());
+
+    let mut enc = Lzma1Encoder::new(&eopts)?;
+    let mut mf = Mf::new(input, eopts.dict_size, opts.mf, nice_len, opts.depth);
+    enc.encode_stream(input, &mut mf);
+    output.extend_from_slice(&enc.rc.output);
     Ok(())
 }

@@ -633,3 +633,39 @@ fn bcj_ia64_cross_impl() {
         f.ia64();
     });
 }
+
+/// `.lzma` (alone) encoder output must decode with liblzma and with ours.
+#[test]
+fn alone_encoder_roundtrips_through_liblzma() {
+    use std::io::{Cursor, Read};
+    let mut data: Vec<u8> = b"lzma alone format, the way Python's lzma.compress(format=FORMAT_ALONE) writes it. ".repeat(500);
+    data.extend((0..50_000u32).map(|i| ((i * 2654435761u32) >> 24) as u8));
+    for preset in [0u32, 1, 6, 9] {
+        let mut ours = Vec::new();
+        libcramjam::xz::compress(
+            &mut Cursor::new(&data), &mut ours, Some(preset),
+            Some(libcramjam::xz::Format::ALONE), None::<libcramjam::xz::Check>,
+            None::<libcramjam::xz::Filters>, None::<libcramjam::xz::LzmaOptions>,
+        ).unwrap();
+        assert_eq!(ours[0] as u32, (2 * 5 + 0) * 9 + 3, "props byte lc=3 lp=0 pb=2");
+        let stream = xz2::stream::Stream::new_lzma_decoder(u64::MAX).unwrap();
+        let mut dec = xz2::read::XzDecoder::new_stream(&ours[..], stream);
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        assert_eq!(out, data, "preset {preset}");
+        let mut back = Vec::new();
+        libcramjam::xz::decompress(&mut Cursor::new(&ours), &mut back).unwrap();
+        assert_eq!(back, data);
+    }
+    // Empty input.
+    let mut ours = Vec::new();
+    libcramjam::xz::compress(
+        &mut Cursor::new(&[][..]), &mut ours, Some(6),
+        Some(libcramjam::xz::Format::ALONE), None::<libcramjam::xz::Check>,
+        None::<libcramjam::xz::Filters>, None::<libcramjam::xz::LzmaOptions>,
+    ).unwrap();
+    let stream = xz2::stream::Stream::new_lzma_decoder(u64::MAX).unwrap();
+    let mut out = Vec::new();
+    xz2::read::XzDecoder::new_stream(&ours[..], stream).read_to_end(&mut out).unwrap();
+    assert!(out.is_empty());
+}
