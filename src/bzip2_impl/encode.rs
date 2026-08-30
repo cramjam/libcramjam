@@ -751,20 +751,38 @@ fn main_gt_u(
         }
         cmp1!(); cmp1!(); cmp1!(); cmp1!(); cmp1!(); cmp1!();
         cmp1!(); cmp1!(); cmp1!(); cmp1!(); cmp1!(); cmp1!();
+    }
+    main_gt_u_deep(block, quadrant, nblock, i1, i2, budget)
+}
 
+/// The deep part of [`main_gt_u`] (byte + quadrant compares with wrap
+/// around). Out of line on purpose: inlined into the shell sort it shared
+/// that function's register pressure and LLVM reloaded `i2` and the
+/// quadrant pointer from the stack before every compare.
+#[inline(never)]
+fn main_gt_u_deep(
+    block: &[u8],
+    quadrant: &[u16],
+    nblock: usize,
+    mut i1: usize,
+    mut i2: usize,
+    budget: &mut i32,
+) -> bool {
+    let mut b = *budget;
+    unsafe {
         let mut k = nblock as i32 + 8;
-        loop {
+        let r = loop {
             macro_rules! cmpq {
                 () => {
                     let c1 = *block.get_unchecked(i1);
                     let c2 = *block.get_unchecked(i2);
                     if c1 != c2 {
-                        return c1 > c2;
+                        break c1 > c2;
                     }
                     let s1 = *quadrant.get_unchecked(i1);
                     let s2 = *quadrant.get_unchecked(i2);
                     if s1 != s2 {
-                        return s1 > s2;
+                        break s1 > s2;
                     }
                     i1 += 1;
                     i2 += 1;
@@ -779,11 +797,13 @@ fn main_gt_u(
                 i2 -= nblock;
             }
             k -= 8;
-            *budget -= 1;
+            b -= 1;
             if k < 0 {
-                return false;
+                break false;
             }
-        }
+        };
+        *budget = b;
+        r
     }
 }
 
