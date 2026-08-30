@@ -140,34 +140,50 @@ impl Default for LzmaOptions {
 }
 
 impl LzmaOptions {
-    /// Build options from a preset (0..=9).  These match liblzma's preset
-    /// table from `lzma_encoder_presets.c`.
+    /// Build options from a preset (0..=9, optionally `| 0x8000_0000` for
+    /// "extreme"). Exactly liblzma's `lzma_lzma_preset` table.
     pub fn new_preset(preset: u32) -> io::Result<Self> {
-        let p = preset & 0x07;
-        let extreme = (preset & 0x80000000) != 0;
+        const LEVEL_MASK: u32 = 0x1F;
+        const EXTREME: u32 = 0x8000_0000;
+        let level = preset & LEVEL_MASK;
+        let flags = preset & !LEVEL_MASK;
+        if level > 9 || (flags & !EXTREME) != 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("xz: invalid preset {preset:#x}")));
+        }
+        const DICT_POW2: [u32; 10] = [18, 20, 21, 22, 22, 23, 23, 24, 25, 26];
+        let dict_size = 1u32 << DICT_POW2[level as usize];
 
-        // dict_size from liblzma's preset_dict_size table.
-        let dict_size = match p {
-            0 => 1u32 << 16,         // 64 KiB
-            1 => 1u32 << 20,         // 1 MiB
-            2 => 1u32 << 21,         // 2 MiB
-            3 => 1u32 << 22,         // 4 MiB
-            4 => 1u32 << 22,         // 4 MiB
-            5 => 1u32 << 23,         // 8 MiB
-            6 => 1u32 << 23,         // 8 MiB
-            7 => 1u32 << 24,         // 16 MiB
-            _ => 1u32 << 25,         // 32 MiB (presets 8 and 9)
+        let (mut mode, mut mf, mut nice_len, mut depth) = if level <= 3 {
+            const DEPTHS: [u32; 4] = [4, 8, 24, 48];
+            (
+                Mode::Fast,
+                if level == 0 { MatchFinder::HashChain3 } else { MatchFinder::HashChain4 },
+                if level <= 1 { 128 } else { 273 },
+                DEPTHS[level as usize],
+            )
+        } else {
+            (
+                Mode::Normal,
+                MatchFinder::BinaryTree4,
+                match level {
+                    4 => 16,
+                    5 => 32,
+                    _ => 64,
+                },
+                0,
+            )
         };
-
-        // (mode, nice_len, mf, depth) from the same table.
-        let (mode, nice_len, mf, depth_extra) = match p {
-            0 => (Mode::Fast, 128u32, MatchFinder::HashChain4, 0u32),
-            1 => (Mode::Fast, 128, MatchFinder::HashChain4, 0),
-            2 => (Mode::Fast, 273, MatchFinder::HashChain4, 0),
-            3 => (Mode::Normal, 32, MatchFinder::BinaryTree4, 0),
-            4 => (Mode::Normal, 64, MatchFinder::BinaryTree4, 0),
-            _ => (Mode::Normal, 64, MatchFinder::BinaryTree4, 0),
-        };
+        if flags & EXTREME != 0 {
+            mode = Mode::Normal;
+            mf = MatchFinder::BinaryTree4;
+            if level == 3 || level == 5 {
+                nice_len = 192;
+                depth = 0;
+            } else {
+                nice_len = 273;
+                depth = 512;
+            }
+        }
 
         Ok(LzmaOptions {
             preset,
@@ -176,9 +192,9 @@ impl LzmaOptions {
             lp: 0,
             pb: 2,
             mode,
-            nice_len: if extreme { 273 } else { nice_len },
+            nice_len,
             mf,
-            depth: depth_extra,
+            depth,
         })
     }
 

@@ -33,6 +33,7 @@ pub mod check;
 pub mod options;
 pub mod range_coder;
 pub mod lzma;
+pub mod lzma_enc;
 pub mod lzma2;
 pub mod xz_format;
 

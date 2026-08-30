@@ -597,7 +597,7 @@ pub fn encode_xz_stream_with_options(
 
     // Encode the LZMA2 payload first; we need its size for the index.
     let mut payload = Vec::new();
-    super::lzma::encode_lzma_to_lzma2(input, opts, &mut payload)?;
+    super::lzma_enc::encode_lzma_to_lzma2(input, opts, &mut payload)?;
 
     // ----- Block Header -----
     let dict_size_byte = encode_lzma2_dict_size(opts.dict_size);
