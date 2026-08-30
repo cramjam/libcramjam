@@ -35,9 +35,18 @@ pub mod range_coder;
 pub mod lzma;
 pub mod lzma_enc;
 pub mod lzma2;
+pub mod raw;
 pub mod xz_format;
 
 pub use options::{Check, Filter, Filters, Format, LzmaOptions, MatchFinder, Mode};
+
+/// Decode a raw (container-less, `Format::RAW`) stream produced with the given
+/// filter chain — the chain must match the encoder's (liblzma's
+/// `lzma_raw_decoder`).  LZMA entries without options default to preset 6.
+pub fn decode_raw(input: &[u8], filters: &Filters, out: &mut Vec<u8>) -> io::Result<()> {
+    let chain = filters.resolve(6, None)?;
+    raw::decode_raw(input, &chain, out)
+}
 
 use std::io::{self, Read, Write};
 
@@ -173,7 +182,7 @@ impl<W: Write> XzStreamCompressor<W> {
         if !st.started {
             let mut head = Vec::with_capacity(32);
             xz_format::write_stream_header(&mut head, st.check);
-            st.block_header_size = xz_format::write_block_header(&mut head, st.dict_size);
+            st.block_header_size = xz_format::write_block_header(&mut head, &[], st.dict_size);
             output.write_all(&head)?;
             st.started = true;
         }

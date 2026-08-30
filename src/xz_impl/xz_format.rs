@@ -42,9 +42,9 @@
 
 use std::io;
 
-use super::check::{crc32, crc64};
+use super::check::{crc32, crc64, sha256};
 use super::lzma2::decode_lzma2;
-use super::options::Check;
+use super::options::{bcj_encode, split_chain, Check, ResolvedFilter};
 
 const HEADER_MAGIC: [u8; 6] = [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00];
 const FOOTER_MAGIC: [u8; 2] = [0x59, 0x5A];
@@ -532,13 +532,24 @@ fn verify_check(check: Check, plain: &[u8], stored: &[u8]) -> io::Result<()> {
             Ok(())
         }
         Check::Sha256 => {
-            // We don't ship a SHA-256 implementation in this MVP; the
-            // .xz default is CRC64 anyway.  Reject.
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "xz: SHA-256 check not yet supported",
-            ))
+            if sha256(plain) != stored {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "xz: block SHA-256 mismatch",
+                ));
+            }
+            Ok(())
         }
+    }
+}
+
+/// Compute the block check bytes for `plain` (0 / 4 / 8 / 32 bytes).
+pub(crate) fn compute_check(check: Check, plain: &[u8], out: &mut Vec<u8>) {
+    match check {
+        Check::None => {}
+        Check::Crc32 => out.extend_from_slice(&crc32(plain).to_le_bytes()),
+        Check::Crc64 => out.extend_from_slice(&crc64(plain).to_le_bytes()),
+        Check::Sha256 => out.extend_from_slice(&sha256(plain)),
     }
 }
 
@@ -581,34 +592,51 @@ pub fn encode_xz_stream(
 }
 
 /// Encode `input` as a complete .xz stream using the given fully-resolved
-/// LZMA options + check.  Currently emits a single block with a single
-/// LZMA2 filter.
+/// LZMA options + check: a single block with a single LZMA2 filter.
 pub fn encode_xz_stream_with_options(
     input: &[u8],
     opts: &super::options::LzmaOptions,
     check: Check,
     output: &mut Vec<u8>,
 ) -> io::Result<()> {
-    let stream_flags = write_stream_header(output, check);
+    let chain = [ResolvedFilter::Lzma2(opts.clone())];
+    encode_xz_stream_chain(input, &chain, check, output)
+}
 
-    // Encode the LZMA2 payload first; we need its size for the index.
-    let mut payload = Vec::new();
-    super::lzma_enc::encode_lzma_to_lzma2(input, opts, &mut payload)?;
-
-    let block_header_size = write_block_header(output, opts.dict_size);
-    output.extend_from_slice(&payload);
-
-    let check_bytes = match check {
-        Check::None => Vec::new(),
-        Check::Crc32 => crc32(input).to_le_bytes().to_vec(),
-        Check::Crc64 => crc64(input).to_le_bytes().to_vec(),
-        Check::Sha256 => {
+/// Encode `input` as a complete .xz stream (one block) through a validated
+/// filter chain: zero or more BCJ filters followed by LZMA2.  LZMA1 is not
+/// allowed in the .xz container (liblzma: `LZMA_OPTIONS_ERROR`).
+pub(crate) fn encode_xz_stream_chain(
+    input: &[u8],
+    chain: &[ResolvedFilter],
+    check: Check,
+    output: &mut Vec<u8>,
+) -> io::Result<()> {
+    let (bcj, last) = split_chain(chain)?;
+    let opts = match last {
+        ResolvedFilter::Lzma2(o) => o,
+        _ => {
             return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "xz: SHA-256 check not yet supported",
-            ));
+                io::ErrorKind::InvalidInput,
+                "xz: LZMA1 cannot be used in the .xz format (use LZMA2, or Format::ALONE / RAW)",
+            ))
         }
     };
+
+    let stream_flags = write_stream_header(output, check);
+
+    // Run the BCJ encoders, then encode the LZMA2 payload; we need its size
+    // for the index.
+    let mut filtered = Vec::new();
+    let data = bcj_encode(input, &bcj, &mut filtered);
+    let mut payload = Vec::new();
+    super::lzma_enc::encode_lzma_to_lzma2(data, opts, &mut payload)?;
+
+    let block_header_size = write_block_header(output, &bcj, opts.dict_size);
+    output.extend_from_slice(&payload);
+
+    let mut check_bytes = Vec::new();
+    compute_check(check, input, &mut check_bytes);
     write_block_trailer(
         output,
         block_header_size,
@@ -633,12 +661,16 @@ pub(crate) fn write_stream_header(output: &mut Vec<u8>, check: Check) -> [u8; 2]
 
 /// Block Header for a single LZMA2 filter with no size fields (so it can be
 /// written before the payload is known). Returns its size in bytes.
-pub(crate) fn write_block_header(output: &mut Vec<u8>, dict_size: u32) -> usize {
+pub(crate) fn write_block_header(output: &mut Vec<u8>, bcj: &[u64], dict_size: u32) -> usize {
     let dict_size_byte = encode_lzma2_dict_size(dict_size);
     let mut header = Vec::new();
-    // Block flags: 0 filters - 1 = 0, no comp/unc size present.
     header.push(0u8); // we'll fill in the size byte after we know the size
-    header.push(0u8); // block flags = 0 (1 filter, no sizes)
+    header.push(bcj.len() as u8); // block flags: filter count - 1, no sizes
+    // BCJ filter flags: id, props_size = 0 (start_offset 0, like liblzma).
+    for &id in bcj {
+        write_multibyte_int(&mut header, id);
+        write_multibyte_int(&mut header, 0);
+    }
     // Filter Flags for LZMA2: filter_id = 0x21, props_size = 1, props = dict_size byte.
     write_multibyte_int(&mut header, 0x21);
     write_multibyte_int(&mut header, 1);

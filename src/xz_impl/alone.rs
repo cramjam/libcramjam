@@ -53,9 +53,23 @@ pub fn decode_alone(input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
     let target_size = if known_size { Some(unc_raw as usize) } else { None };
 
     // 4) Decode the LZMA payload that follows the 13-byte header.
+    decode_lzma1_stream(&input[ALONE_HEADER_LEN..], lc, lp, pb, dict_size, target_size, output)
+}
+
+/// Decode one raw LZMA1 stream.  With `target_size` unknown the stream must
+/// end with the end-of-payload marker.
+pub fn decode_lzma1_stream(
+    input: &[u8],
+    lc: u32,
+    lp: u32,
+    pb: u32,
+    dict_size: u32,
+    target_size: Option<usize>,
+    output: &mut Vec<u8>,
+) -> io::Result<()> {
     // Pad the payload so the range decoder's unchecked refill can never
     // read past the end of the input (a corrupt stream may try).
-    let mut payload = input[ALONE_HEADER_LEN..].to_vec();
+    let mut payload = input.to_vec();
     payload.resize(payload.len() + 16, 0);
     let mut decoder = LzmaDecoder::new(lc, lp, pb, dict_size)?;
     decoder.dict_start = output.len();
@@ -63,7 +77,7 @@ pub fn decode_alone(input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
 
     // The maximum we'll ever produce.  When the size is unknown we use
     // a generous cap (1 GiB) so the decoder loop has a budget; the
-    // alone format also supports an end-of-payload distance marker
+    // stream also supports an end-of-payload distance marker
     // (`u32::MAX`) which `decode_to_dict` returns via `hit_marker`, so
     // we'll typically stop earlier than the cap.
     let cap = target_size.unwrap_or(1usize << 30);
@@ -78,7 +92,7 @@ pub fn decode_alone(input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "lzma-alone: declared uncompressed size {} but produced {}",
+                    "lzma: declared uncompressed size {} but produced {}",
                     want, produced
                 ),
             ));
@@ -86,7 +100,7 @@ pub fn decode_alone(input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
     } else if !hit_marker {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "lzma-alone: stream lacks both an uncompressed-size header AND \
+            "lzma: stream lacks both an uncompressed-size header AND \
              an end-of-payload marker — can't tell where to stop",
         ));
     }

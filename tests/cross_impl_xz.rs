@@ -669,3 +669,336 @@ fn alone_encoder_roundtrips_through_liblzma() {
     xz2::read::XzDecoder::new_stream(&ours[..], stream).read_to_end(&mut out).unwrap();
     assert!(out.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// RAW format, BCJ encoders, LZMA1 chains, SHA-256 — ours <-> liblzma
+// ---------------------------------------------------------------------------
+
+use std::io::{Cursor, Read};
+use libcramjam::xz::{Check, Filters, Format, LzmaOptions};
+
+fn ours_encode(data: &[u8], preset: u32, format: Format, check: Check, filters: Option<Filters>) -> Vec<u8> {
+    let mut out = Vec::new();
+    libcramjam::xz::compress(
+        &mut Cursor::new(data), &mut out, Some(preset), Some(format), Some(check), filters,
+        None::<LzmaOptions>,
+    ).unwrap();
+    out
+}
+
+fn ours_decode(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    libcramjam::xz::decompress(&mut Cursor::new(data), &mut out).unwrap();
+    out
+}
+
+fn ours_decode_raw(data: &[u8], filters: Filters) -> Vec<u8> {
+    let mut out = Vec::new();
+    libcramjam::xz::decompress_raw(&mut Cursor::new(data), &mut out, filters).unwrap();
+    out
+}
+
+fn c_decode_stream(data: &[u8], stream: xz2::stream::Stream) -> Vec<u8> {
+    let mut out = Vec::new();
+    xz2::read::XzDecoder::new_stream(data, stream).read_to_end(&mut out).unwrap();
+    out
+}
+
+fn c_encode_stream(data: &[u8], stream: xz2::stream::Stream) -> Vec<u8> {
+    let mut enc = xz2::write::XzEncoder::new_stream(Vec::new(), stream);
+    enc.write_all(data).unwrap();
+    enc.finish().unwrap()
+}
+
+/// liblzma's raw coder (`lzma_raw_buffer_encode/decode`; the `xz2` crate
+/// doesn't wrap it): `bcj` filter ids, then LZMA1 or LZMA2 at `preset` with
+/// optional lc/lp/pb overrides.  `out_cap` bounds the output buffer.
+fn c_raw(
+    data: &[u8],
+    bcj: &[u64],
+    lzma1: bool,
+    preset: u32,
+    lclppb: Option<(u32, u32, u32)>,
+    encode: bool,
+    out_cap: usize,
+) -> Vec<u8> {
+    use std::ptr::null_mut;
+    unsafe {
+        let mut opts: lzma_sys::lzma_options_lzma = std::mem::zeroed();
+        assert_eq!(lzma_sys::lzma_lzma_preset(&mut opts, preset), 0);
+        if let Some((lc, lp, pb)) = lclppb {
+            opts.lc = lc;
+            opts.lp = lp;
+            opts.pb = pb;
+        }
+        let mut filters: Vec<lzma_sys::lzma_filter> =
+            bcj.iter().map(|&id| lzma_sys::lzma_filter { id, options: null_mut() }).collect();
+        filters.push(lzma_sys::lzma_filter {
+            id: if lzma1 { lzma_sys::LZMA_FILTER_LZMA1 } else { lzma_sys::LZMA_FILTER_LZMA2 },
+            options: &mut opts as *mut _ as *mut std::ffi::c_void,
+        });
+        filters.push(lzma_sys::lzma_filter { id: lzma_sys::LZMA_VLI_UNKNOWN, options: null_mut() });
+        let mut out = vec![0u8; out_cap];
+        let mut out_pos = 0usize;
+        let ret = if encode {
+            lzma_sys::lzma_raw_buffer_encode(
+                filters.as_ptr(), std::ptr::null(), data.as_ptr(), data.len(),
+                out.as_mut_ptr(), &mut out_pos, out.len(),
+            )
+        } else {
+            let mut in_pos = 0usize;
+            let ret = lzma_sys::lzma_raw_buffer_decode(
+                filters.as_ptr(), std::ptr::null(), data.as_ptr(), &mut in_pos, data.len(),
+                out.as_mut_ptr(), &mut out_pos, out.len(),
+            );
+            assert_eq!(in_pos, data.len(), "liblzma did not consume the whole raw stream");
+            ret
+        };
+        assert_eq!(ret, lzma_sys::LZMA_OK, "liblzma raw {} failed", if encode { "encode" } else { "decode" });
+        out.truncate(out_pos);
+        out
+    }
+}
+
+fn c_raw_encode(data: &[u8], bcj: &[u64], lzma1: bool, preset: u32) -> Vec<u8> {
+    c_raw(data, bcj, lzma1, preset, None, true, data.len() * 2 + 4096)
+}
+
+fn c_raw_decode(data: &[u8], bcj: &[u64], lzma1: bool, preset: u32, lclppb: Option<(u32, u32, u32)>, len: usize) -> Vec<u8> {
+    c_raw(data, bcj, lzma1, preset, lclppb, false, len + 64)
+}
+
+/// The six BCJ filters as (name, our chain builder, liblzma filter id).
+type OurBuild = fn(&mut Filters) -> &mut Filters;
+const BCJ: &[(&str, OurBuild, u64)] = &[
+    ("x86", |f| f.x86(), lzma_sys::LZMA_FILTER_X86),
+    ("arm", |f| f.arm(), lzma_sys::LZMA_FILTER_ARM),
+    ("armthumb", |f| f.arm_thumb(), lzma_sys::LZMA_FILTER_ARMTHUMB),
+    ("powerpc", |f| f.powerpc(), lzma_sys::LZMA_FILTER_POWERPC),
+    ("sparc", |f| f.sparc(), lzma_sys::LZMA_FILTER_SPARC),
+    ("ia64", |f| f.ia64(), lzma_sys::LZMA_FILTER_IA64),
+];
+
+/// x86 code-like buffer: CALL/JMP rel32 instructions from sequential
+/// positions to a handful of fixed targets, so every relative displacement
+/// differs but the BCJ-converted absolute ones repeat.
+fn gen_x86_calls(n: usize) -> Vec<u8> {
+    let targets = [0x1000u32, 0x2340, 0x8000, 0xABCD0, 0x12345, 0x40000, 0x77777, 0x99990];
+    let mut out = Vec::with_capacity(n * 12);
+    let mut s = 0x9E37_79B9u32;
+    for i in 0..n {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        // Some filler "instructions" between calls.
+        let filler = (s % 7) as usize;
+        for j in 0..filler {
+            out.push(((s >> (j * 4)) & 0x7F) as u8 | 0x40);
+        }
+        let pos = out.len() as u32;
+        let target = targets[i % targets.len()];
+        let rel = target.wrapping_sub(pos + 5);
+        out.push(if s & 0x100 != 0 { 0xE8 } else { 0xE9 });
+        out.extend_from_slice(&rel.to_le_bytes());
+    }
+    out
+}
+
+#[test]
+fn raw_lzma2_cross_impl() {
+    let data = gen_text(200_000);
+    for preset in [0u32, 1, 6, 9] {
+        let opts = LzmaOptions::new_preset(preset).unwrap();
+        let raw = ours_encode(&data, preset, Format::RAW, Check::None, None);
+        // Decodes with liblzma's raw decoder given the same chain.
+        assert_eq!(c_raw_decode(&raw, &[], false, preset, None, data.len()), data, "preset {preset}");
+        // And with ours.
+        let mut f = Filters::new();
+        f.lzma2(&opts);
+        assert_eq!(ours_decode_raw(&raw, f), data);
+        // liblzma raw -> ours.
+        let theirs = c_raw_encode(&data, &[], false, preset);
+        let mut f = Filters::new();
+        f.lzma2(&opts);
+        assert_eq!(ours_decode_raw(&theirs, f), data);
+    }
+}
+
+#[test]
+fn raw_lzma1_cross_impl() {
+    let mut data = gen_text(150_000);
+    data.extend((0..30_000u32).map(|i| ((i * 2654435761u32) >> 24) as u8));
+    for preset in [0u32, 3, 6, 9] {
+        let opts = LzmaOptions::new_preset(preset).unwrap();
+        let mut f = Filters::new();
+        f.lzma1(&opts);
+        let raw = ours_encode(&data, preset, Format::RAW, Check::None, Some(f.clone()));
+        assert_eq!(c_raw_decode(&raw, &[], true, preset, None, data.len()), data, "preset {preset}");
+        assert_eq!(ours_decode_raw(&raw, f.clone()), data);
+        let theirs = c_raw_encode(&data, &[], true, preset);
+        assert_eq!(ours_decode_raw(&theirs, f), data);
+    }
+    // Non-default lc/lp/pb travel through the chain options.
+    let mut opts = LzmaOptions::new_preset(6).unwrap();
+    opts.literal_context_bits(0).literal_position_bits(2).position_bits(0);
+    let mut f = Filters::new();
+    f.lzma1(&opts);
+    let raw = ours_encode(&data, 6, Format::RAW, Check::None, Some(f.clone()));
+    assert_eq!(c_raw_decode(&raw, &[], true, 6, Some((0, 2, 0)), data.len()), data);
+    // With the default lc/lp/pb liblzma either errors or yields garbage.
+    let wrong = std::panic::catch_unwind(|| c_raw_decode(&raw, &[], true, 6, None, data.len()));
+    assert!(wrong.map(|v| v != data).unwrap_or(true), "default lc/lp/pb must not decode it");
+    assert_eq!(ours_decode_raw(&raw, f), data);
+}
+
+#[test]
+fn bcj_encoders_cross_impl_xz_and_raw() {
+    let opts = LzmaOptions::new_preset(6).unwrap();
+    for &(name, our_build, c_id) in BCJ {
+        for size in [0usize, 5, 4096, 200_000] {
+            let data = gen_bcj_corpus(0xBEEF_0000 + size as u32, size);
+
+            // .xz container: BCJ + LZMA2, CRC64.
+            let mut f = Filters::new();
+            our_build(&mut f).lzma2(&opts);
+            let xz = ours_encode(&data, 6, Format::XZ, Check::Crc64, Some(f));
+            assert_eq!(c_xz_decompress(&xz), data, "{name} .xz size {size} (liblzma decode)");
+            assert_eq!(ours_decode(&xz), data, "{name} .xz size {size} (our decode)");
+            // The block header must actually declare the filter.
+            let block_flags = xz[13];
+            assert_eq!(block_flags & 3, 1, "{name}: block header should list 2 filters");
+
+            // RAW: BCJ + LZMA2 and BCJ + LZMA1, both directions.
+            for lzma1 in [false, true] {
+                let mut f = Filters::new();
+                our_build(&mut f);
+                if lzma1 {
+                    f.lzma1(&opts);
+                } else {
+                    f.lzma2(&opts);
+                }
+                let raw = ours_encode(&data, 6, Format::RAW, Check::None, Some(f.clone()));
+                assert_eq!(
+                    c_raw_decode(&raw, &[c_id], lzma1, 6, None, data.len()),
+                    data,
+                    "{name} raw lzma1={lzma1} size {size} (liblzma decode)"
+                );
+                assert_eq!(ours_decode_raw(&raw, f.clone()), data, "{name} raw lzma1={lzma1} size {size}");
+                let theirs = c_raw_encode(&data, &[c_id], lzma1, 6);
+                assert_eq!(ours_decode_raw(&theirs, f), data, "{name} raw lzma1={lzma1} size {size} (C encode)");
+                // The filtered bytes are identical to liblzma's: peel only
+                // the LZMA layer off both raw streams and compare.
+                let ours_t = c_raw_decode(&raw, &[], lzma1, 6, None, data.len());
+                let theirs_t = c_raw_decode(&theirs, &[], lzma1, 6, None, data.len());
+                assert!(ours_t == theirs_t, "{name} transform differs from liblzma (size {size})");
+            }
+        }
+    }
+}
+
+#[test]
+fn x86_bcj_on_real_call_patterns_matches_liblzma() {
+    let data = gen_x86_calls(20_000);
+    let opts = LzmaOptions::new_preset(6).unwrap();
+    let mut f = Filters::new();
+    f.x86().lzma2(&opts);
+    let with = ours_encode(&data, 6, Format::XZ, Check::Crc64, Some(f));
+    let without = ours_encode(&data, 6, Format::XZ, Check::Crc64, None);
+    assert_eq!(c_xz_decompress(&with), data);
+    assert_eq!(ours_decode(&with), data);
+    assert!(with.len() < without.len() * 3 / 4, "x86 BCJ should help: {} vs {}", with.len(), without.len());
+
+    // Same chain in liblzma gives (nearly) the same size — the transforms
+    // agree (liblzma's streaming BCJ changes LZMA2 chunk boundaries slightly).
+    let c = c_xz_compress_with_filter(&data, |f| {
+        f.x86();
+    });
+    let c_plain = c_xz_compress(&data, 6);
+    eprintln!("x86 BCJ: ours {} / liblzma {}; plain: ours {} / liblzma {}", with.len(), c.len(), without.len(), c_plain.len());
+    assert!((with.len() as i64 - c.len() as i64).abs() * 200 <= c.len() as i64, "ours {} vs liblzma {}", with.len(), c.len());
+    assert_eq!(ours_decode(&c), data);
+
+    // The transform itself is byte-identical: peel LZMA2 off both raw
+    // [x86, LZMA2] streams with liblzma and compare the filtered bytes.
+    let mut f = Filters::new();
+    f.x86().lzma2(&opts);
+    let ours_raw = ours_encode(&data, 6, Format::RAW, Check::None, Some(f));
+    let theirs_raw = c_raw_encode(&data, &[lzma_sys::LZMA_FILTER_X86], false, 6);
+    let ours_t = c_raw_decode(&ours_raw, &[], false, 6, None, data.len());
+    let theirs_t = c_raw_decode(&theirs_raw, &[], false, 6, None, data.len());
+    let first_diff = ours_t.iter().zip(&theirs_t).position(|(a, b)| a != b);
+    assert_eq!(first_diff, None, "x86 BCJ transform differs from liblzma at {first_diff:?} of {}", data.len());
+    assert_eq!(ours_t.len(), theirs_t.len());
+
+    // Stacked BCJ filters (x86 then ARM) are allowed too.
+    let mut f = Filters::new();
+    f.x86().arm().lzma2(&opts);
+    let stacked = ours_encode(&data, 6, Format::XZ, Check::Crc32, Some(f));
+    assert_eq!(c_xz_decompress(&stacked), data);
+    assert_eq!(ours_decode(&stacked), data);
+}
+
+#[test]
+fn sha256_check_cross_impl() {
+    let mut data = gen_text(100_000);
+    data.extend((0..40_000u32).map(|i| ((i * 2654435761u32) >> 24) as u8));
+    for preset in [1u32, 6] {
+        let xz = ours_encode(&data, preset, Format::XZ, Check::Sha256, None);
+        assert_eq!(xz[7], 0x0A, "stream flags check id = SHA-256");
+        assert_eq!(c_xz_decompress(&xz), data);
+        assert_eq!(ours_decode(&xz), data);
+        let theirs = c_encode_stream(
+            &data,
+            xz2::stream::Stream::new_easy_encoder(preset, xz2::stream::Check::Sha256).unwrap(),
+        );
+        assert_eq!(ours_decode(&theirs), data);
+
+        // Corrupt one byte of the stored hash: must be rejected by both.
+        // The hash is the 32 bytes right before the index (indicator 0x00).
+        let mut bad = xz.clone();
+        let mut probe = bad.len() - 12 - 4 - 4 - 32;
+        while probe > 0 && bad[probe + 32] != 0x00 {
+            probe -= 1;
+        }
+        bad[probe + 3] ^= 0x01;
+        let mut out = Vec::new();
+        let err = libcramjam::xz::decompress(&mut Cursor::new(&bad), &mut out).unwrap_err();
+        assert!(err.to_string().contains("SHA-256"), "{err}");
+        let mut out = Vec::new();
+        assert!(xz2::read::XzDecoder::new(&bad[..]).read_to_end(&mut out).is_err());
+    }
+    // Other checks still fine, including None.
+    for check in [Check::None, Check::Crc32, Check::Crc64] {
+        let xz = ours_encode(&data, 6, Format::XZ, check, None);
+        assert_eq!(c_xz_decompress(&xz), data);
+    }
+}
+
+#[test]
+fn invalid_chains_and_formats_are_rejected() {
+    let data = gen_text(1000);
+    let opts = LzmaOptions::new_preset(6).unwrap();
+    let mut out = Vec::new();
+    let mut try_compress = |format, f: Filters| {
+        libcramjam::xz::compress(
+            &mut Cursor::new(&data), &mut out, Some(6), Some(format), None::<Check>, Some(f), None::<LzmaOptions>,
+        )
+    };
+    // LZMA1 inside .xz.
+    let mut f = Filters::new();
+    f.lzma1(&opts);
+    assert!(try_compress(Format::XZ, f).is_err());
+    // BCJ inside .lzma alone.
+    let mut f = Filters::new();
+    f.x86().lzma2(&opts);
+    assert!(try_compress(Format::ALONE, f).is_err());
+    // BCJ-only chain.
+    let mut f = Filters::new();
+    f.x86();
+    assert!(try_compress(Format::RAW, f).is_err());
+    // ALONE with an explicit LZMA1 entry works (it is the alone format's coder).
+    let mut f = Filters::new();
+    f.lzma1(&opts);
+    let alone = ours_encode(&data, 6, Format::ALONE, Check::None, Some(f));
+    assert_eq!(c_decode_stream(&alone, xz2::stream::Stream::new_lzma_decoder(u64::MAX).unwrap()), data);
+}

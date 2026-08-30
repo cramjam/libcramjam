@@ -288,4 +288,104 @@ impl Filters {
         self.chain.push(FilterEntry { filter, options: None });
         self
     }
+
+    /// Validate the chain the way liblzma's `lzma_validate_chain` does (1..=4
+    /// entries, the last one LZMA1/LZMA2, everything before it a BCJ filter)
+    /// and fill in the LZMA options: `override_opts` wins, then the entry's
+    /// own options, then `preset`.  An empty chain means a single LZMA2
+    /// filter.
+    pub(crate) fn resolve(
+        &self,
+        preset: u32,
+        override_opts: Option<&LzmaOptions>,
+    ) -> io::Result<Vec<ResolvedFilter>> {
+        let lzma_opts = |entry: Option<&LzmaOptions>| -> io::Result<LzmaOptions> {
+            match override_opts.or(entry) {
+                Some(o) => Ok(o.clone()),
+                None => LzmaOptions::new_preset(preset),
+            }
+        };
+        if self.chain.is_empty() {
+            return Ok(vec![ResolvedFilter::Lzma2(lzma_opts(None)?)]);
+        }
+        if self.chain.len() > 4 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "xz: a filter chain has at most 4 filters"));
+        }
+        let mut out = Vec::with_capacity(self.chain.len());
+        for (i, entry) in self.chain.iter().enumerate() {
+            let is_last = i + 1 == self.chain.len();
+            let resolved = match (entry.filter, entry.filter.bcj_id()) {
+                (Filter::Lzma1, _) if is_last => ResolvedFilter::Lzma1(lzma_opts(entry.options.as_ref())?),
+                (Filter::Lzma2, _) if is_last => ResolvedFilter::Lzma2(lzma_opts(entry.options.as_ref())?),
+                (_, Some(id)) if !is_last => ResolvedFilter::Bcj(id),
+                (f, _) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "xz: invalid filter chain — {f:?} at position {i}: BCJ filters must \
+                             precede exactly one trailing LZMA1/LZMA2 filter"
+                        ),
+                    ))
+                }
+            };
+            out.push(resolved);
+        }
+        Ok(out)
+    }
+}
+
+/// A validated filter-chain entry with every option resolved.
+#[derive(Clone, Debug)]
+pub(crate) enum ResolvedFilter {
+    /// BCJ filter, by xz filter id (see `bcj.rs`).
+    Bcj(u64),
+    Lzma1(LzmaOptions),
+    Lzma2(LzmaOptions),
+}
+
+impl Filter {
+    pub(crate) fn bcj_id(self) -> Option<u64> {
+        use super::bcj::*;
+        Some(match self {
+            Filter::X86 => FILTER_X86,
+            Filter::PowerPC => FILTER_POWERPC,
+            Filter::Ia64 => FILTER_IA64,
+            Filter::Arm => FILTER_ARM,
+            Filter::ArmThumb => FILTER_ARMTHUMB,
+            Filter::Sparc => FILTER_SPARC,
+            Filter::Lzma1 | Filter::Lzma2 => return None,
+        })
+    }
+}
+
+/// Split a resolved chain into its BCJ prefix and the trailing LZMA entry.
+pub(crate) fn split_chain(chain: &[ResolvedFilter]) -> io::Result<(Vec<u64>, &ResolvedFilter)> {
+    let (last, bcj) = chain
+        .split_last()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "xz: empty filter chain"))?;
+    let ids = bcj
+        .iter()
+        .map(|f| match f {
+            ResolvedFilter::Bcj(id) => Ok(*id),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "xz: LZMA filter must be last in the chain")),
+        })
+        .collect::<io::Result<Vec<u64>>>()?;
+    if matches!(last, ResolvedFilter::Bcj(_)) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "xz: filter chain must end with LZMA1/LZMA2"));
+    }
+    Ok((ids, last))
+}
+
+/// Run the BCJ encoders of `bcj` (chain order) over a copy of `input`, or
+/// hand back `input` itself when there are none.
+pub(crate) fn bcj_encode<'a>(input: &'a [u8], bcj: &[u64], scratch: &'a mut Vec<u8>) -> &'a [u8] {
+    if bcj.is_empty() {
+        return input;
+    }
+    scratch.clear();
+    scratch.extend_from_slice(input);
+    for &id in bcj {
+        super::bcj::apply(id, scratch, 0, true);
+    }
+    scratch
 }
