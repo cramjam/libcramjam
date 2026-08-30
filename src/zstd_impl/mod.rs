@@ -80,20 +80,24 @@ pub fn compress_bound(len: usize) -> usize {
     encode::compress_bound(len)
 }
 
-/// Streaming compressor (Write-adapter for the C API).  Generic over
-/// `W: Write` so callers can pass either a `Vec<u8>` or `Cursor<Vec<u8>>`.
+/// Streaming compressor with `ZSTD_compressStream2` semantics: `write`
+/// feeds data (full 128 KiB blocks are emitted as they fill), `flush`
+/// compresses everything pending so a decoder can consume all input written
+/// so far (`ZSTD_e_flush`), `finish` writes the last block (`ZSTD_e_end`).
+/// Generic over `W: Write` so callers can pass either a `Vec<u8>` or a
+/// `Cursor<Vec<u8>>`.
 pub struct ZstdStreamCompressor<W: Write = Vec<u8>> {
-    input: Vec<u8>,
+    enc: encode::StreamEncoder,
+    out: Vec<u8>,
     output: W,
-    level: i32,
 }
 
 impl<W: Write> ZstdStreamCompressor<W> {
     pub fn new(output: W, level: i32) -> io::Result<Self> {
         Ok(Self {
-            input: Vec::new(),
+            enc: encode::StreamEncoder::new(level),
+            out: Vec::new(),
             output,
-            level,
         })
     }
 
@@ -105,26 +109,30 @@ impl<W: Write> ZstdStreamCompressor<W> {
         &mut self.output
     }
 
+    fn drain(&mut self) -> io::Result<()> {
+        if !self.out.is_empty() {
+            self.output.write_all(&self.out)?;
+            self.out.clear();
+        }
+        Ok(())
+    }
+
     pub fn finish(mut self) -> io::Result<W> {
-        let mut buf = Vec::with_capacity(self.input.len() / 2);
-        compress(
-            &mut std::io::Cursor::new(self.input),
-            &mut buf,
-            Some(self.level),
-            None,
-        )?;
-        self.output.write_all(&buf)?;
+        self.enc.end(&mut self.out);
+        self.drain()?;
         Ok(self.output)
     }
 }
 
 impl<W: Write> Write for ZstdStreamCompressor<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.input.extend_from_slice(buf);
+        self.enc.push(&mut self.out, buf);
+        self.drain()?;
         Ok(buf.len())
     }
-
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        self.enc.flush(&mut self.out);
+        self.drain()?;
+        self.output.flush()
     }
 }

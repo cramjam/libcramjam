@@ -136,37 +136,48 @@ fn is_rle(block: &[u8]) -> bool {
     block.iter().all(|&x| x == b)
 }
 
-fn encode_compressed_blocks(out: &mut Vec<u8>, input: &[u8], level: i32, scratch: &mut Scratch) {
-    let params: CParams = cparams(level, input.len());
-    let block_size = MAX_BLOCK_SIZE.min(1usize << params.window_log);
-    let is_row = params.strategy >= Strategy::Greedy;
-    let row_log = params.search_log.clamp(4, 6);
-    if is_row {
-        scratch.row.reset(params.hash_log, row_log);
-    } else {
-        scratch.fast.reset(params.hash_log, params.chain_log, params.strategy == Strategy::Dfast);
+/// Everything a block encoder needs across blocks: the level's parameters,
+/// the match-finder tables, the repeat offsets and the "first block" flag.
+/// Shared by the one-shot frame loop and the streaming compressor so both
+/// produce identical blocks for identical input.
+struct BlockEncoder {
+    params: CParams,
+    block_size: usize,
+    is_row: bool,
+    rep: [u32; 3],
+    first_block: bool,
+}
+
+impl BlockEncoder {
+    fn new(params: CParams, scratch: &mut Scratch) -> Self {
+        let block_size = MAX_BLOCK_SIZE.min(1usize << params.window_log);
+        let is_row = params.strategy >= Strategy::Greedy;
+        let row_log = params.search_log.clamp(4, 6);
+        if is_row {
+            scratch.row.reset(params.hash_log, row_log);
+        } else {
+            scratch.fast.reset(params.hash_log, params.chain_log, params.strategy == Strategy::Dfast);
+        }
+        Self { params, block_size, is_row, rep: [1, 4, 8], first_block: true }
     }
 
-    // Repeat offsets persist across blocks — the decoder's view only
-    // changes on compressed blocks, so raw/RLE blocks roll them back.
-    let mut rep = [1u32, 4, 8];
-    let base = input.as_ptr();
-    let input_end = unsafe { base.add(input.len()) };
-    let mut pos = 0usize;
-    let mut first_block = true;
-
-    while pos < input.len() {
-        let len = (input.len() - pos).min(block_size);
-        let block = &input[pos..pos + len];
-        let last = pos + len >= input.len();
+    /// Encode `buf[pos..pos + len]` as one block (raw / RLE / compressed)
+    /// appended to `out`. `buf` is the whole addressable history (positions
+    /// in the match-finder tables index into it); `avail_end` is the end of
+    /// the data that may be read past the block (literal-copy / count limit).
+    fn encode_block(&mut self, out: &mut Vec<u8>, buf: &[u8], pos: usize, len: usize, avail_end: usize, last: bool, scratch: &mut Scratch) {
+        let params = &self.params;
+        let block = &buf[pos..pos + len];
+        let base = buf.as_ptr();
+        let input_end = unsafe { base.add(avail_end) };
 
         // ZSTD_buildSeqStore: tiny blocks are not worth compressing.
         let compressed = if len < 2 + 3 + 1 + 1 {
             None
         } else {
-            let saved_rep = rep;
+            let saved_rep = self.rep;
             // limited update after a very long match (row finder)
-            if is_row {
+            if self.is_row {
                 let curr = pos as u32;
                 let ntu = scratch.row.next_to_update;
                 if curr > ntu + 384 {
@@ -181,7 +192,7 @@ fn encode_compressed_blocks(out: &mut Vec<u8>, input: &[u8], level: i32, scratch
                 input_end,
                 window_log: params.window_log,
                 target_length: params.target_length,
-                rep: &mut rep,
+                rep: &mut self.rep,
             };
             let last_lits = unsafe {
                 match params.strategy {
@@ -206,7 +217,7 @@ fn encode_compressed_blocks(out: &mut Vec<u8>, input: &[u8], level: i32, scratch
             // ZSTD_entropyCompressSeqStore: not compressible enough → raw.
             let max_c_size = len - entropy::min_gain(len);
             if payload.len() >= max_c_size {
-                rep = saved_rep;
+                self.rep = saved_rep;
                 None
             } else {
                 Some(payload.len())
@@ -215,7 +226,7 @@ fn encode_compressed_blocks(out: &mut Vec<u8>, input: &[u8], level: i32, scratch
 
         match compressed {
             Some(c_size) => {
-                if !first_block && c_size < 25 && is_rle(block) {
+                if !self.first_block && c_size < 25 && is_rle(block) {
                     write_block_header(out, len, BlockType::Rle, last);
                     out.push(block[0]);
                 } else {
@@ -228,8 +239,185 @@ fn encode_compressed_blocks(out: &mut Vec<u8>, input: &[u8], level: i32, scratch
                 out.extend_from_slice(block);
             }
         }
-        first_block = false;
+        self.first_block = false;
+    }
+
+    /// Drop `shift` bytes of history from the front of the addressable
+    /// buffer (the caller memmoves the buffer): rebase every table index
+    /// like C's `ZSTD_reduceTable`. Entries that pointed below the new
+    /// start saturate to 0 — a candidate that is only ever verified by byte
+    /// comparison and the window-distance check, so a stale 0 is harmless.
+    /// `shift` must be a multiple of the row hash-cache size so the cache's
+    /// position→slot mapping stays valid.
+    fn rebase(&mut self, shift: usize, scratch: &mut Scratch) {
+        let shift = shift as u32;
+        if self.is_row {
+            for e in scratch.row.hash_table.iter_mut() {
+                *e = e.saturating_sub(shift);
+            }
+            scratch.row.next_to_update = scratch.row.next_to_update.saturating_sub(shift);
+        } else {
+            for e in scratch.fast.hash_table.iter_mut() {
+                *e = e.saturating_sub(shift);
+            }
+            for e in scratch.fast.hash_small.iter_mut() {
+                *e = e.saturating_sub(shift);
+            }
+        }
+    }
+}
+
+fn encode_compressed_blocks(out: &mut Vec<u8>, input: &[u8], level: i32, scratch: &mut Scratch) {
+    let params: CParams = cparams(level, input.len());
+    let mut enc = BlockEncoder::new(params, scratch);
+    let mut pos = 0usize;
+    while pos < input.len() {
+        let len = (input.len() - pos).min(enc.block_size);
+        let last = pos + len >= input.len();
+        enc.encode_block(out, input, pos, len, input.len(), last, scratch);
         pos += len;
+    }
+}
+
+// =========================================================================
+// Streaming (ZSTD_compressStream2 semantics)
+// =========================================================================
+
+/// Streaming frame encoder: `push` buffers input and emits full blocks,
+/// `flush` compresses whatever is pending into block(s) so a decoder can
+/// consume everything written so far (`ZSTD_e_flush`), `end` writes the
+/// last block (`ZSTD_e_end`). The frame header carries no content size
+/// (Single_Segment = 0, window descriptor from the level's windowLog).
+///
+/// Memory is bounded: the addressable buffer holds at most about
+/// `2 * window + block` bytes — once more than a window of history sits
+/// behind the pending data the front is dropped and the tables rebased.
+pub struct StreamEncoder {
+    enc: Option<BlockEncoder>,
+    scratch: Box<Scratch>,
+    /// history + pending input; positions in the tables index into it.
+    buf: Vec<u8>,
+    /// `buf[pending..]` has not been encoded yet.
+    pending: usize,
+    window: usize,
+    block_size: usize,
+    header_written: bool,
+    finished: bool,
+}
+
+impl StreamEncoder {
+    pub fn new(level: i32) -> Self {
+        let params = cparams(level, 0);
+        let mut scratch = Box::new(Scratch {
+            fast: FastState::new(),
+            row: RowState::new(),
+            seq: SeqStore::new(),
+            payload: Vec::new(),
+        });
+        let (enc, window, block_size) = if level <= 0 {
+            (None, MAX_BLOCK_SIZE, MAX_BLOCK_SIZE)
+        } else {
+            let e = BlockEncoder::new(params, &mut scratch);
+            let bs = e.block_size;
+            (Some(e), 1usize << params.window_log, bs)
+        };
+        Self {
+            enc,
+            scratch,
+            buf: Vec::new(),
+            pending: 0,
+            window,
+            block_size,
+            header_written: false,
+            finished: false,
+        }
+    }
+
+    fn write_header(&mut self, out: &mut Vec<u8>) {
+        if self.header_written {
+            return;
+        }
+        self.header_written = true;
+        out.extend_from_slice(&ZSTD_MAGIC.to_le_bytes());
+        // FCS flag 0 + Single_Segment 0 ⇒ no content size; no checksum.
+        out.push(0);
+        // Window descriptor: exponent = windowLog - 10, mantissa 0.
+        let window_log = self.window.trailing_zeros();
+        out.push(((window_log - 10) as u8) << 3);
+    }
+
+    /// Emit one block of `len` pending bytes (`len > 0`).
+    fn emit_block(&mut self, out: &mut Vec<u8>, len: usize, last: bool) {
+        self.write_header(out);
+        let pos = self.pending;
+        match self.enc.as_mut() {
+            Some(enc) => enc.encode_block(out, &self.buf, pos, len, self.buf.len(), last, &mut self.scratch),
+            None => {
+                write_block_header(out, len, BlockType::Raw, last);
+                out.extend_from_slice(&self.buf[pos..pos + len]);
+            }
+        }
+        self.pending += len;
+    }
+
+    /// Drop history beyond the window once it costs more than a window's
+    /// worth of memory (keeps exactly `window` bytes behind the pending
+    /// data afterwards).
+    fn maybe_slide(&mut self) {
+        if self.pending < 2 * self.window {
+            return;
+        }
+        // Shift rounded down to a multiple of 64 (row hash-cache alignment).
+        let shift = (self.pending - self.window) & !63;
+        if shift == 0 {
+            return;
+        }
+        self.buf.drain(..shift);
+        self.pending -= shift;
+        if let Some(enc) = self.enc.as_mut() {
+            enc.rebase(shift, &mut self.scratch);
+        }
+    }
+
+    /// Feed input; full blocks are emitted as they become available.
+    pub fn push(&mut self, out: &mut Vec<u8>, data: &[u8]) {
+        debug_assert!(!self.finished);
+        self.buf.extend_from_slice(data);
+        while self.buf.len() - self.pending >= self.block_size {
+            self.emit_block(out, self.block_size, false);
+        }
+        self.maybe_slide();
+    }
+
+    /// `ZSTD_e_flush`: compress everything pending (in >= 1 blocks) so the
+    /// output so far decodes to all input pushed so far.
+    pub fn flush(&mut self, out: &mut Vec<u8>) {
+        while self.buf.len() > self.pending {
+            let len = (self.buf.len() - self.pending).min(self.block_size);
+            self.emit_block(out, len, false);
+        }
+        self.maybe_slide();
+    }
+
+    /// `ZSTD_e_end`: everything pending, the last block flag set (an empty
+    /// raw last block when nothing is pending), then the encoder is done.
+    pub fn end(&mut self, out: &mut Vec<u8>) {
+        if self.finished {
+            return;
+        }
+        while self.buf.len() - self.pending > self.block_size {
+            self.emit_block(out, self.block_size, false);
+        }
+        let rest = self.buf.len() - self.pending;
+        if rest > 0 {
+            self.emit_block(out, rest, true);
+        } else {
+            self.write_header(out);
+            write_block_header(out, 0, BlockType::Raw, true);
+        }
+        self.finished = true;
+        self.buf = Vec::new();
+        self.pending = 0;
     }
 }
 
