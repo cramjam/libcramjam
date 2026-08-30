@@ -32,6 +32,10 @@ impl<W: Write> Bzip2StreamCompressor<W> {
         &self.output
     }
 
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.output
+    }
+
     /// Consume the compressor and return the underlying writer after the
     /// final compressed bytes have been written to it.
     pub fn finish(mut self) -> io::Result<W> {

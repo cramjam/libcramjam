@@ -92,6 +92,10 @@ impl<W: Write> XzStreamCompressor<W> {
         &self.output
     }
 
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.output
+    }
+
     /// Encode the buffered input and write it to the underlying sink, then
     /// return the sink.
     pub fn finish(mut self) -> io::Result<W> {

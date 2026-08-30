@@ -11,6 +11,13 @@ pub mod bzip2;
 #[cfg(feature = "capi")]
 mod capi;
 
+/// Test hook: lz4 frame encoder with explicit frame options.
+#[cfg(feature = "lz4")]
+#[doc(hidden)]
+pub fn lz4_frame_opts_for_tests(input: &[u8], level: Option<u32>, block_linked: bool, content_checksum: bool) -> Vec<u8> {
+    lz4_impl::frame::encode_frame_opts(input, level, block_linked, content_checksum)
+}
+
 /// Run `f` with a thread-local scratch `Vec<u8>` (cleared, capacity kept)
 /// and then write its contents to `output`.
 ///

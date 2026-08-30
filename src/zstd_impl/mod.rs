@@ -101,6 +101,10 @@ impl<W: Write> ZstdStreamCompressor<W> {
         &self.output
     }
 
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.output
+    }
+
     pub fn finish(mut self) -> io::Result<W> {
         let mut buf = Vec::with_capacity(self.input.len() / 2);
         compress(

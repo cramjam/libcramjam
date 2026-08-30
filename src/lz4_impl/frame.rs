@@ -48,6 +48,19 @@ pub fn encode_frame(input: &[u8]) -> Vec<u8> {
 /// context (level 2 = `LZ4MID`, 3-9 hash chain, 10-12 optimal) — matching
 /// lz4frame's `LZ4HC_CLEVEL_MIN` routing.
 pub fn encode_frame_at(input: &[u8], level: Option<u32>) -> Vec<u8> {
+    encode_frame_opts(input, level, true, false)
+}
+
+/// FLG bit 5: blocks are independent (no back-references across blocks).
+const FLG_BLOCK_INDEPENDENT: u8 = 1 << 5;
+/// FLG bit 2: a 4-byte xxhash32 of the content follows the end marker.
+const FLG_CONTENT_CHECKSUM: u8 = 1 << 2;
+
+/// [`encode_frame_at`] with the frame options the C `LZ4F_preferences_t`
+/// exposes: `block_linked = false` resets the match-finder context at every
+/// block (`LZ4F_blockIndependent`), `content_checksum` appends the xxhash32
+/// of the input after the end marker.
+pub fn encode_frame_opts(input: &[u8], level: Option<u32>, block_linked: bool, content_checksum: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len() + 32);
 
     // Magic.
@@ -60,7 +73,13 @@ pub fn encode_frame_at(input: &[u8], level: Option<u32>) -> Vec<u8> {
     // like the C reference encoder's default, for both parsers.
     // `LZ4HC_CLEVEL_MIN` = 2: C routes level 2 to the HC context (LZ4MID).
     let use_hc = matches!(level, Some(l) if l >= 2);
-    let flg: u8 = FLG_VERSION_BITS;
+    let mut flg: u8 = FLG_VERSION_BITS;
+    if !block_linked {
+        flg |= FLG_BLOCK_INDEPENDENT;
+    }
+    if content_checksum {
+        flg |= FLG_CONTENT_CHECKSUM;
+    }
     let bd: u8 = DEFAULT_BLOCK_SIZE_CODE << 4;
     out.push(flg);
     out.push(bd);
@@ -81,6 +100,14 @@ pub fn encode_frame_at(input: &[u8], level: Option<u32>) -> Vec<u8> {
 
         // Compress the block; if the compressed payload >= raw size, emit raw.
         compressed.clear();
+        if !block_linked && pos > 0 {
+            // Independent blocks: fresh context, no history.
+            if use_hc {
+                hc_ctx = Some(super::hc::HcCtx::new());
+            } else {
+                fast_ctx = Some(block::FastCtx::new());
+            }
+        }
         if let Some(ctx) = hc_ctx.as_mut() {
             super::hc::compress_block_hc_continue(ctx, input, pos, chunk_end, &mut compressed, hc_level);
         } else {
@@ -102,6 +129,9 @@ pub fn encode_frame_at(input: &[u8], level: Option<u32>) -> Vec<u8> {
 
     // End-of-frame marker.
     out.extend_from_slice(&0u32.to_le_bytes());
+    if content_checksum {
+        out.extend_from_slice(&xxhash32(input, 0).to_le_bytes());
+    }
     out
 }
 

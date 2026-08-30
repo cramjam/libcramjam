@@ -199,3 +199,22 @@ fn self_roundtrip_all_levels() {
         );
     }
 }
+
+/// Frame options the Python wrapper exposes: independent blocks and the
+/// xxhash32 content checksum. The C decoder verifies both.
+#[test]
+fn frame_options_content_checksum_and_independent_blocks() {
+    use std::io::Read;
+    let data: Vec<u8> = (0..300_000u32).map(|i| ((i * 7919) % 251) as u8 ^ (i >> 12) as u8).collect();
+    for &(linked, checksum) in &[(true, true), (false, true), (false, false), (true, false)] {
+        for level in [1u32, 2, 4, 9] {
+            let frame = libcramjam::lz4_frame_opts_for_tests(&data, Some(level), linked, checksum);
+            let mut out = Vec::new();
+            lz4::Decoder::new(&frame[..]).unwrap().read_to_end(&mut out).unwrap();
+            assert_eq!(out, data, "linked={linked} checksum={checksum} level={level}");
+            let mut ours = Vec::new();
+            libcramjam::lz4::decompress(&mut std::io::Cursor::new(&frame), &mut ours).unwrap();
+            assert_eq!(ours, data);
+        }
+    }
+}

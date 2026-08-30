@@ -12,14 +12,25 @@ pub struct Lz4StreamCompressor<W: Write = Vec<u8>> {
     input: Vec<u8>,
     output: W,
     level: u32,
+    block_linked: bool,
+    content_checksum: bool,
 }
 
 impl<W: Write> Lz4StreamCompressor<W> {
     pub fn new(output: W, level: u32) -> Self {
+        Self::with_options(output, level, true, false)
+    }
+
+    /// `block_linked = false` emits independent blocks; `content_checksum`
+    /// appends the xxhash32 content checksum (the C `LZ4F_preferences_t`
+    /// knobs the Python wrapper exposes).
+    pub fn with_options(output: W, level: u32, block_linked: bool, content_checksum: bool) -> Self {
         Self {
             input: Vec::new(),
             output,
             level,
+            block_linked,
+            content_checksum,
         }
     }
 
@@ -27,8 +38,12 @@ impl<W: Write> Lz4StreamCompressor<W> {
         &self.output
     }
 
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.output
+    }
+
     pub fn finish(mut self) -> io::Result<W> {
-        let frame = frame::encode_frame_at(&self.input, Some(self.level));
+        let frame = frame::encode_frame_opts(&self.input, Some(self.level), self.block_linked, self.content_checksum);
         self.output.write_all(&frame)?;
         Ok(self.output)
     }

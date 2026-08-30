@@ -379,6 +379,10 @@ impl<W: Write> GzipStreamCompressor<W> {
         &self.output
     }
 
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.output
+    }
+
     pub fn finish(mut self) -> io::Result<W> {
         let mut buf = Vec::with_capacity(self.input.len() / 2);
         gzip_compress(&mut std::io::Cursor::new(self.input), &mut buf, Some(self.level))?;
@@ -418,6 +422,10 @@ impl<W: Write> DeflateStreamCompressor<W> {
         &self.output
     }
 
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.output
+    }
+
     pub fn finish(mut self) -> io::Result<W> {
         let mut buf = Vec::with_capacity(self.input.len() / 2);
         deflate_compress(&mut std::io::Cursor::new(self.input), &mut buf, Some(self.level))?;
@@ -455,6 +463,10 @@ impl<W: Write> ZlibStreamCompressor<W> {
 
     pub fn get_ref(&self) -> &W {
         &self.output
+    }
+
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.output
     }
 
     pub fn finish(mut self) -> io::Result<W> {
