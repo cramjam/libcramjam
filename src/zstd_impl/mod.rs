@@ -27,11 +27,9 @@ pub fn decompress<W: Write + ?Sized, R: Read>(
     mut input: R,
     output: &mut W,
 ) -> io::Result<usize> {
-    let mut data = Vec::new();
-    input.read_to_end(&mut data)?;
-
     let mut sink = crate::SinkRef(output);
-    crate::scratch_with(|buf| {
+    crate::scratch_pair_with(|data, buf| {
+        input.read_to_end(data)?;
         let mut consumed = 0usize;
         let mut total = 0usize;
         while consumed < data.len() {
@@ -58,15 +56,15 @@ pub fn compress<W: Write + ?Sized, R: Read>(
     input_size: Option<usize>,
 ) -> io::Result<usize> {
     let level = level.unwrap_or(DEFAULT_COMPRESSION_LEVEL);
-    let mut data = Vec::new();
-    if let Some(hint) = input_size {
-        data.reserve(hint);
-    }
-    input.read_to_end(&mut data)?;
-
-    let compressed = encode::encode_frame(&data, level, Some(data.len() as u64));
-    output.write_all(&compressed)?;
-    Ok(compressed.len())
+    crate::scratch_pair_with(|data, out| {
+        if let Some(hint) = input_size {
+            data.reserve(hint);
+        }
+        input.read_to_end(data)?;
+        encode::encode_frame_into(out, data, level);
+        output.write_all(out)?;
+        Ok(out.len())
+    })
 }
 
 /// Compress a byte slice into a new `Vec` (no intermediate input copy).

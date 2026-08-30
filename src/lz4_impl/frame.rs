@@ -47,6 +47,7 @@ pub fn encode_frame(input: &[u8]) -> Vec<u8> {
 /// (`block::compress_block_fast_continue`); `Some(2..=12)` selects the HC
 /// context (level 2 = `LZ4MID`, 3-9 hash chain, 10-12 optimal) — matching
 /// lz4frame's `LZ4HC_CLEVEL_MIN` routing.
+#[cfg(test)]
 pub fn encode_frame_at(input: &[u8], level: Option<u32>) -> Vec<u8> {
     encode_frame_opts(input, level, true, false)
 }
@@ -62,7 +63,13 @@ const FLG_CONTENT_CHECKSUM: u8 = 1 << 2;
 /// of the input after the end marker.
 pub fn encode_frame_opts(input: &[u8], level: Option<u32>, block_linked: bool, content_checksum: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len() + 32);
-    write_frame_header(&mut out, block_linked, content_checksum);
+    encode_frame_opts_into(&mut out, input, level, block_linked, content_checksum);
+    out
+}
+
+/// [`encode_frame_opts`] appending to a caller-provided buffer.
+pub fn encode_frame_opts_into(out: &mut Vec<u8>, input: &[u8], level: Option<u32>, block_linked: bool, content_checksum: bool) {
+    write_frame_header(out, block_linked, content_checksum);
     // `LZ4HC_CLEVEL_MIN` = 2: C routes level 2 to the HC context (LZ4MID).
     let use_hc = use_hc_for(level);
 
@@ -87,7 +94,7 @@ pub fn encode_frame_opts(input: &[u8], level: Option<u32>, block_linked: bool, c
             block::compress_block_fast_continue(fast_ctx.as_mut().unwrap(), input, pos, chunk_end, &mut compressed);
         }
 
-        emit_block(&mut out, &compressed, chunk);
+        emit_block(out, &compressed, chunk);
         pos = chunk_end;
     }
 
@@ -96,7 +103,6 @@ pub fn encode_frame_opts(input: &[u8], level: Option<u32>, block_linked: bool, c
     if content_checksum {
         out.extend_from_slice(&xxhash32(input, 0).to_le_bytes());
     }
-    out
 }
 
 /// One independent block (`LZ4F_blockIndependent`): the block is its own

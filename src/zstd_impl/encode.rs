@@ -34,14 +34,19 @@ const MAX_FRAME_INPUT: usize = 1 << 30;
 /// the strongest lazy2 configuration).
 pub fn encode_frame(input: &[u8], level: i32, _content_size: Option<u64>) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len() / 2 + 64);
+    encode_frame_into(&mut out, input, level);
+    out
+}
+
+/// [`encode_frame`] appending to a caller-provided buffer.
+pub fn encode_frame_into(out: &mut Vec<u8>, input: &[u8], level: i32) {
     if input.len() > MAX_FRAME_INPUT {
         for chunk in input.chunks(MAX_FRAME_INPUT) {
-            encode_one_frame(&mut out, chunk, level);
+            encode_one_frame(out, chunk, level);
         }
     } else {
-        encode_one_frame(&mut out, input, level);
+        encode_one_frame(out, input, level);
     }
-    out
 }
 
 fn encode_one_frame(out: &mut Vec<u8>, input: &[u8], level: i32) {

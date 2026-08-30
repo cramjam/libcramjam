@@ -40,6 +40,39 @@ pub(crate) fn with_scratch<W: std::io::Write + ?Sized>(
     })
 }
 
+/// Two retained thread-local buffers (input copy + encoded output) for the
+/// generic `Read`/`Write` wrappers of the fast codecs: a fresh 50 MB `Vec`
+/// per call is ~13k page faults (glibc mmaps/unmaps at that size), which on
+/// lz4/zstd is as expensive as the codec itself. Both are cleared on entry.
+#[cfg(any(feature = "lz4", feature = "zstd"))]
+pub(crate) fn scratch_pair_with<R>(f: impl FnOnce(&mut Vec<u8>, &mut Vec<u8>) -> std::io::Result<R>) -> std::io::Result<R> {
+    use std::cell::RefCell;
+    const SCRATCH_KEEP_MAX: usize = 64 << 20;
+    thread_local! {
+        static A: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+        static B: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
+    A.with(|ca| {
+        B.with(|cb| {
+            let mut ga = ca.try_borrow_mut().ok();
+            let mut gb = cb.try_borrow_mut().ok();
+            let (mut ta, mut tb) = (Vec::new(), Vec::new());
+            let a: &mut Vec<u8> = ga.as_deref_mut().unwrap_or(&mut ta);
+            let b: &mut Vec<u8> = gb.as_deref_mut().unwrap_or(&mut tb);
+            a.clear();
+            b.clear();
+            let out = f(a, b);
+            if a.capacity() > SCRATCH_KEEP_MAX {
+                *a = Vec::new();
+            }
+            if b.capacity() > SCRATCH_KEEP_MAX {
+                *b = Vec::new();
+            }
+            out
+        })
+    })
+}
+
 /// Raw access to the thread-local scratch buffer (cleared on entry).
 #[cfg(any(feature = "lz4", feature = "zstd", feature = "bzip2", feature = "xz", feature = "deflate-static", feature = "deflate-shared"))]
 pub(crate) fn scratch_with<R>(f: impl FnOnce(&mut Vec<u8>) -> std::io::Result<R>) -> std::io::Result<R> {

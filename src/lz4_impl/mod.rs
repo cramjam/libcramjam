@@ -182,11 +182,12 @@ pub fn compress<W: Write + ?Sized, R: Read>(
     output: &mut W,
     level: Option<u32>,
 ) -> io::Result<usize> {
-    let mut data = Vec::new();
-    input.read_to_end(&mut data)?;
-    let frame = frame::encode_frame_at(&data, level);
-    output.write_all(&frame)?;
-    Ok(frame.len())
+    crate::scratch_pair_with(|data, out| {
+        input.read_to_end(data)?;
+        frame::encode_frame_opts_into(out, data, level, true, false);
+        output.write_all(out)?;
+        Ok(out.len())
+    })
 }
 
 /// Decompress an LZ4 frame from `input` into `output`.
@@ -194,10 +195,9 @@ pub fn decompress<W: Write + ?Sized, R: Read>(
     mut input: R,
     output: &mut W,
 ) -> io::Result<usize> {
-    let mut data = Vec::new();
-    input.read_to_end(&mut data)?;
     let mut sink = crate::SinkRef(output);
-    crate::scratch_with(|buf| {
+    crate::scratch_pair_with(|data, buf| {
+        input.read_to_end(data)?;
         let mut consumed = 0usize;
         let mut total = 0usize;
         while consumed < data.len() {
