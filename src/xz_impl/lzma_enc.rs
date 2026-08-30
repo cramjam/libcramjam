@@ -191,6 +191,15 @@ static CRC32_TABLE: [u32; 256] = {
     t
 };
 
+// SAFETY: `buf_ptr` is a plain view into memory the owner controls (the
+// streaming encoder's own `Vec`, or a one-shot input slice that outlives the
+// `Mf`); it carries no thread affinity and the owner re-points it with
+// `set_buf` after every change, so moving/sharing `Mf` across threads is no
+// different from moving the `Vec`. Needed so `XzStreamCompressor` stays
+// `Send + Sync` (pyo3 `#[pyclass]` in cramjam requires it).
+unsafe impl Send for Mf {}
+unsafe impl Sync for Mf {}
+
 pub struct Mf {
     /// The input buffer. A raw view rather than a borrow so the streaming
     /// driver can own, grow and slide the buffer between calls (it must

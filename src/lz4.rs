@@ -90,6 +90,15 @@ pub mod block {
                     "Input not long enough for prepended size",
                 ));
             }
+            // Honour the stored size like `LZ4_decompress_safe` callers do:
+            // the caller's buffer must hold at least that much.
+            let stored = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
+            if stored > output.len() {
+                return Err(Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("lz4 block: output buffer too small ({} < stored size {})", output.len(), stored),
+                ));
+            }
             &input[4..]
         } else {
             input
