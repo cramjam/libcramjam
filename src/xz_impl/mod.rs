@@ -69,23 +69,87 @@ pub fn decode_xz_into(input: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
     Ok(())
 }
 
-/// Streaming Write-adapter so the cramjam Python wrapper can wrap an output
-/// sink the same way it currently does with `xz2::write::XzEncoder`.
-/// Buffers all input then encodes once on `finish` (matching the bzip2/zstd
-/// adapters in this crate).
+/// Streaming `.xz` compressor with the semantics of liblzma's encoder
+/// (`xz2::write::XzEncoder`): the stream and block headers are written up
+/// front, `write` feeds the LZMA2 encoder (keeping only the dictionary
+/// window plus a reserve in memory), `flush` is `LZMA_SYNC_FLUSH` — the
+/// current chunk is finished so everything written so far decodes — and
+/// `finish` is `LZMA_FINISH` (end marker, padding, check, index, footer).
 pub struct XzStreamCompressor<W: Write> {
-    input: Vec<u8>,
     output: W,
-    preset: u32,
+    inner: Option<XzStreamState>,
+    /// Set when the preset was invalid; reported on first use.
+    error: Option<String>,
+}
+
+struct XzStreamState {
+    lzma2: lzma_enc::Lzma2StreamEncoder,
+    check: Check,
+    digest: XzDigest,
+    dict_size: u32,
+    started: bool,
+    block_header_size: usize,
+    payload_size: u64,
+    total_in: u64,
+}
+
+enum XzDigest {
+    None,
+    Crc32(crc32fast::Hasher),
+    Crc64(crc_fast::Digest),
+}
+
+impl XzDigest {
+    fn new(check: Check) -> io::Result<Self> {
+        Ok(match check {
+            Check::None => Self::None,
+            Check::Crc32 => Self::Crc32(crc32fast::Hasher::new()),
+            Check::Crc64 => Self::Crc64(crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc64Xz)),
+            Check::Sha256 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "xz: SHA-256 check not yet supported",
+                ))
+            }
+        })
+    }
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            Self::None => {}
+            Self::Crc32(h) => h.update(data),
+            Self::Crc64(d) => d.update(data),
+        }
+    }
+    fn finalize(self) -> Vec<u8> {
+        match self {
+            Self::None => Vec::new(),
+            Self::Crc32(h) => h.finalize().to_le_bytes().to_vec(),
+            Self::Crc64(d) => d.finalize().to_le_bytes().to_vec(),
+        }
+    }
 }
 
 impl<W: Write> XzStreamCompressor<W> {
     pub fn new(output: W, preset: u32) -> Self {
-        Self {
-            input: Vec::new(),
-            output,
-            preset,
+        match Self::state_for(preset) {
+            Ok(inner) => Self { output, inner: Some(inner), error: None },
+            Err(e) => Self { output, inner: None, error: Some(e.to_string()) },
         }
+    }
+
+    fn state_for(preset: u32) -> io::Result<XzStreamState> {
+        let opts = LzmaOptions::new_preset(preset)?;
+        let check = Check::Crc64;
+        Ok(XzStreamState {
+            lzma2: lzma_enc::Lzma2StreamEncoder::new(&opts)?,
+            check,
+            digest: XzDigest::new(check)?,
+            dict_size: opts.dict_size,
+            started: false,
+            block_header_size: 0,
+            payload_size: 0,
+            total_in: 0,
+        })
     }
 
     pub fn get_ref(&self) -> &W {
@@ -96,22 +160,77 @@ impl<W: Write> XzStreamCompressor<W> {
         &mut self.output
     }
 
-    /// Encode the buffered input and write it to the underlying sink, then
-    /// return the sink.
+    fn state(&mut self) -> io::Result<(&mut XzStreamState, &mut W)> {
+        match (self.inner.as_mut(), &self.error) {
+            (Some(st), _) => Ok((st, &mut self.output)),
+            (None, Some(e)) => Err(io::Error::new(io::ErrorKind::InvalidInput, e.clone())),
+            (None, None) => Err(io::Error::new(io::ErrorKind::Other, "xz: compressor already finished")),
+        }
+    }
+
+    /// Stream header + block header, once.
+    fn start(st: &mut XzStreamState, output: &mut W) -> io::Result<()> {
+        if !st.started {
+            let mut head = Vec::with_capacity(32);
+            xz_format::write_stream_header(&mut head, st.check);
+            st.block_header_size = xz_format::write_block_header(&mut head, st.dict_size);
+            output.write_all(&head)?;
+            st.started = true;
+        }
+        Ok(())
+    }
+
+    fn drain(st: &mut XzStreamState, output: &mut W) -> io::Result<()> {
+        if !st.lzma2.out.is_empty() {
+            output.write_all(&st.lzma2.out)?;
+            st.payload_size += st.lzma2.out.len() as u64;
+            st.lzma2.out.clear();
+        }
+        Ok(())
+    }
+
+    /// `LZMA_FINISH`: close the stream and return the sink.
     pub fn finish(mut self) -> io::Result<W> {
-        let compressed = encode_xz(&self.input, self.preset)?;
-        self.output.write_all(&compressed)?;
+        let (st, output) = self.state()?;
+        Self::start(st, output)?;
+        st.lzma2.finish_input(lzma_enc::Action::Finish);
+        Self::drain(st, output)?;
+        let mut st = self.inner.take().unwrap();
+        let mut tail = Vec::with_capacity(64);
+        let stream_flags = [0u8, st.check.id() & 0x0F];
+        let digest = std::mem::replace(&mut st.digest, XzDigest::None);
+        xz_format::write_block_trailer(
+            &mut tail,
+            st.block_header_size,
+            st.payload_size,
+            st.check,
+            &digest.finalize(),
+            st.total_in,
+            stream_flags,
+        );
+        self.output.write_all(&tail)?;
         Ok(self.output)
     }
 }
 
 impl<W: Write> Write for XzStreamCompressor<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.input.extend_from_slice(buf);
+        let (st, output) = self.state()?;
+        Self::start(st, output)?;
+        st.digest.update(buf);
+        st.total_in += buf.len() as u64;
+        st.lzma2.write(buf);
+        Self::drain(st, output)?;
         Ok(buf.len())
     }
+
+    /// `LZMA_SYNC_FLUSH`: everything written so far becomes decodable.
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        let (st, output) = self.state()?;
+        Self::start(st, output)?;
+        st.lzma2.finish_input(lzma_enc::Action::Flush);
+        Self::drain(st, output)?;
+        output.flush()
     }
 }
 
