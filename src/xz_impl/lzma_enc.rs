@@ -191,12 +191,20 @@ static CRC32_TABLE: [u32; 256] = {
     t
 };
 
-pub struct Mf<'a> {
-    buf: &'a [u8],
+pub struct Mf {
+    /// The input buffer. A raw view rather than a borrow so the streaming
+    /// driver can own, grow and slide the buffer between calls (it must
+    /// call [`Mf::set_buf`] after every change); the one-shot paths point
+    /// it at their input slice for the whole run.
+    buf_ptr: *const u8,
+    buf_len: usize,
     /// `buf[read_pos]` is the next byte to run through the match finder.
     read_pos: u32,
     /// Bytes run through the match finder but not yet encoded.
     read_ahead: u32,
+    /// Bytes skipped by `move_pending` at the end of the input that must
+    /// be re-hashed once more input arrives (liblzma `mf->pending`).
+    pending: u32,
     /// `buf.len()`.
     write_pos: u32,
     /// Stored position = index + offset (starts at `cyclic_size`).
@@ -211,8 +219,8 @@ pub struct Mf<'a> {
     kind: MatchFinder,
 }
 
-impl<'a> Mf<'a> {
-    pub fn new(buf: &'a [u8], dict_size: u32, kind: MatchFinder, nice_len: u32, depth: u32) -> Self {
+impl Mf {
+    pub fn new(buf: &[u8], dict_size: u32, kind: MatchFinder, nice_len: u32, depth: u32) -> Self {
         let hash_bytes: u32 = match kind {
             MatchFinder::BinaryTree2 => 2,
             MatchFinder::HashChain3 | MatchFinder::BinaryTree3 => 3,
@@ -258,9 +266,11 @@ impl<'a> Mf<'a> {
         };
 
         Self {
-            buf,
+            buf_ptr: buf.as_ptr(),
+            buf_len: buf.len(),
             read_pos: 0,
             read_ahead: 0,
+            pending: 0,
             write_pos: buf.len() as u32,
             offset: cyclic_size,
             hash: vec![EMPTY_HASH_VALUE; hash_count],
@@ -272,6 +282,64 @@ impl<'a> Mf<'a> {
             depth,
             nice_len,
             kind,
+        }
+    }
+
+    /// The input buffer.
+    #[inline(always)]
+    fn buf(&self) -> &[u8] {
+        // SAFETY: `buf_ptr`/`buf_len` always describe the caller's live
+        // buffer (see `set_buf`); the one-shot paths never change it and
+        // the streaming driver refreshes it before every call.
+        unsafe { core::slice::from_raw_parts(self.buf_ptr, self.buf_len) }
+    }
+
+    /// Point the match finder at (the current version of) its input
+    /// buffer; `write_pos` becomes its length.
+    pub fn set_buf(&mut self, buf: &[u8]) {
+        self.buf_ptr = buf.as_ptr();
+        self.buf_len = buf.len();
+        self.write_pos = buf.len() as u32;
+    }
+
+    #[inline(always)]
+    pub fn read_pos(&self) -> u32 {
+        self.read_pos
+    }
+
+    #[inline(always)]
+    pub fn read_ahead(&self) -> u32 {
+        self.read_ahead
+    }
+
+    /// liblzma `move_window`: drop history so that `keep_size_before` bytes
+    /// remain before `read_pos`. Returns how many bytes the caller must
+    /// remove from the front of its buffer (then call [`set_buf`]). Stored
+    /// positions stay valid because `read_pos + offset` is unchanged.
+    pub fn move_window(&mut self, keep_size_before: u32) -> usize {
+        debug_assert!(self.read_pos > keep_size_before);
+        let move_offset = (self.read_pos - keep_size_before) & !15u32;
+        self.offset += move_offset;
+        self.read_pos -= move_offset;
+        move_offset as usize
+    }
+
+    /// `fill_window`'s restart after a sync flush: bytes consumed by
+    /// `move_pending` are rewound and run through the hash so later data
+    /// can match against them. Doesn't touch `read_ahead`.
+    pub fn rehash_pending(&mut self, read_limit: u32) {
+        if self.pending > 0 && self.read_pos < read_limit {
+            let pending = self.pending;
+            self.pending = 0;
+            debug_assert!(self.read_pos >= pending);
+            self.read_pos -= pending;
+            match self.kind {
+                MatchFinder::HashChain3 => self.hc3_skip(pending),
+                MatchFinder::HashChain4 => self.hc4_skip(pending),
+                MatchFinder::BinaryTree2 => self.bt2_skip(pending),
+                MatchFinder::BinaryTree3 => self.bt3_skip(pending),
+                MatchFinder::BinaryTree4 => self.bt4_skip(pending),
+            }
         }
     }
 
@@ -315,11 +383,12 @@ impl<'a> Mf<'a> {
     }
 
     /// Too little input left to hash: consume the byte without indexing it
-    /// (C's `move_pending`; we are always finishing, so nothing is ever
-    /// rewound).
+    /// (C's `move_pending`). The streaming driver rewinds and re-hashes
+    /// these once more input arrives (`rehash_pending`).
     #[inline(always)]
     fn move_pending(&mut self) {
         self.read_pos += 1;
+        self.pending += 1;
     }
 
     /// C's `header()`: `Some(len_limit)` or `None` after `move_pending`.
@@ -340,8 +409,8 @@ impl<'a> Mf<'a> {
     /// `cur + 2 / cur + 3 < write_pos == buf.len()`.
     #[inline(always)]
     fn hash3(&self, cur: usize) -> (u32, u32) {
-        debug_assert!(cur + 3 <= self.buf.len());
-        let b = self.buf.as_ptr();
+        debug_assert!(cur + 3 <= self.buf().len());
+        let b = self.buf().as_ptr();
         let (b0, b1, b2) = unsafe { (*b.add(cur), *b.add(cur + 1), *b.add(cur + 2)) };
         let temp = CRC32_TABLE[b0 as usize] ^ b1 as u32;
         let h2 = temp & HASH_2_MASK;
@@ -351,8 +420,8 @@ impl<'a> Mf<'a> {
 
     #[inline(always)]
     fn hash4(&self, cur: usize) -> (u32, u32, u32) {
-        debug_assert!(cur + 4 <= self.buf.len());
-        let b = self.buf.as_ptr();
+        debug_assert!(cur + 4 <= self.buf().len());
+        let b = self.buf().as_ptr();
         let (b0, b1, b2, b3) = unsafe { (*b.add(cur), *b.add(cur + 1), *b.add(cur + 2), *b.add(cur + 3)) };
         let temp = CRC32_TABLE[b0 as usize] ^ b1 as u32;
         let h2 = temp & HASH_2_MASK;
@@ -382,7 +451,7 @@ impl<'a> Mf<'a> {
                 }
                 let p1 = self.read_pos as usize - 1;
                 let p2 = p1 - matches[count - 1].dist as usize - 1;
-                len_best = memcmplen(self.buf, p1, p2, len_best, limit);
+                len_best = memcmplen(self.buf(), p1, p2, len_best, limit);
             }
         }
         self.read_ahead += 1;
@@ -423,7 +492,7 @@ impl<'a> Mf<'a> {
         // `pb` inside the buffer, and `len_best < len_limit <= avail` keeps
         // `cur + len_best < buf.len()`.
         let son = self.son.as_mut_ptr();
-        let b = self.buf.as_ptr();
+        let b = self.buf().as_ptr();
         unsafe {
             *son.add(cyclic_pos as usize) = cur_match;
             loop {
@@ -435,7 +504,7 @@ impl<'a> Mf<'a> {
                 let pb = cur - delta as usize;
                 cur_match = *son.add(cyclic_pos.wrapping_sub(delta).wrapping_add(if delta > cyclic_pos { cyclic_size } else { 0 }) as usize);
                 if *b.add(pb + len_best as usize) == *b.add(cur + len_best as usize) && *b.add(pb) == *b.add(cur) {
-                    let len = memcmplen(self.buf, cur, pb, 1, len_limit);
+                    let len = memcmplen(self.buf(), cur, pb, 1, len_limit);
                     if len_best < len {
                         len_best = len;
                         *matches.get_unchecked_mut(count) = Match { len, dist: delta - 1 };
@@ -468,8 +537,8 @@ impl<'a> Mf<'a> {
 
         let mut len_best = 2;
         let mut count = 0usize;
-        if delta2 < self.cyclic_size && self.buf[cur - delta2 as usize] == self.buf[cur] {
-            len_best = memcmplen(self.buf, cur, cur - delta2 as usize, len_best, len_limit);
+        if delta2 < self.cyclic_size && self.buf()[cur - delta2 as usize] == self.buf()[cur] {
+            len_best = memcmplen(self.buf(), cur, cur - delta2 as usize, len_best, len_limit);
             matches[0] = Match { len: len_best, dist: delta2 - 1 };
             count = 1;
             if len_best == len_limit {
@@ -518,19 +587,19 @@ impl<'a> Mf<'a> {
 
         let mut len_best = 1;
         let mut count = 0usize;
-        if delta2 < self.cyclic_size && self.buf[cur - delta2 as usize] == self.buf[cur] {
+        if delta2 < self.cyclic_size && self.buf()[cur - delta2 as usize] == self.buf()[cur] {
             len_best = 2;
             matches[0] = Match { len: 2, dist: delta2 - 1 };
             count = 1;
         }
-        if delta2 != delta3 && delta3 < self.cyclic_size && self.buf[cur - delta3 as usize] == self.buf[cur] {
+        if delta2 != delta3 && delta3 < self.cyclic_size && self.buf()[cur - delta3 as usize] == self.buf()[cur] {
             len_best = 3;
             matches[count].dist = delta3 - 1;
             count += 1;
             delta2 = delta3;
         }
         if count != 0 {
-            len_best = memcmplen(self.buf, cur, cur - delta2 as usize, len_best, len_limit);
+            len_best = memcmplen(self.buf(), cur, cur - delta2 as usize, len_best, len_limit);
             matches[count - 1].len = len_best;
             if len_best == len_limit {
                 self.hc_skip_one(cur_match);
@@ -586,7 +655,7 @@ impl<'a> Mf<'a> {
         // every index is `2 * (x mod cyclic_size) + {0, 1}`. `len < len_limit`
         // whenever `b[.. + len]` is read (a full-length match returns).
         let son = self.son.as_mut_ptr();
-        let b = self.buf.as_ptr();
+        let b = self.buf().as_ptr();
         let mut ptr0 = ((cyclic_pos as usize) << 1) + 1;
         let mut ptr1 = (cyclic_pos as usize) << 1;
         let mut len0 = 0u32;
@@ -604,7 +673,7 @@ impl<'a> Mf<'a> {
                 let pb = cur - delta as usize;
                 let mut len = len0.min(len1);
                 if *b.add(pb + len as usize) == *b.add(cur + len as usize) {
-                    len = memcmplen(self.buf, cur, pb, len + 1, len_limit);
+                    len = memcmplen(self.buf(), cur, pb, len + 1, len_limit);
                     if len_best < len {
                         len_best = len;
                         *matches.get_unchecked_mut(count) = Match { len, dist: delta - 1 };
@@ -637,7 +706,7 @@ impl<'a> Mf<'a> {
         let mut depth = self.depth;
         // SAFETY: see `bt_find_func`.
         let son = self.son.as_mut_ptr();
-        let b = self.buf.as_ptr();
+        let b = self.buf().as_ptr();
         let mut ptr0 = ((cyclic_pos as usize) << 1) + 1;
         let mut ptr1 = (cyclic_pos as usize) << 1;
         let mut len0 = 0u32;
@@ -655,7 +724,7 @@ impl<'a> Mf<'a> {
                 let pb = cur - delta as usize;
                 let mut len = len0.min(len1);
                 if *b.add(pb + len as usize) == *b.add(cur + len as usize) {
-                    len = memcmplen(self.buf, cur, pb, len + 1, len_limit);
+                    len = memcmplen(self.buf(), cur, pb, len + 1, len_limit);
                     if len == len_limit {
                         *son.add(ptr1) = *son.add(pair);
                         *son.add(ptr0) = *son.add(pair + 1);
@@ -679,7 +748,7 @@ impl<'a> Mf<'a> {
 
     #[inline(always)]
     fn hash2(&self, cur: usize) -> u32 {
-        (self.buf[cur] as u32) | ((self.buf[cur + 1] as u32) << 8)
+        (self.buf()[cur] as u32) | ((self.buf()[cur + 1] as u32) << 8)
     }
 
     #[inline]
@@ -727,8 +796,8 @@ impl<'a> Mf<'a> {
 
         let mut len_best = 2;
         let mut count = 0usize;
-        if delta2 < self.cyclic_size && self.buf[cur - delta2 as usize] == self.buf[cur] {
-            len_best = memcmplen(self.buf, cur, cur - delta2 as usize, len_best, len_limit);
+        if delta2 < self.cyclic_size && self.buf()[cur - delta2 as usize] == self.buf()[cur] {
+            len_best = memcmplen(self.buf(), cur, cur - delta2 as usize, len_best, len_limit);
             matches[0] = Match { len: len_best, dist: delta2 - 1 };
             count = 1;
             if len_best == len_limit {
@@ -777,19 +846,19 @@ impl<'a> Mf<'a> {
 
         let mut len_best = 1;
         let mut count = 0usize;
-        if delta2 < self.cyclic_size && self.buf[cur - delta2 as usize] == self.buf[cur] {
+        if delta2 < self.cyclic_size && self.buf()[cur - delta2 as usize] == self.buf()[cur] {
             len_best = 2;
             matches[0] = Match { len: 2, dist: delta2 - 1 };
             count = 1;
         }
-        if delta2 != delta3 && delta3 < self.cyclic_size && self.buf[cur - delta3 as usize] == self.buf[cur] {
+        if delta2 != delta3 && delta3 < self.cyclic_size && self.buf()[cur - delta3 as usize] == self.buf()[cur] {
             len_best = 3;
             matches[count].dist = delta3 - 1;
             count += 1;
             delta2 = delta3;
         }
         if count != 0 {
-            len_best = memcmplen(self.buf, cur, cur - delta2 as usize, len_best, len_limit);
+            len_best = memcmplen(self.buf(), cur, cur - delta2 as usize, len_best, len_limit);
             matches[count - 1].len = len_best;
             if len_best == len_limit {
                 self.bt_skip_func(len_limit, pos, cur, cur_match);
@@ -1272,6 +1341,47 @@ impl Lzma1Encoder {
             position = position.wrapping_add(len);
         }
         self.rc.finish();
+    }
+
+    /// `lzma_lzma_encode` for the streaming LZMA2 driver: like
+    /// [`encode_chunk`] but honours the match finder's `read_limit` and, in
+    /// RUN mode, returns `false` with the chunk still open (range coder not
+    /// flushed) when more input is needed. Returns `true` once the chunk is
+    /// complete and the range coder flushed.
+    fn encode_chunk_run(&mut self, buf: &[u8], mf: &mut Mf, limit: u32, read_limit: u32, run: bool) -> bool {
+        if !self.is_initialized {
+            // C's `encode_init`: nothing can be done in RUN mode without a
+            // byte below the read limit.
+            if run && mf.read_pos >= read_limit {
+                return false;
+            }
+            self.encode_init(buf, mf);
+        }
+        let mut position = mf.position();
+        loop {
+            if mf.read_pos - mf.read_ahead >= limit
+                || self.rc.output.len() + self.rc.cache_size as usize + 4 >= LZMA2_CHUNK_MAX - LOOP_INPUT_MAX as usize
+            {
+                break;
+            }
+            if mf.read_pos >= read_limit {
+                if run {
+                    return false;
+                }
+                if mf.read_ahead == 0 {
+                    break;
+                }
+            }
+            let (back, len) = if self.fast_mode {
+                self.optimum_fast(buf, mf)
+            } else {
+                self.optimum_normal(buf, mf, position)
+            };
+            self.encode_symbol(buf, mf, back, len, position);
+            position = position.wrapping_add(len);
+        }
+        self.rc.finish();
+        true
     }
 
     // =====================================================================
@@ -2139,4 +2249,224 @@ pub fn encode_lzma_alone(input: &[u8], opts: &LzmaOptions, output: &mut Vec<u8>)
     enc.encode_stream(input, &mut mf);
     output.extend_from_slice(&enc.rc.output);
     Ok(())
+}
+
+// =========================================================================
+// Streaming LZMA2 encoder (lz_encoder.c + lzma2_encoder.c)
+// =========================================================================
+
+/// What the caller wants from [`Lzma2StreamEncoder::encode`] — liblzma's
+/// `lzma_action` for the encoder side.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Action {
+    /// Keep `keep_size_after` bytes of lookahead unencoded, wait for more.
+    Run,
+    /// `LZMA_SYNC_FLUSH`: finish the current chunk so everything written so
+    /// far is decodable; the dictionary is kept.
+    Flush,
+    /// `LZMA_FINISH`: like `Flush`, then the LZMA2 end marker.
+    Finish,
+}
+
+/// Incremental LZMA2 encoder: the match finder works over a sliding window
+/// (`keep_size_before` = dict + OPTS + 64 KiB of history, plus a reserve so
+/// the memmove is amortised), input is consumed as it arrives, chunks are
+/// emitted into [`out`](Self::out) exactly as `lzma2_encode` does. A single
+/// `write` + `Finish` produces the same bytes as [`encode_lzma_to_lzma2`]
+/// for inputs that fit in one window.
+pub struct Lzma2StreamEncoder {
+    opts: LzmaOptions,
+    enc: Lzma1Encoder,
+    mf: Mf,
+    buf: Vec<u8>,
+    keep_size_before: u32,
+    keep_size_after: u32,
+    capacity: u32,
+    read_limit: u32,
+    chunk_open: bool,
+    uncompressed_size: u32,
+    need_properties: bool,
+    need_state_reset: bool,
+    need_dictionary_reset: bool,
+    finished: bool,
+    /// Encoded LZMA2 bytes ready for the caller to drain.
+    pub out: Vec<u8>,
+}
+
+impl Lzma2StreamEncoder {
+    pub fn new(opts: &LzmaOptions) -> io::Result<Self> {
+        let dict_size = opts.dict_size.max(4096);
+        let nice_len = opts.nice_len.clamp(MATCH_LEN_MIN, MATCH_LEN_MAX);
+        let mut eopts = opts.clone();
+        eopts.dict_size = dict_size;
+        eopts.nice_len = nice_len;
+        let enc = Lzma1Encoder::new(&eopts)?;
+        let mf = Mf::new(&[], dict_size, opts.mf, nice_len, opts.depth);
+        // lz_encoder_prepare(): before_size = OPTS (raised so that
+        // before + dict >= LZMA2_CHUNK_MAX for the uncompressed-chunk copy),
+        // after_size = LOOP_INPUT_MAX, plus match_len_max.
+        let before_size = (OPTS as u32).max((LZMA2_CHUNK_MAX as u32).saturating_sub(dict_size));
+        let keep_size_before = before_size + dict_size;
+        let keep_size_after = LOOP_INPUT_MAX + MATCH_LEN_MAX;
+        let mut reserve = dict_size / 2;
+        if reserve > (1u32 << 30) {
+            reserve /= 2;
+        }
+        reserve += (before_size + MATCH_LEN_MAX + LOOP_INPUT_MAX) / 2 + (1u32 << 19);
+        let capacity = keep_size_before + reserve + keep_size_after;
+        Ok(Self {
+            opts: eopts,
+            enc,
+            mf,
+            buf: Vec::with_capacity(1 << 16),
+            keep_size_before,
+            keep_size_after,
+            capacity,
+            read_limit: 0,
+            chunk_open: false,
+            uncompressed_size: 0,
+            need_properties: true,
+            need_state_reset: false,
+            need_dictionary_reset: true,
+            finished: false,
+            out: Vec::new(),
+        })
+    }
+
+    /// Bytes fed in but not yet encoded.
+    pub fn unencoded(&self) -> u32 {
+        self.mf.unencoded()
+    }
+
+    /// `fill_window`'s window move: once the encoder has consumed past the
+    /// reserve, drop everything older than `keep_size_before`.
+    fn maybe_move_window(&mut self) {
+        if self.mf.read_pos() >= self.capacity - self.keep_size_after && self.mf.read_pos() > self.keep_size_before {
+            let off = self.mf.move_window(self.keep_size_before);
+            if off > 0 {
+                self.buf.drain(..off);
+                self.read_limit = self.read_limit.saturating_sub(off as u32);
+                self.mf.set_buf(&self.buf);
+            }
+        }
+    }
+
+    /// Feed input (`LZMA_RUN`): appended to the window in pieces that fit
+    /// the buffer, encoding as it goes and keeping `keep_size_after` bytes
+    /// of lookahead unencoded.
+    pub fn write(&mut self, mut data: &[u8]) {
+        debug_assert!(!self.finished);
+        while !data.is_empty() {
+            self.maybe_move_window();
+            let mut room = (self.capacity as usize).saturating_sub(self.buf.len());
+            if room == 0 {
+                // Buffer full but nothing could be dropped yet: encode what
+                // is allowed, then the window can move.
+                self.encode(Action::Run);
+                self.maybe_move_window();
+                room = (self.capacity as usize).saturating_sub(self.buf.len()).max(1);
+            }
+            let take = room.min(data.len());
+            self.buf.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            self.mf.set_buf(&self.buf);
+            let write_pos = self.mf.write_pos;
+            if write_pos > self.keep_size_after {
+                self.read_limit = write_pos - self.keep_size_after;
+            }
+            self.mf.rehash_pending(self.read_limit);
+            self.encode(Action::Run);
+        }
+    }
+
+    /// `LZMA_SYNC_FLUSH` / `LZMA_FINISH`: allow the encoder to consume
+    /// everything, close the open chunk, and (for `Finish`) write the end
+    /// marker. Output lands in [`out`](Self::out).
+    pub fn finish_input(&mut self, action: Action) {
+        debug_assert!(action != Action::Run);
+        self.read_limit = self.mf.write_pos;
+        self.mf.rehash_pending(self.read_limit);
+        self.encode(action);
+    }
+
+    /// `lzma2_encode`.
+    fn encode(&mut self, action: Action) {
+        loop {
+            if !self.chunk_open {
+                if self.mf.unencoded() == 0 {
+                    if action == Action::Finish && !self.finished {
+                        self.out.push(0x00);
+                        self.finished = true;
+                    }
+                    return;
+                }
+                if self.need_state_reset {
+                    self.enc.reset();
+                }
+                self.enc.rc.reset();
+                self.uncompressed_size = 0;
+                self.chunk_open = true;
+            }
+
+            let left = LZMA2_UNCOMPRESSED_MAX - self.uncompressed_size;
+            let limit = if left < MATCH_LEN_MAX { 0 } else { self.mf.position() + left - MATCH_LEN_MAX };
+            let read_start = self.mf.position();
+            let done = self
+                .enc
+                .encode_chunk_run(&self.buf, &mut self.mf, limit, self.read_limit, action == Action::Run);
+            self.uncompressed_size += self.mf.position() - read_start;
+            debug_assert!(self.uncompressed_size <= LZMA2_UNCOMPRESSED_MAX);
+            if !done {
+                return;
+            }
+
+            let compressed_size = self.enc.rc.output.len();
+            debug_assert!(compressed_size <= LZMA2_CHUNK_MAX);
+            if compressed_size >= self.uncompressed_size as usize {
+                // Didn't shrink: store the chunk (everything the match
+                // finder ran through) uncompressed; the next LZMA chunk
+                // resets the coder state.
+                let size = self.uncompressed_size as usize + self.mf.read_ahead() as usize;
+                self.mf.read_ahead = 0;
+                debug_assert!(size <= LZMA2_CHUNK_MAX);
+                self.out.push(if self.need_dictionary_reset { 1 } else { 2 });
+                self.need_dictionary_reset = false;
+                self.out.push(((size - 1) >> 8) as u8);
+                self.out.push(((size - 1) & 0xFF) as u8);
+                let end = self.mf.read_pos() as usize;
+                self.out.extend_from_slice(&self.buf[end - size..end]);
+                self.need_state_reset = true;
+            } else {
+                let mut hdr = [0u8; LZMA2_HEADER_MAX];
+                let mut pos = 0usize;
+                if self.need_properties {
+                    hdr[0] = if self.need_dictionary_reset { 0x80 + (3 << 5) } else { 0x80 + (2 << 5) };
+                } else {
+                    hdr[0] = if self.need_state_reset { 0x80 + (1 << 5) } else { 0x80 };
+                }
+                let us = self.uncompressed_size as usize - 1;
+                hdr[pos] += (us >> 16) as u8;
+                pos += 1;
+                hdr[pos] = ((us >> 8) & 0xFF) as u8;
+                pos += 1;
+                hdr[pos] = (us & 0xFF) as u8;
+                pos += 1;
+                let cs = compressed_size - 1;
+                hdr[pos] = (cs >> 8) as u8;
+                pos += 1;
+                hdr[pos] = (cs & 0xFF) as u8;
+                pos += 1;
+                if self.need_properties {
+                    hdr[pos] = ((self.opts.pb * 5 + self.opts.lp) * 9 + self.opts.lc) as u8;
+                    pos += 1;
+                }
+                self.need_properties = false;
+                self.need_state_reset = false;
+                self.need_dictionary_reset = false;
+                self.out.extend_from_slice(&hdr[..pos]);
+                self.out.extend_from_slice(&self.enc.rc.output);
+            }
+            self.chunk_open = false;
+        }
+    }
 }

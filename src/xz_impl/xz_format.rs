@@ -589,19 +589,52 @@ pub fn encode_xz_stream_with_options(
     check: Check,
     output: &mut Vec<u8>,
 ) -> io::Result<()> {
-    // ----- Stream Header -----
-    output.extend_from_slice(&HEADER_MAGIC);
-    let stream_flags = [0u8, check.id() & 0x0F];
-    output.extend_from_slice(&stream_flags);
-    output.extend_from_slice(&crc32(&stream_flags).to_le_bytes());
+    let stream_flags = write_stream_header(output, check);
 
     // Encode the LZMA2 payload first; we need its size for the index.
     let mut payload = Vec::new();
     super::lzma_enc::encode_lzma_to_lzma2(input, opts, &mut payload)?;
 
-    // ----- Block Header -----
-    let dict_size_byte = encode_lzma2_dict_size(opts.dict_size);
-    let block_header_start = output.len();
+    let block_header_size = write_block_header(output, opts.dict_size);
+    output.extend_from_slice(&payload);
+
+    let check_bytes = match check {
+        Check::None => Vec::new(),
+        Check::Crc32 => crc32(input).to_le_bytes().to_vec(),
+        Check::Crc64 => crc64(input).to_le_bytes().to_vec(),
+        Check::Sha256 => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "xz: SHA-256 check not yet supported",
+            ));
+        }
+    };
+    write_block_trailer(
+        output,
+        block_header_size,
+        payload.len() as u64,
+        check,
+        &check_bytes,
+        input.len() as u64,
+        stream_flags,
+    );
+    Ok(())
+}
+
+/// Stream Header (magic, flags, CRC32). Returns the stream flags, needed
+/// again by the footer.
+pub(crate) fn write_stream_header(output: &mut Vec<u8>, check: Check) -> [u8; 2] {
+    output.extend_from_slice(&HEADER_MAGIC);
+    let stream_flags = [0u8, check.id() & 0x0F];
+    output.extend_from_slice(&stream_flags);
+    output.extend_from_slice(&crc32(&stream_flags).to_le_bytes());
+    stream_flags
+}
+
+/// Block Header for a single LZMA2 filter with no size fields (so it can be
+/// written before the payload is known). Returns its size in bytes.
+pub(crate) fn write_block_header(output: &mut Vec<u8>, dict_size: u32) -> usize {
+    let dict_size_byte = encode_lzma2_dict_size(dict_size);
     let mut header = Vec::new();
     // Block flags: 0 filters - 1 = 0, no comp/unc size present.
     header.push(0u8); // we'll fill in the size byte after we know the size
@@ -623,38 +656,30 @@ pub fn encode_xz_stream_with_options(
     header.extend_from_slice(&crc.to_le_bytes());
     debug_assert_eq!(header.len(), block_header_size);
     output.extend_from_slice(&header);
+    block_header_size
+}
 
-    // ----- Compressed payload -----
-    let payload_start = output.len();
-    output.extend_from_slice(&payload);
-    let payload_size = output.len() - payload_start;
-
+/// Everything after the compressed payload: block padding, the check,
+/// the index (one record) and the stream footer.
+pub(crate) fn write_block_trailer(
+    output: &mut Vec<u8>,
+    block_header_size: usize,
+    payload_size: u64,
+    check: Check,
+    check_bytes: &[u8],
+    uncompressed_size: u64,
+    stream_flags: [u8; 2],
+) {
     // Block padding.
-    while (output.len() - block_header_start) % 4 != 0 {
+    let mut block_len = block_header_size as u64 + payload_size;
+    while block_len % 4 != 0 {
         output.push(0);
+        block_len += 1;
     }
+    debug_assert_eq!(check_bytes.len(), check.size());
+    output.extend_from_slice(check_bytes);
 
-    // Block check.
-    match check {
-        Check::None => {}
-        Check::Crc32 => {
-            let v = crc32(input).to_le_bytes();
-            output.extend_from_slice(&v);
-        }
-        Check::Crc64 => {
-            let v = crc64(input).to_le_bytes();
-            output.extend_from_slice(&v);
-        }
-        Check::Sha256 => {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "xz: SHA-256 check not yet supported",
-            ));
-        }
-    }
-
-    let unpadded_size = block_header_size as u64 + payload_size as u64 + check.size() as u64;
-    let uncompressed_size = input.len() as u64;
+    let unpadded_size = block_header_size as u64 + payload_size + check.size() as u64;
 
     // ----- Index -----
     let index_start = output.len();
@@ -681,11 +706,8 @@ pub fn encode_xz_stream_with_options(
     output.extend_from_slice(&backward_size_raw.to_le_bytes());
     output.extend_from_slice(&stream_flags);
     output.extend_from_slice(&FOOTER_MAGIC);
-
-    Ok(())
 }
 
-/// Encode an LZMA2 dict_size byte (inverse of `decode_lzma2_dict_size`).
 fn encode_lzma2_dict_size(dict_size: u32) -> u8 {
     if dict_size == u32::MAX {
         return 40;
