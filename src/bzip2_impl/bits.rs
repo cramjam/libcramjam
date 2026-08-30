@@ -204,6 +204,17 @@ impl BitWriter {
         self.container = 0;
     }
 
+    /// Move every whole byte out of the writer (for a streaming flush).
+    /// Up to 7 bits stay queued — bzip2 blocks are not byte-aligned.
+    pub fn take_whole_bytes(&mut self) -> Vec<u8> {
+        while self.bits_in_container >= 8 {
+            self.bits_in_container -= 8;
+            self.output.push((self.container >> self.bits_in_container) as u8);
+        }
+        self.container &= (1u64 << self.bits_in_container) - 1;
+        std::mem::take(&mut self.output)
+    }
+
     /// Drop the writer and return the encoded bytes.  Caller must have
     /// already byte-aligned the stream.
     pub fn finish(mut self) -> Vec<u8> {

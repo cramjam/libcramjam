@@ -62,30 +62,9 @@ const FLG_CONTENT_CHECKSUM: u8 = 1 << 2;
 /// of the input after the end marker.
 pub fn encode_frame_opts(input: &[u8], level: Option<u32>, block_linked: bool, content_checksum: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len() + 32);
-
-    // Magic.
-    out.extend_from_slice(&LZ4_FRAME_MAGIC.to_le_bytes());
-
-    // Frame Descriptor.  We always emit:
-    //   FLG: version=01, block_independence=1, no other flags
-    //   BD : block_max_size = 4 (64 KiB)
-    // Blocks are *linked* (each block may reference the previous 64 KiB),
-    // like the C reference encoder's default, for both parsers.
+    write_frame_header(&mut out, block_linked, content_checksum);
     // `LZ4HC_CLEVEL_MIN` = 2: C routes level 2 to the HC context (LZ4MID).
-    let use_hc = matches!(level, Some(l) if l >= 2);
-    let mut flg: u8 = FLG_VERSION_BITS;
-    if !block_linked {
-        flg |= FLG_BLOCK_INDEPENDENT;
-    }
-    if content_checksum {
-        flg |= FLG_CONTENT_CHECKSUM;
-    }
-    let bd: u8 = DEFAULT_BLOCK_SIZE_CODE << 4;
-    out.push(flg);
-    out.push(bd);
-    // Header checksum: byte 2 of xxhash32 over FLG..BD (here just 2 bytes).
-    let hc = xxhash32(&out[4..6], 0);
-    out.push(((hc >> 8) & 0xFF) as u8);
+    let use_hc = use_hc_for(level);
 
     let hc_level = level.unwrap_or(0);
     let mut hc_ctx = if use_hc { Some(super::hc::HcCtx::new()) } else { None };
@@ -100,30 +79,15 @@ pub fn encode_frame_opts(input: &[u8], level: Option<u32>, block_linked: bool, c
 
         // Compress the block; if the compressed payload >= raw size, emit raw.
         compressed.clear();
-        if !block_linked && pos > 0 {
-            // Independent blocks: fresh context, no history.
-            if use_hc {
-                hc_ctx = Some(super::hc::HcCtx::new());
-            } else {
-                fast_ctx = Some(block::FastCtx::new());
-            }
-        }
-        if let Some(ctx) = hc_ctx.as_mut() {
+        if !block_linked {
+            compress_independent_block(chunk, hc_level, use_hc, &mut compressed);
+        } else if let Some(ctx) = hc_ctx.as_mut() {
             super::hc::compress_block_hc_continue(ctx, input, pos, chunk_end, &mut compressed, hc_level);
         } else {
             block::compress_block_fast_continue(fast_ctx.as_mut().unwrap(), input, pos, chunk_end, &mut compressed);
         }
 
-        if compressed.len() < chunk.len() {
-            let size = compressed.len() as u32;
-            out.extend_from_slice(&size.to_le_bytes());
-            out.extend_from_slice(&compressed);
-        } else {
-            let size = (chunk.len() as u32) | UNCOMPRESSED_BIT;
-            out.extend_from_slice(&size.to_le_bytes());
-            out.extend_from_slice(chunk);
-        }
-
+        emit_block(&mut out, &compressed, chunk);
         pos = chunk_end;
     }
 
@@ -133,6 +97,134 @@ pub fn encode_frame_opts(input: &[u8], level: Option<u32>, block_linked: bool, c
         out.extend_from_slice(&xxhash32(input, 0).to_le_bytes());
     }
     out
+}
+
+/// One independent block (`LZ4F_blockIndependent`): the block is its own
+/// input, so nothing — not even a backward match extension — can reach
+/// before its first byte.
+pub(crate) fn compress_independent_block(chunk: &[u8], level: u32, use_hc: bool, out: &mut Vec<u8>) {
+    if use_hc {
+        let mut ctx = super::hc::HcCtx::new();
+        super::hc::compress_block_hc_continue(&mut ctx, chunk, 0, chunk.len(), out, level);
+    } else {
+        block::compress_block(chunk, out);
+    }
+}
+
+pub(crate) fn use_hc_for(level: Option<u32>) -> bool {
+    matches!(level, Some(l) if l >= 2)
+}
+
+/// Magic + frame descriptor (FLG, BD = 64 KiB blocks, header checksum).
+pub(crate) fn write_frame_header(out: &mut Vec<u8>, block_linked: bool, content_checksum: bool) {
+    out.extend_from_slice(&LZ4_FRAME_MAGIC.to_le_bytes());
+    let mut flg: u8 = FLG_VERSION_BITS;
+    if !block_linked {
+        flg |= FLG_BLOCK_INDEPENDENT;
+    }
+    if content_checksum {
+        flg |= FLG_CONTENT_CHECKSUM;
+    }
+    let bd: u8 = DEFAULT_BLOCK_SIZE_CODE << 4;
+    let start = out.len();
+    out.push(flg);
+    out.push(bd);
+    // Header checksum: byte 2 of xxhash32 over FLG..BD.
+    let hc = xxhash32(&out[start..start + 2], 0);
+    out.push(((hc >> 8) & 0xFF) as u8);
+}
+
+/// One block: the compressed payload if it shrank, else the raw chunk with
+/// the uncompressed bit set.
+pub(crate) fn emit_block(out: &mut Vec<u8>, compressed: &[u8], chunk: &[u8]) {
+    if compressed.len() < chunk.len() {
+        let size = compressed.len() as u32;
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(compressed);
+    } else {
+        let size = (chunk.len() as u32) | UNCOMPRESSED_BIT;
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(chunk);
+    }
+}
+
+/// Incremental xxhash32 (seed 0) for the frame content checksum.
+pub(crate) struct Xxh32 {
+    v: [u32; 4],
+    buf: [u8; 16],
+    buf_len: usize,
+    total: u64,
+}
+
+impl Xxh32 {
+    pub fn new() -> Self {
+        Self {
+            v: [PRIME32_1.wrapping_add(PRIME32_2), PRIME32_2, 0, 0u32.wrapping_sub(PRIME32_1)],
+            buf: [0; 16],
+            buf_len: 0,
+            total: 0,
+        }
+    }
+
+    fn stripe(&mut self, b: &[u8]) {
+        for k in 0..4 {
+            self.v[k] = round32(self.v[k], read_u32_le(b, k * 4));
+        }
+    }
+
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.total += data.len() as u64;
+        if self.buf_len > 0 {
+            let take = (16 - self.buf_len).min(data.len());
+            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
+            self.buf_len += take;
+            data = &data[take..];
+            if self.buf_len < 16 {
+                return;
+            }
+            let b = self.buf;
+            self.stripe(&b);
+            self.buf_len = 0;
+        }
+        let mut i = 0;
+        while i + 16 <= data.len() {
+            self.stripe(&data[i..i + 16]);
+            i += 16;
+        }
+        let rest = data.len() - i;
+        self.buf[..rest].copy_from_slice(&data[i..]);
+        self.buf_len = rest;
+    }
+
+    pub fn finish(&self) -> u32 {
+        let mut h = if self.total >= 16 {
+            self.v[0].rotate_left(1)
+                .wrapping_add(self.v[1].rotate_left(7))
+                .wrapping_add(self.v[2].rotate_left(12))
+                .wrapping_add(self.v[3].rotate_left(18))
+        } else {
+            PRIME32_5
+        };
+        h = h.wrapping_add(self.total as u32);
+        let data = &self.buf[..self.buf_len];
+        let mut i = 0;
+        while i + 4 <= data.len() {
+            h = h.wrapping_add(read_u32_le(data, i).wrapping_mul(PRIME32_3));
+            h = h.rotate_left(17).wrapping_mul(PRIME32_4);
+            i += 4;
+        }
+        while i < data.len() {
+            h = h.wrapping_add((data[i] as u32).wrapping_mul(PRIME32_5));
+            h = h.rotate_left(11).wrapping_mul(PRIME32_1);
+            i += 1;
+        }
+        h ^= h >> 15;
+        h = h.wrapping_mul(PRIME32_2);
+        h ^= h >> 13;
+        h = h.wrapping_mul(PRIME32_3);
+        h ^= h >> 16;
+        h
+    }
 }
 
 // =========================================================================

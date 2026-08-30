@@ -16,7 +16,7 @@ use super::bits::BitWriter;
 use super::crc::Crc32;
 
 const BLOCK_MAGIC: u64 = 0x3141_5926_5359;
-const EOS_MAGIC: u64 = 0x1772_4538_5090;
+pub(crate) const EOS_MAGIC: u64 = 0x1772_4538_5090;
 const HUFFMAN_GROUP_SIZE: usize = 50;
 const MAX_HUFFMAN_TABLES: usize = 6;
 const MAX_HUFFMAN_CODE_LEN: u8 = 17;
@@ -35,11 +35,7 @@ pub fn encode_stream(input: &[u8], level: u32) -> Vec<u8> {
     let nblock_max = block_size - 19;
 
     let mut bw = BitWriter::new();
-    // File header: BZh<level>
-    bw.write_bits(b'B' as u64, 8);
-    bw.write_bits(b'Z' as u64, 8);
-    bw.write_bits(b'h' as u64, 8);
-    bw.write_bits((b'0' + level as u8) as u64, 8);
+    write_stream_header(&mut bw, level);
 
     let mut combined_crc: u32 = 0;
     let mut pos = 0usize;
@@ -66,13 +62,21 @@ pub fn encode_stream(input: &[u8], level: u32) -> Vec<u8> {
     bw.finish()
 }
 
-fn compute_block_crc(block: &[u8]) -> u32 {
+/// File header: `BZh<level>`.
+pub(crate) fn write_stream_header(bw: &mut BitWriter, level: u32) {
+    bw.write_bits(b'B' as u64, 8);
+    bw.write_bits(b'Z' as u64, 8);
+    bw.write_bits(b'h' as u64, 8);
+    bw.write_bits((b'0' + level as u8) as u64, 8);
+}
+
+pub(crate) fn compute_block_crc(block: &[u8]) -> u32 {
     let mut c = Crc32::new();
     c.update(block);
     c.finalize()
 }
 
-fn encode_block_from_rle1(bw: &mut BitWriter, rle1_out: Vec<u8>, block_crc: u32) {
+pub(crate) fn encode_block_from_rle1(bw: &mut BitWriter, rle1_out: Vec<u8>, block_crc: u32) {
     // -- 2. BWT --
     let (bwt_out, origin) = forward_bwt(&rle1_out);
 
@@ -268,7 +272,7 @@ fn forward_rle1(input: &[u8]) -> Vec<u8> {
 /// guarantee a post-RLE1 block size ≤ `block_size`, which is the bzip2
 /// decoder's hard buffer limit.  Worst-case expansion: a 4-run encodes as
 /// 5 bytes, so the largest output any single step adds is 5 bytes.
-fn forward_rle1_capped(input: &[u8], max_out: usize) -> (Vec<u8>, usize) {
+pub(crate) fn forward_rle1_capped(input: &[u8], max_out: usize) -> (Vec<u8>, usize) {
     let n = input.len();
     // Output never exceeds `max_out`, and a step adds at most 5 bytes for 4
     // consumed (+25%), so this capacity is enough for unchecked writes.
