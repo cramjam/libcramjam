@@ -347,6 +347,12 @@ mod tests {
     test_variant!(xz, None, format, check, filters, opts);
 }
 
+/// Bench/diagnostic helper: single-block LZ4 fast compression (no frame).
+#[cfg(feature = "lz4")]
+pub fn lz4_impl_block_fast(input: &[u8], output: &mut Vec<u8>) -> usize {
+    lz4_impl::block::compress_block(input, output)
+}
+
 /// Bench/diagnostic helper: single-block LZ4 HC compression (no frame).
 #[cfg(feature = "lz4")]
 pub fn lz4_impl_block_hc(input: &[u8], output: &mut Vec<u8>, level: u32) -> usize {

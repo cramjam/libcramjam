@@ -33,15 +33,6 @@ const MFLIMIT: usize = 12;
 /// Match-extension bound: matches can extend to within 5 bytes of the
 /// block end, but the LAST 5 bytes must remain literals.
 const LAST_LITERALS: usize = 5;
-const HASH_BITS: usize = 14;
-const HASH_SIZE: usize = 1 << HASH_BITS;
-const HASH_MASK: usize = HASH_SIZE - 1;
-const NONE: u32 = u32::MAX;
-/// Skip-step shift: after every `1 << SKIP_TRIGGER` (= 64) consecutive
-/// search misses the parser bumps `step` by 1, exponentially skipping
-/// ahead through incompressible regions.  Mirrors `LZ4_skipTrigger` in
-/// `lz4.c`.
-const SKIP_TRIGGER: u32 = 6;
 
 // =========================================================================
 // Decoder
@@ -274,126 +265,247 @@ pub fn compress_bound(n: usize) -> usize {
     n + n / 255 + 16
 }
 
-/// Compress `input` as an LZ4 block.  Falls back to a single literal-only
-/// sequence if the input is too small for any match.
-///
-/// The parser mirrors `LZ4_compress_generic` in `lz4.c`:
-///
-/// * Hash table is a flat 14-bit `u32` array (`u32::MAX` sentinel = empty).
-/// * On a search miss the parser advances by `step` bytes; `step` starts at
-///   1 and grows by 1 every 64 consecutive misses (the `LZ4_skipTrigger`
-///   pattern).  This is what makes LZ4 fast on incompressible data — we
-///   don't probe every byte.
-/// * Prefix-check is a single 32-bit load.
-/// * Match extension walks 8 bytes at a time via XOR + `trailing_zeros`.
-pub fn compress_block(input: &[u8], output: &mut Vec<u8>) -> usize {
-    let start_out = output.len();
-    let len = input.len();
+// =========================================================================
+// Fast parser — port of `LZ4_compress_generic_validated` (lz4.c 1.10)
+// =========================================================================
+//
+// Two table flavours, exactly as C picks them:
+//   * `byU32` (4096 x u32, `LZ4_hash5` over 8 bytes with the prime
+//     889523592379): the streaming path (`LZ4_compress_fast_continue`) that
+//     the C frame encoder uses for every block, and the block API for inputs
+//     >= 65547 bytes.
+//   * `byU16` (8192 x u16, `LZ4_hash4`): the block API (`LZ4_compress_default`)
+//     for inputs < 65547 bytes; it also skips the distance check.
+// Table entries are absolute input positions (C's `base + index`), an empty
+// slot is 0 — a real candidate, as in C. `acceleration` is 1.
 
-    // Pre-reserve worst-case bytes so the per-byte writes inside the
-    // emit helpers can skip the realloc check.
-    output.reserve(compress_bound(len));
+/// `LZ4_HASHLOG` for `LZ4_MEMORY_USAGE = 14`.
+const HASHLOG: u32 = 12;
+const TABLE_U32: usize = 1 << HASHLOG;
+const TABLE_U16: usize = 1 << (HASHLOG + 1);
+/// `LZ4_skipTrigger`: after 64 misses the search step grows by one.
+const SKIP_TRIGGER: u32 = 6;
+/// `LZ4_64Klimit`: inputs below this use the u16 table in the block API.
+const LZ4_64K_LIMIT: usize = 65_536 + MFLIMIT - 1;
+/// `LZ4_minLength`: smaller inputs are emitted as one literal run.
+const MIN_LENGTH: usize = MFLIMIT + 1;
 
-    if len < MFLIMIT + MIN_MATCH {
-        emit_literal_only(output, input);
-        return output.len() - start_out;
+trait FastTable {
+    const U16: bool;
+    fn hash(input: &[u8], pos: usize) -> usize;
+    fn get(&self, h: usize) -> usize;
+    fn put(&mut self, h: usize, pos: usize);
+}
+
+struct TableU32(Vec<u32>);
+struct TableU16(Vec<u16>);
+
+impl FastTable for TableU32 {
+    const U16: bool = false;
+    #[inline(always)]
+    fn hash(input: &[u8], pos: usize) -> usize {
+        let seq = unsafe { read_u64(input, pos) };
+        ((seq << 24).wrapping_mul(889_523_592_379) >> (64 - HASHLOG)) as usize
     }
+    #[inline(always)]
+    fn get(&self, h: usize) -> usize {
+        unsafe { *self.0.get_unchecked(h) as usize }
+    }
+    #[inline(always)]
+    fn put(&mut self, h: usize, pos: usize) {
+        unsafe { *self.0.get_unchecked_mut(h) = pos as u32 }
+    }
+}
 
-    let mut head: Vec<u32> = vec![NONE; HASH_SIZE];
-    let mflimit = len - MFLIMIT;
-    let matchlimit = len - LAST_LITERALS;
+impl FastTable for TableU16 {
+    const U16: bool = true;
+    #[inline(always)]
+    fn hash(input: &[u8], pos: usize) -> usize {
+        let seq = unsafe { read_u32(input, pos) };
+        (seq.wrapping_mul(2_654_435_761) >> (32 - (HASHLOG + 1))) as usize
+    }
+    #[inline(always)]
+    fn get(&self, h: usize) -> usize {
+        unsafe { *self.0.get_unchecked(h) as usize }
+    }
+    #[inline(always)]
+    fn put(&mut self, h: usize, pos: usize) {
+        unsafe { *self.0.get_unchecked_mut(h) = pos as u16 }
+    }
+}
 
-    let mut ip = 0usize;
-    let mut anchor = 0usize;
+/// Persistent fast-parser state for linked frame blocks
+/// (`LZ4_stream_t` in prefix mode): one u32 table indexed by absolute input
+/// position, kept across blocks so a block can match into the previous
+/// 64 KiB. `base` is subtracted from stored positions; it only moves when
+/// the input passes 2 GiB (C's `LZ4_renormDictT`).
+pub struct FastCtx {
+    table: TableU32,
+    base: usize,
+}
 
-    // SAFETY: throughout this block we maintain `ip < mflimit` and
-    // `mp < ip` whenever we read from `input` or `head`.  All reads
-    // therefore stay strictly within the bounds checked at function entry.
-    unsafe {
-        let head_ptr = head.as_mut_ptr();
+impl Default for FastCtx {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-        // Seed: the very first byte never produces a back-reference.
-        let h0 = hash4_lz4_at(input, ip);
-        *head_ptr.add(h0) = ip as u32;
-        ip += 1;
+impl FastCtx {
+    pub fn new() -> Self {
+        Self { table: TableU32(vec![0; TABLE_U32]), base: 0 }
+    }
+}
 
-        'outer: while ip < mflimit {
-            // ----- Search phase: find a 4-byte match with skip-step -----
-            let mut forward_ip = ip;
-            let mut search_match_nb: u32 = 1u32 << SKIP_TRIGGER;
-            let mut match_pos: usize;
+/// Compress `input[start..end]` as one linked block, continuing `ctx`
+/// (`LZ4_compress_fast_continue`, prefix mode, acceleration 1). Output is
+/// byte-identical to the C frame encoder's blocks. Returns bytes written.
+pub fn compress_block_fast_continue(
+    ctx: &mut FastCtx,
+    input: &[u8],
+    start: usize,
+    end: usize,
+    output: &mut Vec<u8>,
+) -> usize {
+    // `LZ4_renormDictT`: keep stored positions below 2^31.
+    if end - ctx.base > 0x8000_0000 {
+        let delta = (start - ctx.base) - (64 << 10);
+        for e in ctx.table.0.iter_mut() {
+            *e = (*e as usize).saturating_sub(delta) as u32;
+        }
+        ctx.base += delta;
+    }
+    let base = ctx.base;
+    compress_generic(&mut ctx.table, &input[base..], start - base, end - base, 0, output)
+}
 
-            loop {
-                ip = forward_ip;
-                let step = (search_match_nb >> SKIP_TRIGGER) as usize;
-                search_match_nb += 1;
-                forward_ip = ip + step;
-                if forward_ip > mflimit {
-                    // No more candidates.  Encode the trailing literals and exit.
-                    break 'outer;
+/// Compress one independent block (`LZ4_compress_default`): fresh table,
+/// u16 flavour below `LZ4_64K_LIMIT` bytes. Returns bytes written.
+pub fn compress_block(input: &[u8], output: &mut Vec<u8>) -> usize {
+    if input.len() < LZ4_64K_LIMIT {
+        let mut t = TableU16(vec![0; TABLE_U16]);
+        compress_generic(&mut t, input, 0, input.len(), 0, output)
+    } else {
+        let mut t = TableU32(vec![0; TABLE_U32]);
+        compress_generic(&mut t, input, 0, input.len(), 0, output)
+    }
+}
+
+/// `LZ4_compress_generic_validated` with `notLimited` output. `low_limit`
+/// is the lowest position the backward match extension may reach
+/// (`lowLimit`: the dictionary start, i.e. 0 for a linked stream or the
+/// block start for an independent block).
+#[inline(always)]
+fn compress_generic<T: FastTable>(
+    t: &mut T,
+    input: &[u8],
+    start: usize,
+    end: usize,
+    low_limit: usize,
+    output: &mut Vec<u8>,
+) -> usize {
+    let out_start = output.len();
+    output.reserve(compress_bound(end - start));
+    let mut anchor = start;
+
+    if end - start >= MIN_LENGTH {
+        let mflimit_plus_one = end - MFLIMIT + 1;
+        let matchlimit = end - LAST_LITERALS;
+
+        // SAFETY (all get_unchecked / unaligned reads below): positions are
+        // kept below `mflimit_plus_one` (8-byte hashes end 3 bytes before
+        // `end`) or are table entries < the current position; the backward
+        // extension stops at `low_limit`/`anchor`.
+        unsafe {
+            let mut ip = start;
+            t.put(T::hash(input, ip), ip);
+            ip += 1;
+            let mut forward_h = T::hash(input, ip);
+
+            'main: loop {
+                let mut match_pos;
+                // ---- Find a match ----
+                {
+                    let mut forward_ip = ip;
+                    let mut step = 1usize;
+                    let mut search_match_nb: u32 = 1 << SKIP_TRIGGER;
+                    loop {
+                        let h = forward_h;
+                        let current = forward_ip;
+                        let match_index = t.get(h);
+                        ip = forward_ip;
+                        forward_ip += step;
+                        step = (search_match_nb >> SKIP_TRIGGER) as usize;
+                        search_match_nb += 1;
+                        if forward_ip > mflimit_plus_one {
+                            break 'main;
+                        }
+                        forward_h = T::hash(input, forward_ip);
+                        t.put(h, current);
+                        if !T::U16 && match_index + MAX_OFFSET < current {
+                            continue; // too far
+                        }
+                        if read_u32(input, match_index) == read_u32(input, ip) {
+                            match_pos = match_index;
+                            break;
+                        }
+                    }
                 }
 
-                let h = hash4_lz4_at(input, ip);
-                let cand = *head_ptr.add(h);
-                *head_ptr.add(h) = ip as u32;
-                if cand == NONE {
-                    continue;
+                // ---- Catch up ----
+                if match_pos > low_limit
+                    && *input.get_unchecked(ip - 1) == *input.get_unchecked(match_pos - 1)
+                {
+                    loop {
+                        ip -= 1;
+                        match_pos -= 1;
+                        if !(ip > anchor
+                            && match_pos > low_limit
+                            && *input.get_unchecked(ip - 1) == *input.get_unchecked(match_pos - 1))
+                        {
+                            break;
+                        }
+                    }
                 }
-                let mp = cand as usize;
-                // ip > mp by construction (we just stored ip and read the
-                // PREVIOUS slot value), so dist > 0 always.
-                let dist = ip - mp;
-                if dist > MAX_OFFSET {
-                    continue;
-                }
-                // Single 32-bit prefix check.
-                if read_u32(input, mp) == read_u32(input, ip) {
-                    match_pos = mp;
+
+                // ---- Encode literals + match; `_next_match` re-entry ----
+                loop {
+                    let offset = ip - match_pos;
+                    let mcode = count_match(input, match_pos + MIN_MATCH, ip + MIN_MATCH, matchlimit);
+                    emit_sequence(output, &input[anchor..ip], ip - anchor, offset as u16, mcode + MIN_MATCH);
+                    ip += mcode + MIN_MATCH;
+                    anchor = ip;
+
+                    if ip >= mflimit_plus_one {
+                        break 'main;
+                    }
+
+                    // Fill table with the position before the match end.
+                    t.put(T::hash(input, ip - 2), ip - 2);
+
+                    // Test next position.
+                    let h = T::hash(input, ip);
+                    let match_index = t.get(h);
+                    t.put(h, ip);
+                    if (T::U16 || match_index + MAX_OFFSET >= ip)
+                        && read_u32(input, match_index) == read_u32(input, ip)
+                    {
+                        match_pos = match_index;
+                        continue; // zero-literal sequence
+                    }
+
+                    ip += 1;
+                    forward_h = T::hash(input, ip);
                     break;
                 }
             }
-
-            // ----- Walk back: extend match leftward into the literal run -----
-            // (Catches matches that start one or more bytes earlier than the
-            //  hashed position.)
-            while ip > anchor
-                && match_pos > 0
-                && *input.get_unchecked(match_pos - 1) == *input.get_unchecked(ip - 1)
-            {
-                ip -= 1;
-                match_pos -= 1;
-            }
-            let dist = ip - match_pos;
-
-            // ----- Forward match extension (8 bytes at a time) -----
-            let mlen = MIN_MATCH
-                + count_match(input, match_pos + MIN_MATCH, ip + MIN_MATCH, matchlimit);
-
-            // ----- Emit sequence -----
-            let lit_len = ip - anchor;
-            emit_sequence(output, &input[anchor..ip], lit_len, dist as u16, mlen);
-
-            ip += mlen;
-            anchor = ip;
-            if ip >= mflimit {
-                break;
-            }
-
-            // Hash the position right after the match — improves match
-            // discovery for the next iteration without extra cost.
-            let h = hash4_lz4_at(input, ip);
-            *head_ptr.add(h) = ip as u32;
-            ip += 1;
         }
     }
 
-    // Trailing literals (always at least LAST_LITERALS bytes).
-    if anchor < len {
-        emit_literal_only(output, &input[anchor..]);
-    }
-
-    output.len() - start_out
+    // ---- Last literals ----
+    emit_literal_only(output, &input[anchor..end]);
+    output.len() - out_start
 }
+
 
 /// Read a little-endian u32 from `buf` starting at byte position `pos`
 /// using a single unaligned load.
@@ -490,12 +602,6 @@ pub(super) fn emit_sequence(output: &mut Vec<u8>, literals: &[u8], lit_len: usiz
     }
 }
 
-/// SAFETY: caller must guarantee `pos + 4 <= input.len()`.
-#[inline(always)]
-unsafe fn hash4_lz4_at(input: &[u8], pos: usize) -> usize {
-    let v = read_u32(input, pos);
-    (v.wrapping_mul(2654435761) >> (32 - HASH_BITS)) as usize & HASH_MASK
-}
 
 // =========================================================================
 // HC encoder (high compression — levels 3..=12 of the lz4 frame format)
