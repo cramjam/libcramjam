@@ -13,8 +13,8 @@ use std::io::{Cursor, Read, Write};
 mod common;
 
 /// L4 is the first level with dynamic Huffman blocks in our encoder.
-/// L2-3 use fixed Huffman (by design — simpler, faster) and have a
-/// known ~18pp gap vs flate2 which uses dynamic at every level.
+/// All levels use zlib's deflate_fast/deflate_slow + dynamic trees; sizes
+/// match miniz_oxide within a few hundredths of a pp.
 const LEVELS: &[u32] = &[1, 4, 6, 9];
 /// Allowed ratio gap vs flate2 in percentage points of input size.
 /// Matches the user's "≤10%" target.  L6/L9 are typically within 1-2pp;

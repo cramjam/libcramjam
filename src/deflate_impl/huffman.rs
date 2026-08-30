@@ -288,9 +288,4 @@ mod tests {
     }
 
 
-
-    fn kraft(lengths: &[u8], max_len: u8) -> u64 {
-        lengths.iter().filter(|&&l| l > 0).map(|&l| 1u64 << (max_len - l)).sum()
-    }
-
 }
