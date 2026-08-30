@@ -20,9 +20,23 @@ pub fn crc64(data: &[u8]) -> u64 {
     crc_fast::checksum(crc_fast::CrcAlgorithm::Crc64Xz, data)
 }
 
+/// SHA-256 (the optional 32-byte .xz block check).
+#[inline]
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(data).into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sha256_known_vector() {
+        let h = sha256(b"abc");
+        assert_eq!(&h[..4], &[0xba, 0x78, 0x16, 0xbf]);
+        assert_eq!(&h[28..], &[0xf2, 0x00, 0x15, 0xad]);
+    }
 
     #[test]
     fn crc32_known_vector() {

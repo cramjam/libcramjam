@@ -2123,16 +2123,21 @@ pub fn encode_lzma_to_lzma2(input: &[u8], opts: &LzmaOptions, output: &mut Vec<u
 /// Python's `lzma.compress(format=FORMAT_ALONE)` / liblzma's alone encoder
 /// produce.
 pub fn encode_lzma_alone(input: &[u8], opts: &LzmaOptions, output: &mut Vec<u8>) -> io::Result<()> {
-    let dict_size = opts.dict_size.max(4096);
+    output.push(((opts.pb * 5 + opts.lp) * 9 + opts.lc) as u8);
+    output.extend_from_slice(&opts.dict_size.max(4096).to_le_bytes());
+    output.extend_from_slice(&u64::MAX.to_le_bytes());
+    encode_lzma1_raw(input, opts, output)
+}
+
+/// Encode `input` as a single raw LZMA1 stream terminated by the
+/// end-of-payload marker (liblzma's `lzma_raw_encoder` with an `LZMA_FILTER_LZMA1`
+/// chain; also the payload of the `.lzma` alone format).
+pub fn encode_lzma1_raw(input: &[u8], opts: &LzmaOptions, output: &mut Vec<u8>) -> io::Result<()> {
     let nice_len = opts.nice_len.clamp(MATCH_LEN_MIN, MATCH_LEN_MAX);
     let mut eopts = opts.clone();
     // Match-finder tables only need to cover the input.
-    eopts.dict_size = dict_size.min(input.len().max(4096) as u32);
+    eopts.dict_size = opts.dict_size.max(4096).min(input.len().max(4096) as u32);
     eopts.nice_len = nice_len;
-
-    output.push(((opts.pb * 5 + opts.lp) * 9 + opts.lc) as u8);
-    output.extend_from_slice(&dict_size.to_le_bytes());
-    output.extend_from_slice(&u64::MAX.to_le_bytes());
 
     let mut enc = Lzma1Encoder::new(&eopts)?;
     let mut mf = Mf::new(input, eopts.dict_size, opts.mf, nice_len, opts.depth);

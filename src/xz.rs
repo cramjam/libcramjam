@@ -12,6 +12,7 @@ pub use crate::xz_impl::options::{
     Check, Filter, Filters, Format, LzmaOptions, MatchFinder, Mode,
 };
 pub use crate::xz_impl::{XzStreamCompressor, XzStreamDecompressor};
+use crate::xz_impl::options::ResolvedFilter;
 
 /// Default compression preset, matching C xz's `LZMA_PRESET_DEFAULT` = 6.
 pub const DEFAULT_COMPRESSION_LEVEL: u32 = 6;
@@ -29,13 +30,13 @@ pub fn decompress<W: Write + ?Sized, R: Read>(mut input: R, output: &mut W) -> R
 /// * `preset` — LZMA compression preset (0..=9, default 6).  Used as the
 ///   base for the encoder's `LzmaOptions` unless `options` overrides it.
 /// * `format` — `XZ` (default), `AUTO` (same as XZ for compression),
-///   `ALONE` (legacy `.lzma`, currently not supported), or `RAW`
-///   (filter-chain only, currently not supported).
-/// * `check` — block integrity check (CRC64 default, CRC32 / None
-///   supported, SHA256 currently not supported).
-/// * `filters` — optional filter chain.  When provided, must consist of
-///   exactly one LZMA2 filter (BCJ filters are not yet implemented in
-///   the pure-Rust backend and will return an `Unsupported` error).
+///   `ALONE` (legacy `.lzma`: one LZMA1 stream, no filters), or `RAW`
+///   (the bare filter-chain output, no container/check — decode with
+///   [`decompress_raw`] and the same chain).
+/// * `check` — block integrity check: CRC64 (default), CRC32, SHA256, None.
+/// * `filters` — optional filter chain: up to three BCJ filters (x86, ARM,
+///   ARM-Thumb, IA-64, PowerPC, SPARC) followed by LZMA2 (LZMA1 is only
+///   valid in `RAW` / `ALONE`), exactly liblzma's rules.
 /// * `options` — optional `LzmaOptions` override.  When provided,
 ///   replaces the per-preset defaults for lc/lp/pb/dict_size/etc.
 #[inline(always)]
@@ -52,59 +53,54 @@ pub fn compress<W: Write + ?Sized, R: Read>(
     let format = format.map(Into::into).unwrap_or_default();
     let check = check.map(Into::into).unwrap_or_default();
 
-    // Resolve the LZMA options.  Precedence: explicit `options` >
-    // single-LZMA2 filter chain's options > preset default.
-    let lzma_options = if let Some(opts) = options {
-        opts.into()
-    } else if let Some(fchain) = filters {
-        let chain = fchain.into();
-        // We only support a chain consisting of a single LZMA2 filter for
-        // now.  BCJ filters and LZMA1-in-RAW-format are tracked as
-        // pure-Rust follow-ups.
-        match chain.chain.as_slice() {
-            [] => LzmaOptions::new_preset(preset)?,
-            [entry] if entry.filter == Filter::Lzma2 => entry
-                .options
-                .clone()
-                .unwrap_or(LzmaOptions::new_preset(preset)?),
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "xz: pure-Rust backend currently supports only a single \
-                     LZMA2 filter — BCJ / LZMA1 filter chains will be added later",
-                ));
-            }
-        }
-    } else {
-        LzmaOptions::new_preset(preset)?
-    };
+    // Resolve + validate the filter chain (empty = a single LZMA2 filter).
+    // LZMA options precedence: explicit `options` > the chain entry's
+    // options > preset default.
+    let options: Option<LzmaOptions> = options.map(Into::into);
+    let chain = filters
+        .map(Into::into)
+        .unwrap_or_default()
+        .resolve(preset, options.as_ref())?;
 
     let mut data = Vec::new();
     input.read_to_end(&mut data)?;
 
-    let compressed = match format {
+    let mut out = Vec::with_capacity(data.len() / 2 + 64);
+    match format {
         Format::AUTO | Format::XZ => {
-            let mut out = Vec::with_capacity(data.len() / 2);
-            crate::xz_impl::xz_format::encode_xz_stream_with_options(
-                &data,
-                &lzma_options,
-                check,
-                &mut out,
-            )?;
-            out
+            crate::xz_impl::xz_format::encode_xz_stream_chain(&data, &chain, check, &mut out)?;
         }
         Format::ALONE => {
-            let mut out = Vec::with_capacity(data.len() / 2 + 13);
-            crate::xz_impl::lzma_enc::encode_lzma_alone(&data, &lzma_options, &mut out)?;
-            out
+            // The .lzma container carries exactly one LZMA1 stream and no
+            // filter flags; take the LZMA options from the chain's tail.
+            let lzma_options = match chain.as_slice() {
+                [ResolvedFilter::Lzma1(o)] | [ResolvedFilter::Lzma2(o)] => o,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "xz: the .lzma (ALONE) format cannot carry BCJ filters",
+                    ))
+                }
+            };
+            crate::xz_impl::lzma_enc::encode_lzma_alone(&data, lzma_options, &mut out)?;
         }
         Format::RAW => {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "xz: RAW filter-chain encoder not yet implemented in the pure-Rust backend",
-            ));
+            crate::xz_impl::raw::encode_raw(&data, &chain, &mut out)?;
         }
-    };
-    output.write_all(&compressed)?;
-    Ok(compressed.len())
+    }
+    output.write_all(&out)?;
+    Ok(out.len())
+}
+
+/// Decompress a raw (`Format::RAW`) stream: no container, so the filter chain
+/// it was encoded with must be supplied (liblzma's `lzma_raw_decoder`).
+pub fn decompress_raw<W: Write + ?Sized, R: Read>(
+    mut input: R,
+    output: &mut W,
+    filters: impl Into<Filters>,
+) -> Result<usize> {
+    let mut data = Vec::new();
+    input.read_to_end(&mut data)?;
+    let filters = filters.into();
+    crate::with_scratch(output, |decoded| crate::xz_impl::decode_raw(&data, &filters, decoded))
 }
