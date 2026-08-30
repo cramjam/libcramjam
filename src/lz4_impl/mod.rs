@@ -2,6 +2,7 @@
 
 pub mod block;
 pub mod frame;
+pub mod hc;
 
 use std::io::{self, Read, Write};
 
