@@ -264,13 +264,16 @@ impl HufTable {
 
         loop {
             // Each iteration emits 5 symbols per stream and moves each cursor
-            // down by at most 7 bytes (5 * 12 bits < 64).
+            // down by at most 7 bytes (5 * 12 bits < 64) at its refill; the
+            // final re-sync below moves it down by up to 7 more, so budget
+            // that too — the cursor must never go below the stream start.
             let mut iters = usize::MAX;
             for i in 0..4 {
                 let p = [p0, p1, p2, p3][i];
                 let c = [c0, c1, c2, c3][i];
                 iters = iters.min((end[i] - p) / 5);
-                iters = iters.min(unsafe { c.offset_from(lo[i]) } as usize / 7);
+                let ahead = unsafe { c.offset_from(lo[i]) } as usize;
+                iters = iters.min(ahead.saturating_sub(7) / 7);
             }
             if iters == 0 {
                 break;
@@ -314,6 +317,7 @@ impl HufTable {
         for i in 0..4 {
             let ctz = accs[i].trailing_zeros();
             let c = unsafe { curs[i].sub((ctz >> 3) as usize) };
+            debug_assert!(c >= lo[i], "huffman fast loop ran past the stream start");
             let index = unsafe { c.offset_from(lo[i]) } as usize;
             let raw = unsafe { u64::from_le(core::ptr::read_unaligned(c as *const u64)) };
             readers[i].set_raw_parts(index, ctz & 7, raw);
