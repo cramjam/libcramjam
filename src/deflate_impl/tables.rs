@@ -67,22 +67,4 @@ pub fn fixed_distance_lengths() -> [u8; 32] {
     [5u8; 32]
 }
 
-/// Map a match length (3..=258) to (symbol 257..285, extra_bits, extra_value)
-pub fn length_to_symbol(length: u16) -> (u16, u8, u16) {
-    for i in (0..29).rev() {
-        if length >= LENGTH_BASE[i] {
-            return (257 + i as u16, LENGTH_EXTRA[i], length - LENGTH_BASE[i]);
-        }
-    }
-    unreachable!("invalid length: {}", length)
-}
 
-/// Map a distance (1..=32768) to (symbol 0..29, extra_bits, extra_value)
-pub fn distance_to_symbol(dist: u16) -> (u8, u8, u16) {
-    for i in (0..30).rev() {
-        if dist >= DISTANCE_BASE[i] {
-            return (i as u8, DISTANCE_EXTRA[i], dist - DISTANCE_BASE[i]);
-        }
-    }
-    unreachable!("invalid distance: {}", dist)
-}

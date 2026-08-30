@@ -1,86 +1,89 @@
-//! DEFLATE compression (RFC 1951)
+//! DEFLATE compression (RFC 1951) — a port of zlib's `deflate.c`.
 //!
-//! Implements LZ77 string matching with hash chains and Huffman coding.
-//! Supports compression levels 0 (stored only) through 9 (maximum compression).
+//! Levels 1-3 use `deflate_fast` (greedy, short chains), 4-9 `deflate_slow`
+//! (lazy evaluation) with zlib's `configuration_table`; `longest_match` is
+//! zlib's chain walk with the `prev_length` early-outs. Blocks are flushed
+//! every `LIT_BUFSIZE - 1` symbols (memLevel 8) and emitted by `trees.rs`
+//! (stored / static / dynamic chosen by computed bit lengths). The whole
+//! input is in memory, so there is no sliding window: positions index the
+//! input directly and the hash chain is a 32 KiB ring keyed by position.
 
 use super::bitwriter::BitWriter;
-use super::huffman;
-use super::tables;
+use super::trees::{Sym, TreeState};
 
-const WINDOW_SIZE: usize = 32768;
-const WINDOW_MASK: usize = WINDOW_SIZE - 1;
-const HASH_BITS: usize = 15;
-const HASH_SIZE: usize = 1 << HASH_BITS;
-const HASH_MASK: usize = HASH_SIZE - 1;
 const MIN_MATCH: usize = 3;
 const MAX_MATCH: usize = 258;
+/// Maximum back-reference distance (RFC 1951 allows exactly 32 KiB).
+const MAX_DIST: usize = 32768;
+const W_MASK: usize = MAX_DIST - 1;
+const HASH_BITS: u32 = 15; // memLevel 8 → hash_bits = 15
+const HASH_SIZE: usize = 1 << HASH_BITS;
+const HASH_MASK: u32 = (HASH_SIZE - 1) as u32;
+const HASH_SHIFT: u32 = (HASH_BITS + MIN_MATCH as u32 - 1) / MIN_MATCH as u32; // 5
+/// zlib `lit_bufsize` at memLevel 8; a block is flushed at `LIT_BUFSIZE - 1` symbols.
+const LIT_BUFSIZE: usize = 1 << 14;
+const SYM_END: usize = LIT_BUFSIZE - 1;
+/// Matches of length 3 farther back than this are dropped in the lazy parser.
+const TOO_FAR: usize = 4096;
 const MAX_STORED_BLOCK: usize = 65535;
-const BLOCK_SIZE: usize = 32768;
+const NIL: u32 = u32::MAX;
 
-const NONE: u32 = u32::MAX; // sentinel for empty hash chain
-
-// ---------------------------------------------------------------------------
-// Compression level configuration (inspired by zlib)
-// ---------------------------------------------------------------------------
-
+/// Level table: good_length, max_lazy, nice_length, max_chain (zlib's
+/// `configuration_table` semantics: `max_lazy` is the max insert length for
+/// the greedy levels 1-3 and the lazy-evaluation threshold for 4-9).
+///
+/// Tuned against miniz_oxide's level table (flate2's default backend) so
+/// every level is at or below miniz on BOTH bytes and time on the bench
+/// subset: miniz L1 is a 1-probe greedy mode, L2-3 greedy with 6/32 probes
+/// inserting every position, L4-9 lazy with 16/32/128/256/512/768 probes.
+/// zlib's own L8/L9 chains (1024/4096) compress ~0.05pp better but cost
+/// 1.3-1.5x the time; L1's `max_lazy = 0` skips in-match inserts.
 struct Config {
     good_length: usize,
+    max_lazy: usize,
     nice_length: usize,
     max_chain: usize,
-    insert_step: usize, // 0 = skip all match insertions, 1 = every pos, N = every Nth
-    use_fixed: bool,    // true = use fixed Huffman codes (skip tree building)
 }
 
 const CONFIGS: [Config; 10] = [
-    Config { good_length: 0, nice_length: 0, max_chain: 0, insert_step: 0, use_fixed: false },        // 0: stored
-    Config { good_length: 4, nice_length: 8, max_chain: 4, insert_step: 1, use_fixed: true },         // 1
-    Config { good_length: 4, nice_length: 16, max_chain: 8, insert_step: 4, use_fixed: true },        // 2
-    Config { good_length: 4, nice_length: 32, max_chain: 32, insert_step: 4, use_fixed: true },       // 3
-    Config { good_length: 4, nice_length: 16, max_chain: 16, insert_step: 2, use_fixed: false },      // 4
-    Config { good_length: 8, nice_length: 32, max_chain: 32, insert_step: 1, use_fixed: false },      // 5
-    Config { good_length: 8, nice_length: 128, max_chain: 128, insert_step: 1, use_fixed: false },    // 6: default
-    Config { good_length: 8, nice_length: 128, max_chain: 256, insert_step: 1, use_fixed: false },    // 7
-    Config { good_length: 32, nice_length: 258, max_chain: 1024, insert_step: 1, use_fixed: false },  // 8
-    Config { good_length: 32, nice_length: 258, max_chain: 4096, insert_step: 1, use_fixed: false },  // 9
+    Config { good_length: 0, max_lazy: 0, nice_length: 0, max_chain: 0 }, // 0: stored
+    Config { good_length: 4, max_lazy: 0, nice_length: 8, max_chain: 1 }, // 1: greedy
+    Config { good_length: 4, max_lazy: 258, nice_length: 16, max_chain: 4 }, // 2: greedy
+    Config { good_length: 4, max_lazy: 258, nice_length: 32, max_chain: 32 }, // 3: greedy
+    Config { good_length: 4, max_lazy: 32, nice_length: 32, max_chain: 16 }, // 4: lazy
+    Config { good_length: 8, max_lazy: 16, nice_length: 32, max_chain: 28 }, // 5
+    Config { good_length: 8, max_lazy: 16, nice_length: 128, max_chain: 128 }, // 6
+    Config { good_length: 8, max_lazy: 32, nice_length: 128, max_chain: 256 }, // 7
+    Config { good_length: 32, max_lazy: 128, nice_length: 258, max_chain: 320 }, // 8
+    Config { good_length: 16, max_lazy: 258, nice_length: 258, max_chain: 512 }, // 9
 ];
-
-// ---------------------------------------------------------------------------
-// Token representation
-// ---------------------------------------------------------------------------
-
-enum Token {
-    Literal(u8),
-    Match { length: u16, distance: u16 },
-}
-
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
 
 /// Compress `input` into a raw DEFLATE stream.
 pub fn deflate(input: &[u8], level: u32) -> Vec<u8> {
     let level = std::cmp::min(level, 9) as usize;
-
     if level == 0 || input.is_empty() {
         return compress_stored_all(input);
     }
-
-    compress_with_huffman(input, level)
+    let mut d = Deflater::new(input, level);
+    if level <= 3 {
+        d.deflate_fast();
+    } else {
+        d.deflate_slow();
+    }
+    d.w.finish()
 }
 
 // ---------------------------------------------------------------------------
-// Stored-block compression (level 0 / fallback)
+// Stored-block compression (level 0)
 // ---------------------------------------------------------------------------
 
 fn compress_stored_all(input: &[u8]) -> Vec<u8> {
     let mut w = BitWriter::with_capacity(input.len() + input.len() / MAX_STORED_BLOCK * 5 + 20);
-    let mut offset = 0;
-
     if input.is_empty() {
         write_stored_block(&mut w, &[], true);
         return w.finish();
     }
-
+    let mut offset = 0;
     while offset < input.len() {
         let chunk = std::cmp::min(MAX_STORED_BLOCK, input.len() - offset);
         let is_final = offset + chunk >= input.len();
@@ -91,8 +94,7 @@ fn compress_stored_all(input: &[u8]) -> Vec<u8> {
 }
 
 fn write_stored_block(w: &mut BitWriter, data: &[u8], is_final: bool) {
-    w.write_bits(is_final as u32, 1);
-    w.write_bits(0b00, 2); // BTYPE = stored
+    w.write_bits(is_final as u32, 3); // BFINAL + BTYPE 00
     w.align_to_byte();
     let len = data.len() as u16;
     w.write_u16_le(len);
@@ -101,459 +103,345 @@ fn write_stored_block(w: &mut BitWriter, data: &[u8], is_final: bool) {
 }
 
 // ---------------------------------------------------------------------------
-// Huffman-block compression (levels 1-9)
+// LZ77 parser (zlib deflate_fast / deflate_slow)
 // ---------------------------------------------------------------------------
 
-fn compress_with_huffman(input: &[u8], level: usize) -> Vec<u8> {
-    let config = &CONFIGS[level];
-    let mut w = BitWriter::with_capacity(input.len());
-
-    let mut offset = 0;
-    while offset < input.len() {
-        let end = std::cmp::min(offset + BLOCK_SIZE, input.len());
-        let is_final = end >= input.len();
-
-        let tokens = lz77(input, offset, end, config);
-        write_best_block(&mut w, &input[offset..end], &tokens, is_final, config.use_fixed);
-
-        offset = end;
-    }
-    w.finish()
+struct Deflater<'a> {
+    input: &'a [u8],
+    cfg: &'static Config,
+    w: BitWriter,
+    trees: TreeState,
+    /// Hash chain heads (absolute positions) and a ring of *deltas* to the
+    /// previous position with the same hash (0 = end of chain). A u16 ring is
+    /// half the size of zlib's absolute-position `prev` and stays in L2.
+    head: Vec<u32>,
+    prev: Vec<u16>,
+    /// Symbol buffer of the current block and the byte where it starts.
+    syms: Vec<Sym>,
+    block_start: usize,
+    strstart: usize,
+    /// Result of the last `longest_match`.
+    match_start: usize,
+    match_length: usize,
+    prev_length: usize,
+    prev_match: usize,
+    match_available: bool,
 }
 
-/// Choose the smallest block encoding and write it.
-fn write_best_block(
-    w: &mut BitWriter,
-    raw_data: &[u8],
-    tokens: &[Token],
-    is_final: bool,
-    use_fixed: bool,
-) {
-    let stored_bits = stored_block_bits(raw_data.len());
-
-    if use_fixed {
-        // Fast path for low levels: compare stored vs fixed Huffman only.
-        let fixed_bits = estimate_fixed_bits(tokens);
-        if stored_bits <= fixed_bits && raw_data.len() <= MAX_STORED_BLOCK {
-            write_stored_block(w, raw_data, is_final);
-        } else {
-            write_fixed_block(w, tokens, is_final);
+impl<'a> Deflater<'a> {
+    fn new(input: &'a [u8], level: usize) -> Self {
+        Self {
+            input,
+            cfg: &CONFIGS[level],
+            w: BitWriter::with_capacity(input.len() / 2 + 64),
+            trees: TreeState::new(),
+            head: vec![NIL; HASH_SIZE],
+            prev: vec![0; MAX_DIST],
+            syms: Vec::with_capacity(LIT_BUFSIZE),
+            block_start: 0,
+            strstart: 0,
+            match_start: 0,
+            match_length: MIN_MATCH - 1,
+            prev_length: MIN_MATCH - 1,
+            prev_match: 0,
+            match_available: false,
         }
-    } else {
-        // Full path: compare stored vs dynamic Huffman.
-        let mut lit_freq = [0u32; 286];
-        let mut dist_freq = [0u32; 30];
-        lit_freq[256] = 1;
-        for token in tokens {
-            match token {
-                Token::Literal(b) => lit_freq[*b as usize] += 1,
-                Token::Match { length, distance } => {
-                    let (sym, _, _) = tables::length_to_symbol(*length);
-                    lit_freq[sym as usize] += 1;
-                    let (dsym, _, _) = tables::distance_to_symbol(*distance);
-                    dist_freq[dsym as usize] += 1;
+    }
+
+    #[inline(always)]
+    fn lookahead(&self) -> usize {
+        self.input.len() - self.strstart
+    }
+
+    /// zlib's rolling hash of the 3 bytes at `pos` (same value as
+    /// `UPDATE_HASH` applied byte by byte).
+    #[inline(always)]
+    fn hash_at(&self, pos: usize) -> u32 {
+        // SAFETY: callers guarantee pos + 3 <= input.len().
+        unsafe {
+            let p = self.input.as_ptr().add(pos);
+            ((((*p as u32) << HASH_SHIFT) ^ (*p.add(1) as u32)) << HASH_SHIFT ^ (*p.add(2) as u32)) & HASH_MASK
+        }
+    }
+
+    /// `INSERT_STRING`: returns the previous head of the chain.
+    #[inline(always)]
+    fn insert_string(&mut self, pos: usize) -> u32 {
+        let h = self.hash_at(pos) as usize;
+        // SAFETY: h < HASH_SIZE, pos & W_MASK < MAX_DIST.
+        unsafe {
+            let head = *self.head.get_unchecked(h);
+            // Distance to the previous occurrence; beyond the window (or no
+            // previous occurrence) the chain ends here.
+            let delta = pos.wrapping_sub(head as usize);
+            *self.prev.get_unchecked_mut(pos & W_MASK) = if head == NIL || delta > MAX_DIST { 0 } else { delta as u16 };
+            *self.head.get_unchecked_mut(h) = pos as u32;
+            head
+        }
+    }
+
+    /// zlib `longest_match`. Uses `prev_length` as the length to beat.
+    #[inline(never)]
+    fn longest_match(&mut self, mut cur_match: usize) -> usize {
+        let input = self.input;
+        let strstart = self.strstart;
+        let lookahead = input.len() - strstart;
+        let mut chain_length = self.cfg.max_chain;
+        let mut best_len = self.prev_length;
+        let mut nice_match = self.cfg.nice_length;
+        if self.prev_length >= self.cfg.good_length {
+            chain_length >>= 2;
+        }
+        if nice_match > lookahead {
+            nice_match = lookahead;
+        }
+        let max_len = MAX_MATCH.min(lookahead);
+        if best_len >= max_len {
+            return best_len.min(lookahead);
+        }
+        let limit = strstart.saturating_sub(MAX_DIST);
+        let base = input.as_ptr();
+        // SAFETY: every index below is < input.len(): cur_match < strstart,
+        // and compares stay below strstart + max_len <= input.len().
+        unsafe {
+            let scan = base.add(strstart);
+            let mut scan_end1 = *scan.add(best_len - 1);
+            let mut scan_end = *scan.add(best_len);
+            loop {
+                let m = base.add(cur_match);
+                if *m.add(best_len) == scan_end
+                    && *m.add(best_len - 1) == scan_end1
+                    && *m == *scan
+                    && *m.add(1) == *scan.add(1)
+                {
+                    // Extend from byte 2 in 8-byte steps.
+                    let mut len = 2usize;
+                    while len + 8 <= max_len {
+                        let a = core::ptr::read_unaligned(scan.add(len) as *const u64);
+                        let b = core::ptr::read_unaligned(m.add(len) as *const u64);
+                        let x = a ^ b;
+                        if x != 0 {
+                            len += (x.trailing_zeros() >> 3) as usize;
+                            break;
+                        }
+                        len += 8;
+                    }
+                    if len + 8 > max_len && len < max_len {
+                        // Tail (also reached when the 8-byte loop ended
+                        // without a mismatch).
+                        while len < max_len && *scan.add(len) == *m.add(len) {
+                            len += 1;
+                        }
+                    }
+                    if len > best_len {
+                        self.match_start = cur_match;
+                        best_len = len;
+                        if len >= nice_match || len >= max_len {
+                            break;
+                        }
+                        scan_end1 = *scan.add(best_len - 1);
+                        scan_end = *scan.add(best_len);
+                    }
+                }
+                let delta = *self.prev.get_unchecked(cur_match & W_MASK) as usize;
+                if delta == 0 || cur_match < limit + delta {
+                    break;
+                }
+                cur_match -= delta;
+                chain_length -= 1;
+                if chain_length == 0 {
+                    break;
                 }
             }
         }
-        let lit_lengths = huffman::build_lengths(&lit_freq, 15);
-        let dist_lengths = huffman::build_lengths(&dist_freq, 15);
-        let dynamic_bits = estimate_dynamic_bits(tokens, &lit_lengths, &dist_lengths, &lit_freq, &dist_freq);
-
-        if stored_bits <= dynamic_bits && raw_data.len() <= MAX_STORED_BLOCK {
-            write_stored_block(w, raw_data, is_final);
-        } else {
-            write_dynamic_block(w, tokens, &lit_lengths, &dist_lengths, is_final);
-        }
+        best_len.min(lookahead)
     }
-}
 
-fn stored_block_bits(data_len: usize) -> usize {
-    // 3 bits header + align (worst 7) + 4 bytes len/nlen + data
-    3 + 7 + 32 + data_len * 8
-}
+    #[inline(always)]
+    fn tally_lit(&mut self, c: u8) -> bool {
+        self.syms.push(Sym { dist: 0, lc: c });
+        self.trees.dyn_ltree[c as usize].fc += 1;
+        self.syms.len() == SYM_END
+    }
 
-fn estimate_fixed_bits(tokens: &[Token]) -> usize {
-    static FIXED_LIT: std::sync::OnceLock<[u8; 288]> = std::sync::OnceLock::new();
-    static FIXED_DIST: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
-    let fl = FIXED_LIT.get_or_init(tables::fixed_literal_lengths);
-    let fd = FIXED_DIST.get_or_init(tables::fixed_distance_lengths);
+    #[inline(always)]
+    fn tally_dist(&mut self, dist: usize, len: usize) -> bool {
+        use super::trees::{d_code, LENGTH_CODE, LITERALS};
+        self.syms.push(Sym { dist: dist as u16, lc: len as u8 });
+        self.trees.dyn_ltree[LENGTH_CODE[len] as usize + LITERALS + 1].fc += 1;
+        self.trees.dyn_dtree[d_code(dist - 1)].fc += 1;
+        self.syms.len() == SYM_END
+    }
 
-    let mut bits = 3usize; // block header
-    for token in tokens {
-        match token {
-            Token::Literal(b) => bits += fl[*b as usize] as usize,
-            Token::Match { length, distance } => {
-                let (sym, extra, _) = tables::length_to_symbol(*length);
-                bits += fl[sym as usize] as usize + extra as usize;
-                let (dsym, dextra, _) = tables::distance_to_symbol(*distance);
-                bits += fd[dsym as usize] as usize + dextra as usize;
+    fn flush_block(&mut self, last: bool) {
+        let stored = &self.input[self.block_start..self.strstart];
+        self.trees.flush_block(&mut self.w, &self.syms, stored, last);
+        self.syms.clear();
+        self.block_start = self.strstart;
+    }
+
+    /// zlib `deflate_fast` (levels 1-3): greedy matching, short chains.
+    fn deflate_fast(&mut self) {
+        let max_insert = self.cfg.max_lazy;
+        while self.strstart < self.input.len() {
+            let lookahead = self.lookahead();
+            let mut hash_head = NIL;
+            if lookahead >= MIN_MATCH {
+                hash_head = self.insert_string(self.strstart);
             }
-        }
-    }
-    bits += fl[256] as usize; // end-of-block
-    bits
-}
-
-// ---------------------------------------------------------------------------
-// Fixed Huffman block writer (levels 1-3)
-// ---------------------------------------------------------------------------
-
-fn fixed_lit_codes() -> &'static [(u32, u8)] {
-    static CODES: std::sync::OnceLock<Vec<(u32, u8)>> = std::sync::OnceLock::new();
-    CODES.get_or_init(|| huffman::canonical_codes(&tables::fixed_literal_lengths()))
-}
-
-fn fixed_dist_codes() -> &'static [(u32, u8)] {
-    static CODES: std::sync::OnceLock<Vec<(u32, u8)>> = std::sync::OnceLock::new();
-    CODES.get_or_init(|| huffman::canonical_codes(&tables::fixed_distance_lengths()))
-}
-
-fn write_fixed_block(w: &mut BitWriter, tokens: &[Token], is_final: bool) {
-    w.write_bits(is_final as u32, 1);
-    w.write_bits(0b01, 2); // BTYPE = fixed Huffman
-
-    let lit_codes = fixed_lit_codes();
-    let dist_codes = fixed_dist_codes();
-
-    for token in tokens {
-        match token {
-            Token::Literal(b) => {
-                let (code, len) = lit_codes[*b as usize];
-                w.write_bits(code, len as u32);
+            self.match_length = MIN_MATCH - 1;
+            if hash_head != NIL && self.strstart - hash_head as usize <= MAX_DIST {
+                self.prev_length = MIN_MATCH - 1;
+                self.match_length = self.longest_match(hash_head as usize);
             }
-            Token::Match { length, distance } => {
-                let (sym, extra_bits, extra_val) = tables::length_to_symbol(*length);
-                let (code, len) = lit_codes[sym as usize];
-                w.write_bits(code, len as u32);
-                if extra_bits > 0 {
-                    w.write_bits(extra_val as u32, extra_bits as u32);
-                }
-                let (dsym, dextra_bits, dextra_val) = tables::distance_to_symbol(*distance);
-                let (dcode, dlen) = dist_codes[dsym as usize];
-                w.write_bits(dcode, dlen as u32);
-                if dextra_bits > 0 {
-                    w.write_bits(dextra_val as u32, dextra_bits as u32);
-                }
-            }
-        }
-    }
-
-    // End-of-block symbol (256).
-    let (code, len) = lit_codes[256];
-    w.write_bits(code, len as u32);
-}
-
-fn estimate_dynamic_bits(
-    tokens: &[Token],
-    lit_lengths: &[u8],
-    dist_lengths: &[u8],
-    _lit_freq: &[u32],
-    _dist_freq: &[u32],
-) -> usize {
-    // 3 bits block header + header overhead (generous estimate) + data bits
-    let header_est = 3 + 5 + 5 + 4 + 19 * 3 + 286 * 4 + 30 * 4; // rough upper bound
-
-    let mut data_bits = 0usize;
-    for token in tokens {
-        match token {
-            Token::Literal(b) => data_bits += lit_lengths[*b as usize] as usize,
-            Token::Match { length, distance } => {
-                let (sym, extra, _) = tables::length_to_symbol(*length);
-                data_bits += lit_lengths[sym as usize] as usize + extra as usize;
-                let (dsym, dextra, _) = tables::distance_to_symbol(*distance);
-                data_bits += dist_lengths[dsym as usize] as usize + dextra as usize;
-            }
-        }
-    }
-    // End-of-block symbol.
-    data_bits += lit_lengths[256] as usize;
-
-    header_est + data_bits
-}
-
-// ---------------------------------------------------------------------------
-// Dynamic Huffman block writer
-// ---------------------------------------------------------------------------
-
-fn write_dynamic_block(
-    w: &mut BitWriter,
-    tokens: &[Token],
-    lit_lengths: &[u8],
-    dist_lengths: &[u8],
-    is_final: bool,
-) {
-    w.write_bits(is_final as u32, 1);
-    w.write_bits(0b10, 2); // BTYPE = dynamic Huffman
-
-    // Trim trailing zeros.
-    let mut hlit = lit_lengths.len();
-    while hlit > 257 && lit_lengths[hlit - 1] == 0 {
-        hlit -= 1;
-    }
-
-    // RFC 1951 requires the dist alphabet to encode at least one valid code.
-    // When a block has zero matches every dist length is 0 — that produces
-    // a degenerate canonical Huffman table that strict decoders (zlib,
-    // flate2) reject as "corrupt deflate stream", though our own decoder
-    // happens to accept it.  zlib's encoder sidesteps this by emitting two
-    // synthetic 1-bit dist codes that never get used in the bitstream
-    // (`zlib/trees.c::send_all_trees`).  Mirror that here: copy
-    // `dist_lengths` into a local buffer and patch positions 0 and 1 to 1
-    // when the original is all-zero.
-    let dist_owned: Vec<u8>;
-    let dist_lengths: &[u8] = if dist_lengths.iter().all(|&l| l == 0) {
-        let mut buf = vec![0u8; dist_lengths.len().max(2)];
-        buf[0] = 1;
-        buf[1] = 1;
-        dist_owned = buf;
-        &dist_owned
-    } else {
-        dist_lengths
-    };
-
-    let mut hdist = dist_lengths.len();
-    while hdist > 1 && dist_lengths[hdist - 1] == 0 {
-        hdist -= 1;
-    }
-
-
-    // RLE-encode the combined code-length sequence.
-    let mut combined: Vec<u8> = Vec::with_capacity(hlit + hdist);
-    combined.extend_from_slice(&lit_lengths[..hlit]);
-    combined.extend_from_slice(&dist_lengths[..hdist]);
-    let rle = rle_encode(&combined);
-
-    // Build Huffman codes for the code-length alphabet (max 7 bits).
-    let mut cl_freq = [0u32; 19];
-    for &(sym, _) in &rle {
-        cl_freq[sym as usize] += 1;
-    }
-    let mut cl_lengths_arr = huffman::build_lengths(&cl_freq, 7);
-    // Strict inflaters require the code-length code itself to be complete
-    // even when only one symbol is used (miniz_oxide: `bt == HUFFLEN_TABLE`).
-    // A lone 1-bit code is incomplete, so pair it with an unused symbol.
-    if cl_lengths_arr.iter().filter(|&&l| l > 0).count() == 1 {
-        let dummy = (0..19).find(|&i| cl_lengths_arr[i] == 0).expect("19-symbol alphabet");
-        cl_lengths_arr[dummy] = 1;
-    }
-    let cl_codes = huffman::canonical_codes(&cl_lengths_arr);
-
-    // Determine HCLEN.
-    let mut hclen = 19;
-    while hclen > 4 && cl_lengths_arr[tables::CODE_LENGTH_ORDER[hclen - 1]] == 0 {
-        hclen -= 1;
-    }
-
-    // Write header.
-    w.write_bits((hlit - 257) as u32, 5);
-    w.write_bits((hdist - 1) as u32, 5);
-    w.write_bits((hclen - 4) as u32, 4);
-
-    for i in 0..hclen {
-        w.write_bits(cl_lengths_arr[tables::CODE_LENGTH_ORDER[i]] as u32, 3);
-    }
-
-    // Write the RLE-encoded code lengths.
-    for &(sym, extra_val) in &rle {
-        let (code, len) = cl_codes[sym as usize];
-        w.write_bits(code, len as u32);
-        match sym {
-            16 => w.write_bits(extra_val as u32, 2),
-            17 => w.write_bits(extra_val as u32, 3),
-            18 => w.write_bits(extra_val as u32, 7),
-            _ => {}
-        }
-    }
-
-    // Encode the actual data.
-    let lit_codes = huffman::canonical_codes(lit_lengths);
-    let dist_codes = huffman::canonical_codes(dist_lengths);
-
-    for token in tokens {
-        match token {
-            Token::Literal(b) => {
-                huffman::encode_symbol(w, &lit_codes, *b as u16);
-            }
-            Token::Match { length, distance } => {
-                let (sym, extra_bits, extra_val) = tables::length_to_symbol(*length);
-                huffman::encode_symbol(w, &lit_codes, sym);
-                if extra_bits > 0 {
-                    w.write_bits(extra_val as u32, extra_bits as u32);
-                }
-                let (dsym, dextra_bits, dextra_val) = tables::distance_to_symbol(*distance);
-                huffman::encode_symbol(w, &dist_codes, dsym as u16);
-                if dextra_bits > 0 {
-                    w.write_bits(dextra_val as u32, dextra_bits as u32);
-                }
-            }
-        }
-    }
-
-    // End-of-block.
-    huffman::encode_symbol(w, &lit_codes, 256);
-}
-
-/// Run-length encode a sequence of code lengths.
-///
-/// Returns `(symbol, extra_bits_value)` pairs.
-fn rle_encode(lengths: &[u8]) -> Vec<(u8, u8)> {
-    let mut result = Vec::new();
-    let mut i = 0;
-
-    while i < lengths.len() {
-        let val = lengths[i];
-        let mut run = 1;
-        while i + run < lengths.len() && lengths[i + run] == val {
-            run += 1;
-        }
-
-        if val == 0 {
-            let mut remaining = run;
-            while remaining > 0 {
-                if remaining >= 11 {
-                    let n = std::cmp::min(remaining, 138);
-                    result.push((18u8, (n - 11) as u8));
-                    remaining -= n;
-                } else if remaining >= 3 {
-                    let n = std::cmp::min(remaining, 10);
-                    result.push((17u8, (n - 3) as u8));
-                    remaining -= n;
+            let bflush;
+            if self.match_length >= MIN_MATCH {
+                let ml = self.match_length;
+                bflush = self.tally_dist(self.strstart - self.match_start, ml - MIN_MATCH);
+                if ml <= max_insert && lookahead - ml >= MIN_MATCH {
+                    // Insert every position of the match into the chain.
+                    for _ in 1..ml {
+                        self.strstart += 1;
+                        self.insert_string(self.strstart);
+                    }
+                    self.strstart += 1;
                 } else {
-                    result.push((0u8, 0));
-                    remaining -= 1;
+                    self.strstart += ml;
                 }
+                self.match_length = 0;
+            } else {
+                bflush = self.tally_lit(self.input[self.strstart]);
+                self.strstart += 1;
             }
-        } else {
-            // Emit the value once.
-            result.push((val, 0));
-            let mut remaining = run - 1;
-            while remaining > 0 {
-                if remaining >= 3 {
-                    let n = std::cmp::min(remaining, 6);
-                    result.push((16u8, (n - 3) as u8));
-                    remaining -= n;
-                } else {
-                    result.push((val, 0));
-                    remaining -= 1;
-                }
+            if bflush {
+                self.flush_block(false);
             }
         }
-
-        i += run;
+        self.flush_block(true);
     }
 
-    result
-}
-
-// ---------------------------------------------------------------------------
-// LZ77 string matching
-// ---------------------------------------------------------------------------
-
-fn hash3(data: &[u8]) -> usize {
-    let v = (data[0] as u32) | ((data[1] as u32) << 8) | ((data[2] as u32) << 16);
-    (v.wrapping_mul(0x1E35_A7BD) >> (32 - HASH_BITS)) as usize & HASH_MASK
-}
-
-fn lz77(input: &[u8], start: usize, end: usize, config: &Config) -> Vec<Token> {
-    let mut tokens = Vec::with_capacity(end - start);
-    let mut head = vec![NONE; HASH_SIZE];
-    let mut prev = vec![NONE; WINDOW_SIZE];
-    let mut pos = start;
-
-    // Pre-populate hash chains from before `start` (provides context for the window).
-    let pre_start = start.saturating_sub(WINDOW_SIZE);
-    for p in pre_start..start {
-        if p + MIN_MATCH <= end {
-            let h = hash3(&input[p..]);
-            prev[p & WINDOW_MASK] = head[h];
-            head[h] = p as u32;
-        }
-    }
-
-    while pos < end {
-        let remaining = end - pos;
-        if remaining < MIN_MATCH {
-            tokens.push(Token::Literal(input[pos]));
-            pos += 1;
-            continue;
-        }
-
-        let h = hash3(&input[pos..]);
-
-        // Find best match by walking the hash chain.
-        let mut best_len = MIN_MATCH - 1;
-        let mut best_dist = 0u16;
-        let min_pos = pos.saturating_sub(WINDOW_SIZE);
-        let mut chain = config.max_chain;
-        let mut match_head = head[h];
-
-        while match_head != NONE && chain > 0 {
-            let mp = match_head as usize;
-            if mp < min_pos || mp >= pos {
-                break;
+    /// zlib `deflate_slow` (levels 4-9): lazy evaluation.
+    fn deflate_slow(&mut self) {
+        let max_lazy = self.cfg.max_lazy;
+        let n = self.input.len();
+        while self.strstart < n {
+            let lookahead = n - self.strstart;
+            let mut hash_head = NIL;
+            if lookahead >= MIN_MATCH {
+                hash_head = self.insert_string(self.strstart);
             }
-            let dist = pos - mp;
-
-            // Quick check: first and last bytes of current best.
-            if mp + best_len < input.len()
-                && pos + best_len < input.len()
-                && input[mp + best_len] == input[pos + best_len]
-                && input[mp] == input[pos]
+            self.prev_length = self.match_length;
+            self.prev_match = self.match_start;
+            self.match_length = MIN_MATCH - 1;
+            if hash_head != NIL
+                && self.prev_length < max_lazy
+                && self.strstart - hash_head as usize <= MAX_DIST
             {
-                let max_len = std::cmp::min(MAX_MATCH, remaining);
-                let mut len = 0;
-                while len < max_len && input[mp + len] == input[pos + len] {
-                    len += 1;
+                self.match_length = self.longest_match(hash_head as usize);
+                if self.match_length <= 5
+                    && self.match_length == MIN_MATCH
+                    && self.strstart - self.match_start > TOO_FAR
+                {
+                    self.match_length = MIN_MATCH - 1;
                 }
-                if len > best_len {
-                    best_len = len;
-                    best_dist = dist as u16;
-                    if best_len >= config.nice_length {
-                        break;
+            }
+            if self.prev_length >= MIN_MATCH && self.match_length <= self.prev_length {
+                let max_insert = self.strstart + lookahead - MIN_MATCH;
+                let pl = self.prev_length;
+                let bflush = self.tally_dist(self.strstart - 1 - self.prev_match, pl - MIN_MATCH);
+                // Insert the match's remaining positions (strstart+1 ..).
+                let mut cnt = pl - 2;
+                while cnt != 0 {
+                    self.strstart += 1;
+                    if self.strstart <= max_insert {
+                        self.insert_string(self.strstart);
                     }
+                    cnt -= 1;
                 }
+                self.match_available = false;
+                self.match_length = MIN_MATCH - 1;
+                self.strstart += 1;
+                if bflush {
+                    self.flush_block(false);
+                }
+            } else if self.match_available {
+                let bflush = self.tally_lit(self.input[self.strstart - 1]);
+                if bflush {
+                    self.flush_block_only();
+                }
+                self.strstart += 1;
+            } else {
+                self.match_available = true;
+                self.strstart += 1;
             }
-
-            let next = prev[mp & WINDOW_MASK];
-            if next == NONE || next as usize >= mp {
-                break; // chain went forward / ended
-            }
-            match_head = next;
-            if best_len >= config.good_length {
-                chain >>= 2; // reduce search effort for "good enough" matches
-            }
-            chain = chain.saturating_sub(1);
         }
+        if self.match_available {
+            self.tally_lit(self.input[self.strstart - 1]);
+            self.match_available = false;
+        }
+        self.flush_block(true);
+    }
 
-        // Update hash chain.
-        prev[pos & WINDOW_MASK] = head[h];
-        head[h] = pos as u32;
+    /// zlib `FLUSH_BLOCK_ONLY` inside the lazy literal path: the block ends
+    /// at `strstart - 1` (that literal was the last symbol) — in zlib the
+    /// stored range is `[block_start, strstart)` at that point too, since
+    /// `strstart` has not been advanced yet.
+    fn flush_block_only(&mut self) {
+        self.flush_block(false);
+    }
+}
 
-        if best_len >= MIN_MATCH {
-            tokens.push(Token::Match {
-                length: best_len as u16,
-                distance: best_dist,
-            });
-            // Insert hash entries for positions inside the match.
-            // At low levels, skip most/all insertions for speed.
-            if config.insert_step > 0 {
-                let mut i = config.insert_step;
-                while i < best_len {
-                    let p = pos + i;
-                    if p + MIN_MATCH <= end {
-                        let h2 = hash3(&input[p..]);
-                        prev[p & WINDOW_MASK] = head[h2];
-                        head[h2] = p as u32;
-                    }
-                    i += config.insert_step;
-                }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(data: &[u8], level: u32) {
+        let c = deflate(data, level);
+        let mut out = Vec::new();
+        super::super::inflate::inflate_into(&c, &mut out).unwrap();
+        assert_eq!(out, data, "level {level} len {}", data.len());
+        // Strict reference decoder.
+        let mut dec = flate2::read::DeflateDecoder::new(&c[..]);
+        let mut out2 = Vec::new();
+        std::io::Read::read_to_end(&mut dec, &mut out2).unwrap();
+        assert_eq!(out2, data, "miniz rejects level {level} len {}", data.len());
+    }
+
+    #[test]
+    fn roundtrip_levels_and_shapes() {
+        let text: Vec<u8> = b"the quick brown fox jumps over the lazy dog. ".repeat(3000);
+        let mut rnd = Vec::new();
+        let mut x = 0x1234_5678u32;
+        for _ in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            rnd.push((x >> 24) as u8);
+        }
+        let zeros = vec![0u8; 300_000];
+        let mut mixed = text.clone();
+        mixed.extend_from_slice(&rnd[..50_000]);
+        mixed.extend_from_slice(&zeros[..70_000]);
+        for level in 0..=9 {
+            for d in [&b""[..], b"a", b"abc", &text, &rnd, &zeros, &mixed] {
+                roundtrip(d, level);
             }
-            pos += best_len;
-        } else {
-            tokens.push(Token::Literal(input[pos]));
-            pos += 1;
         }
     }
 
-    tokens
+    #[test]
+    fn far_distances_are_within_window() {
+        // A repeat exactly 32768 back is the largest legal distance.
+        let mut d = vec![0u8; 0];
+        let mut x = 7u32;
+        for _ in 0..32768 {
+            x = x.wrapping_mul(1103515245).wrapping_add(12345);
+            d.push((x >> 16) as u8);
+        }
+        let first = d.clone();
+        d.extend_from_slice(&first);
+        for level in [1, 4, 6, 9] {
+            roundtrip(&d, level);
+        }
+    }
 }

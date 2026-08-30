@@ -10,6 +10,7 @@ pub mod crc32;
 mod huffman;
 pub mod inflate;
 mod tables;
+mod trees;
 
 use std::io::{self, Read, Write};
 

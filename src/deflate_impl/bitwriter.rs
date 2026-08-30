@@ -1,5 +1,8 @@
 //! Bit-level writer for DEFLATE compression.
 //! Bits are packed LSB-first into bytes (RFC 1951 section 3.1.1).
+//!
+//! 64-bit accumulator; bytes are drained four at a time so the per-symbol
+//! cost is one shift/or plus a predictable branch.
 
 pub struct BitWriter {
     buf: Vec<u8>,
@@ -16,48 +19,46 @@ impl BitWriter {
         }
     }
 
-    /// Write n bits (0..=32) from value, LSB first.
-    #[inline]
+    /// Write `n` bits (0..=32) from `value`, LSB first. `value` must have
+    /// no bits set above `n`.
+    #[inline(always)]
     pub fn write_bits(&mut self, value: u32, n: u32) {
+        debug_assert!(n <= 32 && (n == 32 || value >> n == 0));
         self.bit_buf |= (value as u64) << self.bit_count;
         self.bit_count += n;
-        self.flush_bytes();
-    }
-
-    #[inline]
-    fn flush_bytes(&mut self) {
-        while self.bit_count >= 8 {
-            self.buf.push((self.bit_buf & 0xFF) as u8);
-            self.bit_buf >>= 8;
-            self.bit_count -= 8;
+        if self.bit_count >= 32 {
+            self.buf.extend_from_slice(&(self.bit_buf as u32).to_le_bytes());
+            self.bit_buf >>= 32;
+            self.bit_count -= 32;
         }
     }
 
     /// Pad remaining bits to the next byte boundary with zeros.
     pub fn align_to_byte(&mut self) {
-        if self.bit_count > 0 {
+        while self.bit_count > 0 {
             self.buf.push((self.bit_buf & 0xFF) as u8);
-            self.bit_buf = 0;
-            self.bit_count = 0;
+            self.bit_buf >>= 8;
+            self.bit_count = self.bit_count.saturating_sub(8);
         }
+        self.bit_buf = 0;
     }
 
-    /// Write a raw byte (flushes any partial byte first).
+    /// Write a raw byte (must be byte-aligned).
     pub fn write_byte(&mut self, byte: u8) {
-        self.write_bits(byte as u32, 8);
+        debug_assert_eq!(self.bit_count, 0);
+        self.buf.push(byte);
     }
 
-    /// Write a 16-bit value in little-endian order.
+    /// Write a 16-bit value in little-endian order (must be byte-aligned).
     pub fn write_u16_le(&mut self, value: u16) {
         self.write_byte(value as u8);
         self.write_byte((value >> 8) as u8);
     }
 
-    /// Write raw bytes.
+    /// Write raw bytes (must be byte-aligned).
     pub fn write_bytes(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.write_byte(b);
-        }
+        debug_assert_eq!(self.bit_count, 0);
+        self.buf.extend_from_slice(bytes);
     }
 
     /// Consume the writer and return the output buffer.
@@ -88,5 +89,27 @@ mod tests {
         w.write_u16_le(0x0201);
         let out = w.finish();
         assert_eq!(out, vec![0x01, 0x02]);
+    }
+
+    #[test]
+    fn test_many_bits_cross_word_boundary() {
+        let mut w = BitWriter::with_capacity(64);
+        for i in 0..100u32 {
+            w.write_bits(i & 0x1FFF, 13);
+        }
+        w.write_bits(0, 5);
+        let out = w.finish();
+        let mut acc = 0u64;
+        let mut n = 0u32;
+        let mut it = out.iter();
+        for i in 0..100u32 {
+            while n < 13 {
+                acc |= (*it.next().unwrap() as u64) << n;
+                n += 8;
+            }
+            assert_eq!((acc & 0x1FFF) as u32, i & 0x1FFF);
+            acc >>= 13;
+            n -= 13;
+        }
     }
 }
