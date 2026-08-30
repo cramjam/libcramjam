@@ -31,36 +31,42 @@ impl HufCTable {
 
     /// Build a length-limited canonical Huffman table from symbol counts
     /// (`counts.len() == max_symbol + 1`, at least two non-zero).
+    /// `HUF_buildCTable_wksp`: `HUF_sort` + `HUF_buildTree` +
+    /// `HUF_setMaxHeight` + `HUF_buildCTableFromTree`, allocation-free.
     fn build(counts: &[u32], max_table_log: u32) -> Option<Self> {
         let max_symbol = counts.len() - 1;
-        let mut indexed: Vec<(usize, u32)> = counts.iter().copied().enumerate().filter(|(_, c)| *c > 0).collect();
-        if indexed.len() < 2 {
+        if counts.iter().filter(|&&c| c > 0).count() < 2 {
             return None;
         }
-        indexed.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-        let sorted_freqs: Vec<u32> = indexed.iter().map(|(_, f)| *f).collect();
-        let lengths = super::huf::package_merge_code_lengths(&sorted_freqs, max_table_log as usize);
-        let max_bits = *lengths.iter().max().unwrap() as u32;
-        // weight = max_bits + 1 - nb; sort present symbols by (weight asc,
-        // symbol asc) = (nb desc, symbol asc) and assign canonical codes.
-        let mut sorted: Vec<(u8, u8)> = indexed
-            .iter()
-            .zip(lengths.iter())
-            .map(|(&(sym, _), &nb)| (sym as u8, (max_bits + 1 - nb as u32) as u8))
-            .collect();
-        sorted.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        let (nodes, non_null_rank) = huf_sort_and_build_tree(counts);
+        let mut nodes = nodes;
+        let max_bits = huf_set_max_height(&mut nodes, non_null_rank, max_table_log);
+        if max_bits > HUF_TABLELOG_MAX {
+            return None;
+        }
+        // HUF_buildCTableFromTree: canonical values per rank, assigned in
+        // symbol order.
+        let mut nb_per_rank = [0u16; HUF_TABLELOG_MAX as usize + 1];
+        let mut val_per_rank = [0u16; HUF_TABLELOG_MAX as usize + 1];
+        let mut nb_bits = [0u8; 256];
+        for n in 0..=non_null_rank {
+            nb_per_rank[nodes[n].nb_bits as usize] += 1;
+            nb_bits[nodes[n].byte as usize] = nodes[n].nb_bits;
+        }
+        let mut min = 0u16;
+        for n in (1..=max_bits as usize).rev() {
+            val_per_rank[n] = min;
+            min += nb_per_rank[n];
+            min >>= 1;
+        }
         let mut elt = [0u64; 256];
-        let mut current_code: u32 = 0;
-        let mut current_weight: u8 = 0;
-        let mut current_nb: u32 = 0;
-        for &(sym, w) in &sorted {
-            if w != current_weight {
-                current_code >>= w - current_weight;
-                current_nb = max_bits + 1 - w as u32;
-                current_weight = w;
+        for sym in 0..=max_symbol {
+            let nb = nb_bits[sym] as u32;
+            if nb > 0 {
+                let v = val_per_rank[nb as usize];
+                val_per_rank[nb as usize] += 1;
+                elt[sym] = ((v as u64) << (64 - nb)) | nb as u64;
             }
-            elt[sym as usize] = ((current_code as u64) << (64 - current_nb)) | current_nb as u64;
-            current_code += 1;
         }
         Some(HufCTable { elt, max_symbol, table_log: max_bits })
     }
@@ -95,6 +101,241 @@ impl HufCTable {
         }
         Some(1 + (n + 1) / 2)
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct HufNode {
+    count: u32,
+    parent: u16,
+    byte: u8,
+    nb_bits: u8,
+}
+
+const HUF_STARTNODE: usize = 256;
+const RANK_POSITION_TABLE_SIZE: usize = 192;
+const RANK_POSITION_LOG_BUCKETS_BEGIN: u32 = 158;
+const RANK_POSITION_DISTINCT_COUNT_CUTOFF: u32 = 166;
+
+#[inline]
+fn huf_get_index(count: u32) -> usize {
+    if count < RANK_POSITION_DISTINCT_COUNT_CUTOFF {
+        count as usize
+    } else {
+        (31 - count.leading_zeros() + RANK_POSITION_LOG_BUCKETS_BEGIN) as usize
+    }
+}
+
+/// `HUF_simpleQuickSort` (descending by count, rightmost pivot, insertion
+/// sort below 8) — the exact order matters for tie-breaking parity.
+fn huf_sort_bucket(a: &mut [HufNode]) {
+    if a.len() < 8 {
+        for i in 1..a.len() {
+            let key = a[i];
+            let mut j = i;
+            while j > 0 && a[j - 1].count < key.count {
+                a[j] = a[j - 1];
+                j -= 1;
+            }
+            a[j] = key;
+        }
+        return;
+    }
+    let high = a.len() - 1;
+    let pivot = a[high].count;
+    let mut i = 0usize;
+    for j in 0..high {
+        if a[j].count > pivot {
+            a.swap(i, j);
+            i += 1;
+        }
+    }
+    a.swap(i, high);
+    let (lo, hi) = a.split_at_mut(i);
+    huf_sort_bucket(lo);
+    huf_sort_bucket(&mut hi[1..]);
+}
+
+/// `HUF_sort` + `HUF_buildTree`. Returns the node table (index 0 is C's
+/// `huffNode0[0]` barrier; symbols start at 1) and `nonNullRank`, both
+/// relative to the symbol base as in C.
+fn huf_sort_and_build_tree(counts: &[u32]) -> (HufNodes, usize) {
+    let n_syms = counts.len();
+    let mut nodes = HufNodes([HufNode::default(); 2 * 256 + 2]);
+    // HUF_sort: bucket by rank, higher counts first.
+    let mut base = [0u32; RANK_POSITION_TABLE_SIZE];
+    let mut curr = [0u32; RANK_POSITION_TABLE_SIZE];
+    for &c in counts {
+        base[huf_get_index(c)] += 1;
+    }
+    for n in (1..RANK_POSITION_TABLE_SIZE).rev() {
+        base[n - 1] += base[n];
+        curr[n - 1] = base[n - 1];
+    }
+    for (sym, &c) in counts.iter().enumerate() {
+        let r = huf_get_index(c) + 1;
+        let pos = curr[r] as usize;
+        curr[r] += 1;
+        nodes[pos] = HufNode { count: c, parent: 0, byte: sym as u8, nb_bits: 0 };
+    }
+    for n in RANK_POSITION_DISTINCT_COUNT_CUTOFF as usize..RANK_POSITION_TABLE_SIZE - 1 {
+        let (b, e) = (base[n] as usize, curr[n] as usize);
+        if e - b > 1 {
+            huf_sort_bucket(&mut nodes.0[b + 1..e + 1]);
+        }
+    }
+    // HUF_buildTree.
+    let mut non_null_rank = n_syms - 1;
+    while nodes[non_null_rank].count == 0 {
+        non_null_rank -= 1;
+    }
+    let mut node_nb = HUF_STARTNODE;
+    let mut low_s = non_null_rank as isize;
+    let node_root = node_nb + low_s as usize - 1;
+    let mut low_n = node_nb;
+    nodes[node_nb].count = nodes[low_s as usize].count + nodes[low_s as usize - 1].count;
+    nodes[low_s as usize].parent = node_nb as u16;
+    nodes[low_s as usize - 1].parent = node_nb as u16;
+    node_nb += 1;
+    low_s -= 2;
+    for n in node_nb..=node_root {
+        nodes[n].count = 1 << 30;
+    }
+    nodes.0[0].count = 1 << 31; // huffNode0[0]: strong barrier
+    while node_nb <= node_root {
+        let n1 = if nodes.get(low_s).count < nodes[low_n].count {
+            low_s -= 1;
+            (low_s + 1) as usize
+        } else {
+            low_n += 1;
+            low_n - 1
+        };
+        let n2 = if nodes.get(low_s).count < nodes[low_n].count {
+            low_s -= 1;
+            (low_s + 1) as usize
+        } else {
+            low_n += 1;
+            low_n - 1
+        };
+        nodes[node_nb].count = nodes[n1].count + nodes[n2].count;
+        nodes[n1].parent = node_nb as u16;
+        nodes[n2].parent = node_nb as u16;
+        node_nb += 1;
+    }
+    nodes[node_root].nb_bits = 0;
+    for n in (HUF_STARTNODE..node_root).rev() {
+        nodes[n].nb_bits = nodes[nodes[n].parent as usize].nb_bits + 1;
+    }
+    for n in 0..=non_null_rank {
+        nodes[n].nb_bits = nodes[nodes[n].parent as usize].nb_bits + 1;
+    }
+    (nodes, non_null_rank)
+}
+
+/// Node table with C's `huffNode = huffNode0 + 1` indexing.
+struct HufNodes([HufNode; 2 * 256 + 2]);
+impl HufNodes {
+    #[inline(always)]
+    fn get(&self, i: isize) -> &HufNode {
+        &self.0[(i + 1) as usize]
+    }
+}
+impl std::ops::Index<usize> for HufNodes {
+    type Output = HufNode;
+    #[inline(always)]
+    fn index(&self, i: usize) -> &HufNode {
+        &self.0[i + 1]
+    }
+}
+impl std::ops::IndexMut<usize> for HufNodes {
+    #[inline(always)]
+    fn index_mut(&mut self, i: usize) -> &mut HufNode {
+        &mut self.0[i + 1]
+    }
+}
+
+/// `HUF_setMaxHeight`: cap code lengths at `target` and repay the cost.
+fn huf_set_max_height(nodes: &mut HufNodes, last_non_null: usize, target: u32) -> u32 {
+    let largest = nodes[last_non_null].nb_bits as u32;
+    if largest <= target {
+        return largest;
+    }
+    let base_cost: i32 = 1 << (largest - target);
+    let mut n = last_non_null as isize;
+    let mut total_cost: i32 = 0;
+    while nodes[n as usize].nb_bits as u32 > target {
+        total_cost += base_cost - (1 << (largest - nodes[n as usize].nb_bits as u32));
+        nodes[n as usize].nb_bits = target as u8;
+        n -= 1;
+    }
+    while nodes[n as usize].nb_bits as u32 == target {
+        n -= 1;
+    }
+    total_cost >>= largest - target;
+    const NO_SYMBOL: u32 = 0xF0F0_F0F0;
+    let mut rank_last = [NO_SYMBOL; HUF_TABLELOG_MAX as usize + 2];
+    {
+        let mut current_nb_bits = target;
+        let mut pos = n;
+        while pos >= 0 {
+            let nb = nodes[pos as usize].nb_bits as u32;
+            if nb < current_nb_bits {
+                current_nb_bits = nb;
+                rank_last[(target - current_nb_bits) as usize] = pos as u32;
+            }
+            pos -= 1;
+        }
+    }
+    while total_cost > 0 {
+        let mut nb_to_decrease = (31 - (total_cost as u32).leading_zeros()) as usize + 1;
+        while nb_to_decrease > 1 {
+            let high_pos = rank_last[nb_to_decrease];
+            let low_pos = rank_last[nb_to_decrease - 1];
+            if high_pos == NO_SYMBOL {
+                nb_to_decrease -= 1;
+                continue;
+            }
+            if low_pos == NO_SYMBOL {
+                break;
+            }
+            let high_total = nodes[high_pos as usize].count;
+            let low_total = 2 * nodes[low_pos as usize].count;
+            if high_total <= low_total {
+                break;
+            }
+            nb_to_decrease -= 1;
+        }
+        while nb_to_decrease <= HUF_TABLELOG_MAX as usize && rank_last[nb_to_decrease] == NO_SYMBOL {
+            nb_to_decrease += 1;
+        }
+        total_cost -= 1 << (nb_to_decrease - 1);
+        nodes[rank_last[nb_to_decrease] as usize].nb_bits += 1;
+        if rank_last[nb_to_decrease - 1] == NO_SYMBOL {
+            rank_last[nb_to_decrease - 1] = rank_last[nb_to_decrease];
+        }
+        if rank_last[nb_to_decrease] == 0 {
+            rank_last[nb_to_decrease] = NO_SYMBOL;
+        } else {
+            rank_last[nb_to_decrease] -= 1;
+            if nodes[rank_last[nb_to_decrease] as usize].nb_bits as u32 != target - nb_to_decrease as u32 {
+                rank_last[nb_to_decrease] = NO_SYMBOL;
+            }
+        }
+    }
+    while total_cost < 0 {
+        if rank_last[1] == NO_SYMBOL {
+            while nodes[n as usize].nb_bits as u32 == target {
+                n -= 1;
+            }
+            nodes[(n + 1) as usize].nb_bits -= 1;
+            rank_last[1] = (n + 1) as u32;
+            total_cost += 1;
+            continue;
+        }
+        nodes[rank_last[1] as usize + 1].nb_bits -= 1;
+        rank_last[1] += 1;
+        total_cost += 1;
+    }
+    target
 }
 
 /// `HUF_CStream_t`: two containers filled from the top. Output goes through

@@ -44,6 +44,8 @@ fn main() {
         if time_c {
             let t = Instant::now();
             let mut enc = zstd::stream::read::Encoder::new(&input[..], level).unwrap();
+            // cramjam pledges the size (size-adjusted tables + content size), compare against that.
+            enc.set_pledged_src_size(Some(input.len() as u64)).unwrap();
             let mut out = Vec::new();
             enc.read_to_end(&mut out).unwrap();
             theirs.push(t.elapsed());

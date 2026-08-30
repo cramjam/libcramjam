@@ -30,7 +30,9 @@ pub fn compress<W: Write + ?Sized, R: Read>(
     output: &mut W,
     level: Option<u32>,
 ) -> Result<usize, Error> {
-    crate::lz4_impl::compress(input, output, level)
+    // `None` = the library default (HC level 4), as the C-backed wrapper did;
+    // only an explicit 0/1 selects the fast parser.
+    crate::lz4_impl::compress(input, output, Some(level.unwrap_or(DEFAULT_COMPRESSION_LEVEL)))
 }
 
 /// Block-format helpers (no frame wrapper).

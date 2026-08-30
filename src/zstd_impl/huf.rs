@@ -475,6 +475,7 @@ fn highest_bit(v: u32) -> u32 {
 /// Returns bit lengths in the same order as `sorted_freqs`.
 /// The resulting code is complete (Kraft sum = 1) and optimal (minimum
 /// weighted path length subject to the length constraint).
+#[cfg(test)]
 pub(crate) fn package_merge_code_lengths(sorted_freqs: &[u32], max_length: usize) -> Vec<u8> {
     let n = sorted_freqs.len();
     debug_assert!(n >= 2);
