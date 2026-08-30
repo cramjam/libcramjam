@@ -734,6 +734,308 @@ unsafe fn decode_sequence_batch(st: &mut FseState, tabs: *const SeqEntry, out: &
     unsafe { decode_sequence_batch_rust(st, tabs, out, n) }
 }
 
+/// Byte tables for the `offset < 8` overlapping match copy (lz4's
+/// `inc32table` / `dec64table`), referenced from the asm loop.
+#[cfg(target_arch = "x86_64")]
+static OVL_INC32: [u8; 8] = [0, 1, 2, 1, 0, 4, 4, 4];
+#[cfg(target_arch = "x86_64")]
+static OVL_DEC64: [i8; 8] = [0, 0, 0, -1, -4, 1, 2, 3];
+
+/// In/out block for [`decode_exec_bmi2`] (everything that doesn't fit in
+/// the 13 nameable registers).
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+struct ExecArgs {
+    cursor_lo: *const u8,
+    lit_end: *const u8,
+    out_base: *mut u8,
+    left: usize,
+    dst: *mut u8,
+    lit: *const u8,
+    status: usize,
+}
+
+/// Fused x86_64 BMI2 sequence loop: decode one sequence, advance the FSE
+/// states, refill, execute the literal + match copies — all in registers,
+/// like `ZSTD_decompressSequences_bmi2`. The split decode/execute batches
+/// were instruction-count parity with C but ~20% slower on small inputs
+/// and L1 streams: phase A is a pure FSE latency chain with nothing to
+/// overlap, whereas a fused loop lets the OOO core hide it behind the
+/// copies of the previous sequence.
+///
+/// Stops (returning normally) before any sequence it can't handle — the
+/// last one (no state advance), fewer than 8 source bytes ahead (slow
+/// refill), or > 31 extra bits; the caller runs that one sequence through
+/// the general path and re-enters. Sets `status = 1` and stops on a
+/// literal / offset validation failure (nothing was written for that
+/// sequence; the bit state is then garbage but the caller reports an error).
+///
+/// Register map: rax = pre-shifted container, ecx = bits consumed, rdx =
+/// source cursor, rsi = tables, rdi = output write cursor, rbx = literal
+/// read cursor, r8/r9/r10 = LL/ML/OF states, r11/r12/r13 = rep offsets,
+/// r14/r15/rbp = scratch. Stack slots (below the saved rbx/rbp): cursor low
+/// bound, lit end, out base, count left, offset/ml/ll spills, cursor spill,
+/// args pointer.
+///
+/// # Safety
+/// Same requirements as `decode_sequences` (tables, literal padding of 32
+/// bytes, `ZSTD_BLOCKSIZE_MAX + 32` bytes of output headroom); BMI2.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+unsafe fn decode_exec_bmi2(st: &mut FseState, tabs: *const SeqEntry, args: &mut ExecArgs) {
+    let (index, consumed0, container0, src) = st.bits.raw_parts();
+    let mut consumed: u32 = consumed0;
+    let mut acc: u64 = container0 << consumed;
+    let mut cursor: *const u8 = unsafe { src.add(index) };
+    args.cursor_lo = unsafe { src.add(8) };
+    args.left = st.left;
+    args.status = 0;
+    let mut ll_state = st.ll_state;
+    let mut ml_state = st.ml_state;
+    let mut of_state = st.of_state;
+    let [mut r0, mut r1, mut r2] = st.rep;
+
+    // read!(): n in r14d -> value in r15d; consumes n bits (clobbers r14).
+    macro_rules! read { () => { concat!(
+        "mov r15, rax\n",
+        "shr r15, 1\n",
+        "add ecx, r14d\n",
+        "shlx rax, rax, r14\n",
+        "xor r14d, 63\n",
+        "shrx r15, r15, r14\n",
+    ) } }
+
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "push rbp",
+            "sub rsp, 64",
+            // slots: [0]=cursor_lo [8]=lit_end [16]=out_base [24]=left
+            //        [32]=off [40]=ml [48]=ll/cursor spill [56]=args
+            "mov [rsp+56], rdi",
+            "mov r14, [rdi]",       "mov [rsp], r14",
+            "mov r14, [rdi+8]",     "mov [rsp+8], r14",
+            "mov r14, [rdi+16]",    "mov [rsp+16], r14",
+            "mov r14, [rdi+24]",    "mov [rsp+24], r14",
+            "mov rbx, [rdi+40]",
+            "mov rdi, [rdi+32]",
+            "2:",
+            "cmp qword ptr [rsp+24], 1",
+            "jbe 9f",
+            "cmp rdx, qword ptr [rsp]",
+            "jb 9f",
+            // total extra bits <= 31, else bail.
+            "movzx r14d, byte ptr [rsi + r10*8 + 0x1002]",
+            "movzx r15d, byte ptr [rsi + r9*8 + 0x2002]",
+            "add r15d, r14d",
+            "add r15b, byte ptr [rsi + r8*8 + 2]",
+            "cmp r15d, 31",
+            "ja 9f",
+            // ---- offset ----
+            "cmp r14d, 1",
+            "jbe 3f",
+            read!(),
+            "add r15d, dword ptr [rsi + r10*8 + 0x1004]",
+            "mov r13d, r12d",
+            "mov r12d, r11d",
+            "mov r11d, r15d",
+            "jmp 5f",
+            "3:",
+            "test r14d, r14d",
+            "jnz 4f",
+            "mov r15d, r11d",
+            "mov r14d, r12d",
+            "cmp dword ptr [rsi + r8*8 + 4], 0",
+            "cmove r15d, r12d",
+            "cmove r14d, r11d",
+            "mov r12d, r14d",
+            "mov r11d, r15d",
+            "jmp 5f",
+            "4:",
+            "mov r15, rax",
+            "shr r15, 63",
+            "add rax, rax",
+            "inc ecx",
+            "xor r14d, r14d",
+            "cmp dword ptr [rsi + r8*8 + 4], 0",
+            "sete r14b",
+            "add r15d, r14d",
+            "jnz 6f",
+            "mov r15d, r12d",
+            "mov r12d, r11d",
+            "mov r11d, r15d",
+            "jmp 5f",
+            "6:",
+            "lea r14d, [r11 - 1]",
+            "cmp r15d, 1",
+            "mov r15d, r13d",
+            "cmovne r15d, r14d",
+            "mov r13d, r12d",
+            "mov r12d, r11d",
+            "mov r11d, r15d",
+            "5:",
+            "mov [rsp+32], r15",
+            // ---- match length ----
+            "movzx r14d, byte ptr [rsi + r9*8 + 0x2002]",
+            read!(),
+            "add r15d, dword ptr [rsi + r9*8 + 0x2004]",
+            "mov [rsp+40], r15",
+            // ---- literal length ----
+            "movzx r14d, byte ptr [rsi + r8*8 + 2]",
+            read!(),
+            "add r15d, dword ptr [rsi + r8*8 + 4]",
+            "mov [rsp+48], r15",
+            // ---- state advance: LL, ML, OF ----
+            "movzx r14d, byte ptr [rsi + r8*8 + 3]",
+            read!(),
+            "movzx r8d, word ptr [rsi + r8*8]",
+            "add r8d, r15d",
+            "movzx r14d, byte ptr [rsi + r9*8 + 0x2003]",
+            read!(),
+            "movzx r9d, word ptr [rsi + r9*8 + 0x2000]",
+            "add r9d, r15d",
+            "movzx r14d, byte ptr [rsi + r10*8 + 0x1003]",
+            read!(),
+            "movzx r10d, word ptr [rsi + r10*8 + 0x1000]",
+            "add r10d, r15d",
+            // ---- refill ----
+            "mov r14d, ecx",
+            "shr r14d, 3",
+            "sub rdx, r14",
+            "and ecx, 7",
+            "shlx rax, qword ptr [rdx], rcx",
+            // ---- execute: validate ----
+            "mov r15, [rsp+48]",            // ll
+            "lea r14, [rbx + r15]",
+            "cmp r14, qword ptr [rsp+8]",   // lit + ll > lit_end -> error
+            "ja 8f",
+            "lea r14, [rdi + r15]",
+            "sub r14, qword ptr [rsp+16]",  // post_lit - out_base
+            "mov rbp, [rsp+32]",
+            "dec rbp",                      // off - 1 (off == 0 wraps)
+            "cmp rbp, r14",
+            "jae 8f",
+            // ---- literal copy (16-byte steps; literals padded by 32) ----
+            "mov r14, rdi",
+            "mov rbp, rbx",
+            "add rdi, r15",
+            "add rbx, r15",
+            "movdqu xmm0, [rbp]",
+            "movdqu [r14], xmm0",
+            "cmp r15, 16",
+            "jbe 20f",
+            "21:",
+            "add rbp, 16",
+            "add r14, 16",
+            "movdqu xmm0, [rbp]",
+            "movdqu [r14], xmm0",
+            "cmp r14, rdi",
+            "jb 21b",
+            "20:",
+            // ---- match copy ----
+            "mov r14, [rsp+32]",            // off
+            "mov r15, [rsp+40]",            // ml
+            "mov rbp, rdi",
+            "sub rbp, r14",                 // src
+            "add r15, rdi",                 // end
+            "cmp r14, 16",
+            "jb 30f",
+            "movdqu xmm0, [rbp]",
+            "movdqu [rdi], xmm0",
+            "add rdi, 16",
+            "cmp rdi, r15",
+            "jae 39f",
+            "add rbp, 16",
+            "31:",
+            "movdqu xmm0, [rbp]",
+            "movdqu [rdi], xmm0",
+            "movdqu xmm1, [rbp + 16]",
+            "movdqu [rdi + 16], xmm1",
+            "add rbp, 32",
+            "add rdi, 32",
+            "cmp rdi, r15",
+            "jb 31b",
+            "jmp 39f",
+            "30:",
+            // offset < 16: first 8 bytes with the inc32/dec64 fix-up, then
+            // 8-byte steps. rdx (cursor) is spilled to free a byte register.
+            "mov [rsp+48], rdx",
+            "cmp r14, 8",
+            "jae 32f",
+            "movzx edx, byte ptr [rbp]",     "mov [rdi], dl",
+            "movzx edx, byte ptr [rbp + 1]", "mov [rdi + 1], dl",
+            "movzx edx, byte ptr [rbp + 2]", "mov [rdi + 2], dl",
+            "movzx edx, byte ptr [rbp + 3]", "mov [rdi + 3], dl",
+            "lea rdx, [rip + {inc32}]",
+            "movzx edx, byte ptr [rdx + r14]",
+            "add rbp, rdx",
+            "mov edx, dword ptr [rbp]",
+            "mov [rdi + 4], edx",
+            "lea rdx, [rip + {dec64}]",
+            "movsx rdx, byte ptr [rdx + r14]",
+            "sub rbp, rdx",
+            "jmp 33f",
+            "32:",
+            "mov rdx, [rbp]",
+            "mov [rdi], rdx",
+            "add rbp, 8",
+            "33:",
+            "add rdi, 8",
+            "cmp rdi, r15",
+            "jae 34f",
+            "35:",
+            "mov rdx, [rbp]",
+            "mov [rdi], rdx",
+            "add rbp, 8",
+            "add rdi, 8",
+            "cmp rdi, r15",
+            "jb 35b",
+            "34:",
+            "mov rdx, [rsp+48]",
+            "39:",
+            "mov rdi, r15",
+            "dec qword ptr [rsp+24]",
+            "jmp 2b",
+            "8:",
+            "mov r14, [rsp+56]",
+            "mov qword ptr [r14+48], 1",
+            "9:",
+            "mov r14, [rsp+56]",
+            "mov [r14+32], rdi",
+            "mov [r14+40], rbx",
+            "mov r15, [rsp+24]",
+            "mov [r14+24], r15",
+            "add rsp, 64",
+            "pop rbp",
+            "pop rbx",
+            inc32 = sym OVL_INC32,
+            dec64 = sym OVL_DEC64,
+            inout("rax") acc,
+            inout("ecx") consumed,
+            inout("rdx") cursor,
+            in("rsi") tabs,
+            inout("rdi") args as *mut ExecArgs => _,
+            inout("r8d") ll_state,
+            inout("r9d") ml_state,
+            inout("r10d") of_state,
+            inout("r11d") r0,
+            inout("r12d") r1,
+            inout("r13d") r2,
+            out("r14") _,
+            out("r15") _,
+            out("xmm0") _,
+            out("xmm1") _,
+        );
+    }
+    let index = unsafe { cursor.offset_from(src) } as usize;
+    st.bits.set_raw_parts(index, consumed, acc >> consumed);
+    st.ll_state = ll_state;
+    st.of_state = of_state;
+    st.ml_state = ml_state;
+    st.rep = [r0, r1, r2];
+    st.left = args.left;
+}
+
 /// The sequence section: decode in batches (fast path + general fallback)
 /// and execute each batch's literal + match copies with only the output /
 /// literal cursors live.
@@ -773,12 +1075,51 @@ unsafe fn decode_sequences(
     let mut lit_pos = 0usize;
     let mut dst = out_off;
     let mut seqs: SeqBatch = [Seq::default(); SEQ_BATCH];
+    #[cfg(target_arch = "x86_64")]
+    let fused = crate::cpu_features::has_bmi2();
+    #[cfg(not(target_arch = "x86_64"))]
+    let fused = false;
 
     while st.left != 0 {
-        let mut n = unsafe { decode_sequence_batch(&mut st, tabs, &mut seqs, SEQ_BATCH) };
-        if n < SEQ_BATCH && st.left != 0 {
-            seqs[n] = unsafe { decode_sequence_general(&mut st, tabs) };
-            n += 1;
+        let mut n;
+        #[cfg(target_arch = "x86_64")]
+        if fused {
+            let mut args = ExecArgs {
+                cursor_lo: core::ptr::null(),
+                lit_end: unsafe { lit_ptr.add(lit_total) },
+                out_base,
+                left: 0,
+                dst: unsafe { out_base.add(dst) },
+                lit: unsafe { lit_ptr.add(lit_pos) },
+                status: 0,
+            };
+            unsafe { decode_exec_bmi2(&mut st, tabs, &mut args) };
+            dst = unsafe { args.dst.offset_from(out_base) } as usize;
+            lit_pos = unsafe { args.lit.offset_from(lit_ptr) } as usize;
+            if args.status != 0 {
+                return Err(seq_validation_error(lit_pos, 0, lit_total, 0, dst));
+            }
+            if st.left == 0 {
+                break;
+            }
+            // One sequence the fast loop declined (last / stream start /
+            // long extras): general decode, executed by the loop below.
+            seqs[0] = unsafe { decode_sequence_general(&mut st, tabs) };
+            n = 1;
+        } else {
+            n = unsafe { decode_sequence_batch(&mut st, tabs, &mut seqs, SEQ_BATCH) };
+            if n < SEQ_BATCH && st.left != 0 {
+                seqs[n] = unsafe { decode_sequence_general(&mut st, tabs) };
+                n += 1;
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            n = unsafe { decode_sequence_batch(&mut st, tabs, &mut seqs, SEQ_BATCH) };
+            if n < SEQ_BATCH && st.left != 0 {
+                seqs[n] = unsafe { decode_sequence_general(&mut st, tabs) };
+                n += 1;
+            }
         }
 
         for &Seq { lit_len, match_len, offset } in seqs.iter().take(n) {
