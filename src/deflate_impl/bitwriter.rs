@@ -61,6 +61,16 @@ impl BitWriter {
         self.buf.extend_from_slice(bytes);
     }
 
+    /// Take the whole bytes emitted so far (bits in the accumulator stay).
+    pub fn take_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buf)
+    }
+
+    /// Whole bytes currently buffered.
+    pub fn buffered_len(&self) -> usize {
+        self.buf.len()
+    }
+
     /// Consume the writer and return the output buffer.
     pub fn finish(mut self) -> Vec<u8> {
         self.align_to_byte();
