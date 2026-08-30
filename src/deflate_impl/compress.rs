@@ -4,9 +4,16 @@
 //! (lazy evaluation) with zlib's `configuration_table`; `longest_match` is
 //! zlib's chain walk with the `prev_length` early-outs. Blocks are flushed
 //! every `LIT_BUFSIZE - 1` symbols (memLevel 8) and emitted by `trees.rs`
-//! (stored / static / dynamic chosen by computed bit lengths). The whole
-//! input is in memory, so there is no sliding window: positions index the
-//! input directly and the hash chain is a 32 KiB ring keyed by position.
+//! (stored / static / dynamic chosen by computed bit lengths).
+//!
+//! The encoder is incremental (`Deflater::feed` / `sync_flush` / `finish`):
+//! input is appended to an owned buffer and parsed as it arrives, keeping
+//! zlib's `MIN_LOOKAHEAD` so a match is never cut short by the end of what
+//! has been received so far; the buffer is slid down in 32 KiB steps once
+//! the parser is past the pending block and the 32 KiB window, so memory is
+//! bounded by the window plus the current block (zlib's `fill_window` /
+//! `slide_hash`). The one-shot [`deflate`] feeds everything at once, which
+//! makes the same decisions as parsing a complete buffer.
 
 use super::bitwriter::BitWriter;
 use super::trees::{Sym, TreeState};
@@ -64,14 +71,19 @@ pub fn deflate(input: &[u8], level: u32) -> Vec<u8> {
     if level == 0 || input.is_empty() {
         return compress_stored_all(input);
     }
-    let mut d = Deflater::new(input, level);
-    if level <= 3 {
-        d.deflate_fast();
-    } else {
-        d.deflate_slow();
-    }
+    let mut d = Deflater::new(level as u32);
+    d.w = BitWriter::with_capacity(input.len() / 2 + 64);
+    d.buf.reserve(input.len());
+    d.feed(input);
+    d.finish();
     d.w.finish()
 }
+
+/// zlib `MIN_LOOKAHEAD`: in run mode the parser stops this far before the
+/// end of the received data so no match is truncated by data not yet seen.
+const MIN_LOOKAHEAD: usize = MAX_MATCH + MIN_MATCH + 1;
+/// Slide the window once this much has been consumed past what must stay.
+const SLIDE_TRIGGER: usize = 2 * MAX_DIST;
 
 // ---------------------------------------------------------------------------
 // Stored-block compression (level 0)
@@ -93,7 +105,7 @@ fn compress_stored_all(input: &[u8]) -> Vec<u8> {
     w.finish()
 }
 
-fn write_stored_block(w: &mut BitWriter, data: &[u8], is_final: bool) {
+pub(crate) fn write_stored_block(w: &mut BitWriter, data: &[u8], is_final: bool) {
     w.write_bits(is_final as u32, 3); // BFINAL + BTYPE 00
     w.align_to_byte();
     let len = data.len() as u16;
@@ -106,10 +118,16 @@ fn write_stored_block(w: &mut BitWriter, data: &[u8], is_final: bool) {
 // LZ77 parser (zlib deflate_fast / deflate_slow)
 // ---------------------------------------------------------------------------
 
-struct Deflater<'a> {
-    input: &'a [u8],
+/// Incremental raw-deflate encoder (see the module docs).
+pub struct Deflater {
+    /// Window + pending input. `strstart`, `block_start`, hash heads and
+    /// match positions index into this buffer; sliding subtracts a
+    /// multiple of `MAX_DIST` from all of them (the `prev` ring is keyed by
+    /// `pos & W_MASK`, which such a shift leaves unchanged).
+    buf: Vec<u8>,
+    level: u32,
     cfg: &'static Config,
-    w: BitWriter,
+    pub(crate) w: BitWriter,
     trees: TreeState,
     /// Hash chain heads (absolute positions) and a ring of *deltas* to the
     /// previous position with the same hash (0 = end of chain). A u16 ring is
@@ -126,14 +144,20 @@ struct Deflater<'a> {
     prev_length: usize,
     prev_match: usize,
     match_available: bool,
+    /// Data was written since the last `sync_flush` (a flush with nothing
+    /// new is a no-op, like zlib returning `Z_BUF_ERROR` for a repeated
+    /// `Z_SYNC_FLUSH`).
+    dirty: bool,
 }
 
-impl<'a> Deflater<'a> {
-    fn new(input: &'a [u8], level: usize) -> Self {
+impl Deflater {
+    pub fn new(level: u32) -> Self {
+        let level = level.min(9) as usize;
         Self {
-            input,
-            cfg: &CONFIGS[level],
-            w: BitWriter::with_capacity(input.len() / 2 + 64),
+            buf: Vec::new(),
+            level: level as u32,
+            cfg: &CONFIGS[level.max(1)],
+            w: BitWriter::with_capacity(1 << 16),
             trees: TreeState::new(),
             head: vec![NIL; HASH_SIZE],
             prev: vec![0; MAX_DIST],
@@ -145,21 +169,124 @@ impl<'a> Deflater<'a> {
             prev_length: MIN_MATCH - 1,
             prev_match: 0,
             match_available: false,
+            dirty: false,
+        }
+    }
+
+    /// Append input and parse as far as the lookahead rule allows.
+    pub fn feed(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        self.dirty = true;
+        self.maybe_slide();
+        self.buf.extend_from_slice(data);
+        if self.level == 0 {
+            self.stored_run(false);
+            return;
+        }
+        self.parse(false);
+    }
+
+    /// zlib `Z_SYNC_FLUSH`: parse everything received, emit the pending
+    /// block, then an empty stored block so the output is byte-aligned and
+    /// a decoder can consume all data written so far. No-op if nothing was
+    /// written since the last flush.
+    pub fn sync_flush(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        self.dirty = false;
+        if self.level == 0 {
+            self.stored_run(true);
+        } else {
+            self.parse(true);
+            if !self.syms.is_empty() || self.block_start != self.strstart {
+                self.flush_block(false);
+            }
+        }
+        write_stored_block(&mut self.w, &[], false);
+    }
+
+    /// zlib `Z_FINISH`: parse everything received and emit the final block.
+    pub fn finish(&mut self) {
+        self.dirty = false;
+        if self.level == 0 {
+            self.stored_run(true);
+            // Level 0 always ends with a (possibly empty) final stored block.
+            write_stored_block(&mut self.w, &[], true);
+            return;
+        }
+        self.parse(true);
+        self.flush_block(true);
+        self.w.align_to_byte();
+    }
+
+    /// Whole output bytes produced so far.
+    pub fn take_output(&mut self) -> Vec<u8> {
+        self.w.take_bytes()
+    }
+
+    pub fn output_len(&self) -> usize {
+        self.w.buffered_len()
+    }
+
+    /// Level 0: emit pending bytes as stored blocks. In run mode only full
+    /// 65535-byte blocks are emitted; `to_end` drains the rest.
+    fn stored_run(&mut self, to_end: bool) {
+        while self.buf.len() - self.strstart >= MAX_STORED_BLOCK
+            || (to_end && self.strstart < self.buf.len())
+        {
+            let n = (self.buf.len() - self.strstart).min(MAX_STORED_BLOCK);
+            write_stored_block(&mut self.w, &self.buf[self.strstart..self.strstart + n], false);
+            self.strstart += n;
+        }
+        self.block_start = self.strstart;
+    }
+
+    fn parse(&mut self, to_end: bool) {
+        if self.level <= 3 {
+            self.deflate_fast(to_end);
+        } else {
+            self.deflate_slow(to_end);
+        }
+    }
+
+    /// Drop everything before the pending block and the 32 KiB window, in
+    /// multiples of `MAX_DIST` so the `prev` ring stays valid. Removed bytes
+    /// are all farther back than `MAX_DIST` from every position the parser
+    /// can still reference, so the output is unchanged.
+    fn maybe_slide(&mut self) {
+        if self.strstart < SLIDE_TRIGGER {
+            return;
+        }
+        let keep_from = self.block_start.min(self.strstart.saturating_sub(MAX_DIST + 1));
+        let slide = keep_from & !W_MASK;
+        if slide == 0 {
+            return;
+        }
+        self.buf.drain(..slide);
+        self.strstart -= slide;
+        self.block_start -= slide;
+        self.match_start = self.match_start.saturating_sub(slide);
+        self.prev_match = self.prev_match.saturating_sub(slide);
+        for h in self.head.iter_mut() {
+            *h = if *h != NIL && *h as usize >= slide { *h - slide as u32 } else { NIL };
         }
     }
 
     #[inline(always)]
     fn lookahead(&self) -> usize {
-        self.input.len() - self.strstart
+        self.buf.len() - self.strstart
     }
 
     /// zlib's rolling hash of the 3 bytes at `pos` (same value as
     /// `UPDATE_HASH` applied byte by byte).
     #[inline(always)]
     fn hash_at(&self, pos: usize) -> u32 {
-        // SAFETY: callers guarantee pos + 3 <= input.len().
+        // SAFETY: callers guarantee pos + 3 <= buf.len().
         unsafe {
-            let p = self.input.as_ptr().add(pos);
+            let p = self.buf.as_ptr().add(pos);
             ((((*p as u32) << HASH_SHIFT) ^ (*p.add(1) as u32)) << HASH_SHIFT ^ (*p.add(2) as u32)) & HASH_MASK
         }
     }
@@ -183,7 +310,7 @@ impl<'a> Deflater<'a> {
     /// zlib `longest_match`. Uses `prev_length` as the length to beat.
     #[inline(never)]
     fn longest_match(&mut self, mut cur_match: usize) -> usize {
-        let input = self.input;
+        let input: &[u8] = &self.buf;
         let strstart = self.strstart;
         let lookahead = input.len() - strstart;
         let mut chain_length = self.cfg.max_chain;
@@ -201,6 +328,7 @@ impl<'a> Deflater<'a> {
         }
         let limit = strstart.saturating_sub(MAX_DIST);
         let base = input.as_ptr();
+        let prev_ptr = self.prev.as_ptr();
         // SAFETY: every index below is < input.len(): cur_match < strstart,
         // and compares stay below strstart + max_len <= input.len().
         unsafe {
@@ -243,7 +371,7 @@ impl<'a> Deflater<'a> {
                         scan_end = *scan.add(best_len);
                     }
                 }
-                let delta = *self.prev.get_unchecked(cur_match & W_MASK) as usize;
+                let delta = *prev_ptr.add(cur_match & W_MASK) as usize;
                 if delta == 0 || cur_match < limit + delta {
                     break;
                 }
@@ -274,17 +402,22 @@ impl<'a> Deflater<'a> {
     }
 
     fn flush_block(&mut self, last: bool) {
-        let stored = &self.input[self.block_start..self.strstart];
+        let stored = &self.buf[self.block_start..self.strstart];
         self.trees.flush_block(&mut self.w, &self.syms, stored, last);
         self.syms.clear();
         self.block_start = self.strstart;
     }
 
     /// zlib `deflate_fast` (levels 1-3): greedy matching, short chains.
-    fn deflate_fast(&mut self) {
+    /// In run mode (`to_end == false`) stops while `MIN_LOOKAHEAD` bytes
+    /// remain unparsed.
+    fn deflate_fast(&mut self, to_end: bool) {
         let max_insert = self.cfg.max_lazy;
-        while self.strstart < self.input.len() {
+        while self.strstart < self.buf.len() {
             let lookahead = self.lookahead();
+            if !to_end && lookahead < MIN_LOOKAHEAD {
+                return;
+            }
             let mut hash_head = NIL;
             if lookahead >= MIN_MATCH {
                 hash_head = self.insert_string(self.strstart);
@@ -310,22 +443,26 @@ impl<'a> Deflater<'a> {
                 }
                 self.match_length = 0;
             } else {
-                bflush = self.tally_lit(self.input[self.strstart]);
+                bflush = self.tally_lit(self.buf[self.strstart]);
                 self.strstart += 1;
             }
             if bflush {
                 self.flush_block(false);
             }
         }
-        self.flush_block(true);
     }
 
-    /// zlib `deflate_slow` (levels 4-9): lazy evaluation.
-    fn deflate_slow(&mut self) {
+    /// zlib `deflate_slow` (levels 4-9): lazy evaluation. In run mode stops
+    /// while `MIN_LOOKAHEAD` bytes remain unparsed; the pending lazy
+    /// literal (`match_available`) is only emitted when `to_end`.
+    fn deflate_slow(&mut self, to_end: bool) {
         let max_lazy = self.cfg.max_lazy;
-        let n = self.input.len();
+        let n = self.buf.len();
         while self.strstart < n {
             let lookahead = n - self.strstart;
+            if !to_end && lookahead < MIN_LOOKAHEAD {
+                return;
+            }
             let mut hash_head = NIL;
             if lookahead >= MIN_MATCH {
                 hash_head = self.insert_string(self.strstart);
@@ -365,7 +502,7 @@ impl<'a> Deflater<'a> {
                     self.flush_block(false);
                 }
             } else if self.match_available {
-                let bflush = self.tally_lit(self.input[self.strstart - 1]);
+                let bflush = self.tally_lit(self.buf[self.strstart - 1]);
                 if bflush {
                     self.flush_block_only();
                 }
@@ -375,11 +512,10 @@ impl<'a> Deflater<'a> {
                 self.strstart += 1;
             }
         }
-        if self.match_available {
-            self.tally_lit(self.input[self.strstart - 1]);
+        if to_end && self.match_available {
+            self.tally_lit(self.buf[self.strstart - 1]);
             self.match_available = false;
         }
-        self.flush_block(true);
     }
 
     /// zlib `FLUSH_BLOCK_ONLY` inside the lazy literal path: the block ends
