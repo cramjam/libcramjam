@@ -158,7 +158,10 @@ pub fn decode_frame_streaming(
         output.clear();
         output.reserve(keep + chunk + ZSTD_BLOCKSIZE_MAX + 32);
     } else if let Some(cs) = header.content_size {
-        output.reserve(cs as usize);
+        // Only a hint: cap the up-front reservation so a corrupt frame that
+        // declares a huge content size (up to 2^64) can't request a giant
+        // allocation. `output` still grows per block as real data arrives.
+        output.reserve((cs as usize).min(64 << 20));
     }
     let mut hasher = if header.content_checksum && streaming { Some(Xxh64::new()) } else { None };
     let mut flushed_total: usize = 0;
@@ -186,6 +189,17 @@ pub fn decode_frame_streaming(
         let last_block = (block_header & 1) != 0;
         let block_type = (block_header >> 1) & 3;
         let block_size = (block_header >> 3) as usize;
+
+        // A block's content is at most ZSTD_BLOCKSIZE_MAX (and <= window).
+        // Rejecting an oversized value bounds the RLE resize / raw copy so a
+        // tiny input can't declare huge blocks (a decompression bomb: an RLE
+        // block produces `block_size` output for ~4 input bytes).
+        if block_size > ZSTD_BLOCKSIZE_MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "zstd: block size exceeds maximum",
+            ));
+        }
 
         match block_type {
             0 => {
@@ -1189,6 +1203,12 @@ fn decode_literals_section_into(
         1 => {
             // RLE literals.
             let regen_size = decode_lit_size_raw(byte0, size_format, r)?;
+            // Literals regenerated size is bounded by the block size; an RLE
+            // section produces `regen_size` bytes from ~2 input bytes, so an
+            // unbounded value is a decompression bomb.
+            if regen_size > ZSTD_BLOCKSIZE_MAX {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "zstd: literals size exceeds block maximum"));
+            }
             let byte = r.read_u8()?;
             buf.clear();
             buf.resize(regen_size + 32, byte);
@@ -1198,6 +1218,9 @@ fn decode_literals_section_into(
             // Compressed or Treeless literals.
             let (regen_size, compressed_size, four_streams) =
                 decode_lit_size_compressed(byte0, size_format, r)?;
+            if regen_size > ZSTD_BLOCKSIZE_MAX {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "zstd: literals size exceeds block maximum"));
+            }
 
             let lit_data = r.read_bytes(compressed_size)?;
             let mut pos = 0;

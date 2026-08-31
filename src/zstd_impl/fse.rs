@@ -90,7 +90,9 @@ impl FseTable {
     /// Decode FSE table description following the exact algorithm from
     /// the zstd reference (FSE_readNCount).
     pub fn decode_table(reader: &mut ForwardByteReader, max_symbol: u32, max_accuracy_log: u32) -> io::Result<Self> {
-        let data = &reader.data[reader.pos..];
+        let data = reader.data.get(reader.pos..).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "zstd: FSE table reader past end of data")
+        })?;
         if data.len() < 4 {
             // Need at least 4 bytes for the LE u32 load.
             if data.is_empty() {
