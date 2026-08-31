@@ -334,7 +334,9 @@ impl HufTable {
 fn decode_weights_fse(data: &[u8]) -> io::Result<Vec<u8>> {
     let mut reader = super::bits::ForwardByteReader::new(data);
     let fse_table = fse::FseTable::decode_table(&mut reader, 255, 6)?;
-    let remaining = &data[reader.position()..];
+    let remaining = data.get(reader.position()..).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "zstd: Huffman weight FSE table overran input")
+    })?;
 
     let mut bits = ReverseBitReader::new(remaining)?;
     bits.skip_padding_bits()?;

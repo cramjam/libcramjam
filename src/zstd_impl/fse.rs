@@ -72,6 +72,16 @@ impl FseTable {
         for i in 0..table_size {
             let sym = table[i].symbol as usize;
             let s = symbol_next[sym];
+            // A symbol occupying a table slot must have had a normalized
+            // count >= 1 (or the -1 "less than one" case, mapped to 1). A
+            // 0 here means the count distribution was corrupt (it would
+            // underflow `highest_bit`); reject rather than build a bad table.
+            if s == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "zstd: FSE symbol with zero count in table slot",
+                ));
+            }
             let nb = (accuracy_log - highest_bit(s as u32)) as u8;
             table[i].num_bits = nb;
             table[i].baseline = ((s as u32) << nb) as u16 - table_size as u16;

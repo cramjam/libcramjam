@@ -222,6 +222,15 @@ pub struct Mf {
     son: Vec<u32>,
     cyclic_pos: u32,
     cyclic_size: u32,
+    /// Position floor for the match finder: candidates whose stored position
+    /// is below this are treated as absent. Bumped to the current position by
+    /// `set_finder_floor` on a streaming sync flush so no match-finder state
+    /// (a bt4 tree entry from before the flush) can produce a match into the
+    /// previous chunk — a stale such match silently corrupted the next chunk
+    /// at presets 4-9. 0 (the init value) is inert: a stored position is
+    /// always >= the initial `offset` (= cyclic_size) > 0, so the check costs
+    /// only a predictable, never-taken branch until the first flush.
+    min_valid_pos: u32,
     hash_mask: u32,
     depth: u32,
     nice_len: u32,
@@ -286,6 +295,7 @@ impl Mf {
             // C leaves `son` uninitialized; zero is the empty marker anyway.
             son: vec![EMPTY_HASH_VALUE; sons_count],
             cyclic_pos: 0,
+            min_valid_pos: 0,
             cyclic_size,
             hash_mask,
             depth,
@@ -319,6 +329,13 @@ impl Mf {
     #[inline(always)]
     pub fn read_ahead(&self) -> u32 {
         self.read_ahead
+    }
+
+    /// Make every position stored so far invisible to the match finder from
+    /// now on (see `min_valid_pos`). O(1); keeps the sliding-buffer bytes so
+    /// later chunks still decode, only the *finder* forgets pre-flush history.
+    fn set_finder_floor(&mut self) {
+        self.min_valid_pos = self.read_pos + self.offset;
     }
 
     /// liblzma `move_window`: drop history so that `keep_size_before` bytes
@@ -377,6 +394,7 @@ impl Mf {
             *s = if *s <= subvalue { EMPTY_HASH_VALUE } else { *s - subvalue };
         }
         self.offset -= subvalue;
+        self.min_valid_pos = self.min_valid_pos.saturating_sub(subvalue);
     }
 
     #[inline(always)]
@@ -496,6 +514,7 @@ impl Mf {
         let cyclic_pos = self.cyclic_pos;
         let cyclic_size = self.cyclic_size;
         let mut depth = self.depth;
+        let min_valid = self.min_valid_pos;
         // SAFETY: son indices are reduced modulo cyclic_size (son.len() ==
         // cyclic_size for hash chains); `delta < cyclic_size <= pos` keeps
         // `pb` inside the buffer, and `len_best < len_limit <= avail` keeps
@@ -506,7 +525,7 @@ impl Mf {
             *son.add(cyclic_pos as usize) = cur_match;
             loop {
                 let delta = pos.wrapping_sub(cur_match);
-                if depth == 0 || delta >= cyclic_size {
+                if depth == 0 || delta >= cyclic_size || cur_match < min_valid {
                     return count;
                 }
                 depth -= 1;
@@ -660,6 +679,7 @@ impl Mf {
         let cyclic_pos = self.cyclic_pos;
         let cyclic_size = self.cyclic_size;
         let mut depth = self.depth;
+        let min_valid = self.min_valid_pos;
         // SAFETY: as in `hc_find_func`; son.len() == 2 * cyclic_size here and
         // every index is `2 * (x mod cyclic_size) + {0, 1}`. `len < len_limit`
         // whenever `b[.. + len]` is read (a full-length match returns).
@@ -672,7 +692,7 @@ impl Mf {
         unsafe {
             loop {
                 let delta = pos.wrapping_sub(cur_match);
-                if depth == 0 || delta >= cyclic_size {
+                if depth == 0 || delta >= cyclic_size || cur_match < min_valid {
                     *son.add(ptr0) = EMPTY_HASH_VALUE;
                     *son.add(ptr1) = EMPTY_HASH_VALUE;
                     return count;
@@ -713,6 +733,7 @@ impl Mf {
         let cyclic_pos = self.cyclic_pos;
         let cyclic_size = self.cyclic_size;
         let mut depth = self.depth;
+        let min_valid = self.min_valid_pos;
         // SAFETY: see `bt_find_func`.
         let son = self.son.as_mut_ptr();
         let b = self.buf().as_ptr();
@@ -723,7 +744,7 @@ impl Mf {
         unsafe {
             loop {
                 let delta = pos.wrapping_sub(cur_match);
-                if depth == 0 || delta >= cyclic_size {
+                if depth == 0 || delta >= cyclic_size || cur_match < min_valid {
                     *son.add(ptr0) = EMPTY_HASH_VALUE;
                     *son.add(ptr1) = EMPTY_HASH_VALUE;
                     return;
@@ -2401,6 +2422,15 @@ impl Lzma2StreamEncoder {
         self.read_limit = self.mf.write_pos;
         self.mf.rehash_pending(self.read_limit);
         self.encode(action);
+        if action == Action::Flush {
+            // Forget all match-finder history before this flush boundary
+            // (O(1); see `Mf::set_finder_floor`) so a stale bt4 tree entry
+            // can't produce a false cross-chunk match that corrupts the next
+            // chunk. The reps no longer correspond to visible history, so also
+            // force an LZMA state reset (0xA0 control) on the next chunk.
+            self.mf.set_finder_floor();
+            self.need_state_reset = true;
+        }
     }
 
     /// `lzma2_encode`.

@@ -228,3 +228,41 @@ fn invalid_preset_errors_on_use() {
     let mut enc = XzStreamCompressor::new(Vec::new(), 42);
     assert!(enc.write_all(b"abc").is_err());
 }
+
+/// Regression (fuzzer-found): at presets 4-9 (bt4 + optimum parser) a sync
+/// flush landing at certain data positions used to leave stale match-finder
+/// tree state that produced a false cross-chunk match in the next chunk,
+/// silently corrupting the stream (both our decoder and liblzma rejected the
+/// output). Fixed by resetting the match finder at each sync flush. The
+/// fixture + op pattern is the minimized fuzzer case (first bad byte 4500).
+#[test]
+fn streaming_flush_bt4_no_false_match() {
+    let fed = include_bytes!("fixtures/xz_stream_flush_bt4.bin");
+    let ops: &[(usize, bool)] = &[
+        (353, true), (353, true), (353, true), (353, true), (353, true),
+        (353, true), (353, true), (353, true), (32, false), (58, true),
+        (353, true), (353, true), (353, true), (32, false), (1838, true),
+    ];
+    for preset in [1u32, 3, 4, 6, 8, 9] {
+        let mut enc = XzStreamCompressor::new(Vec::new(), preset);
+        let mut pos = 0usize;
+        for &(n, flush) in ops {
+            let e = (pos + n).min(fed.len());
+            enc.write_all(&fed[pos..e]).unwrap();
+            pos = e;
+            if flush {
+                enc.flush().unwrap();
+            }
+        }
+        if pos < fed.len() {
+            enc.write_all(&fed[pos..]).unwrap();
+        }
+        let out = enc.finish().unwrap();
+        let mut dec = Vec::new();
+        xz2::read::XzDecoder::new(&out[..])
+            .read_to_end(&mut dec)
+            .unwrap_or_else(|e| panic!("preset {preset}: liblzma rejected our stream: {e}"));
+        assert_eq!(dec.len(), fed.len(), "preset {preset} length");
+        assert!(dec == fed, "preset {preset}: streaming xz output corrupted");
+    }
+}
