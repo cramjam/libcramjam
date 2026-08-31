@@ -304,11 +304,18 @@ fn decode_one_frame(
                 break;
             }
             if sym <= 1 {
-                // RUNA / RUNB — accumulate into the run length.
-                if sym == 0 {
-                    zero_run += run_weight;
-                } else {
-                    zero_run += 2 * run_weight;
+                // RUNA / RUNB — accumulate into the run length. A zero run
+                // can never exceed the block size; bound it here so a
+                // crafted run (RUNA/RUNB repeated) can't overflow the u32
+                // accumulators or drive `tt.resize` to allocate gigabytes
+                // (decompression bomb). Also stops `run_weight <<= 1` from
+                // overflowing (it would after 32 doublings).
+                zero_run += if sym == 0 { run_weight } else { 2 * run_weight };
+                if zero_run as usize + tt.len() > max_block_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "bzip2: decoded block exceeds block size",
+                    ));
                 }
                 run_weight <<= 1;
                 continue;
@@ -329,6 +336,14 @@ fn decode_one_frame(
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "bzip2: MTF index out of range",
+                ));
+            }
+            // A real symbol appends one byte; refuse to grow past the block
+            // size (a corrupt stream could emit more symbols than fit).
+            if tt.len() >= max_block_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bzip2: decoded block exceeds block size",
                 ));
             }
             // Move-to-front: shift mtf_list[0..mtf_index] right by one slot

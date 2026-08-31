@@ -177,10 +177,10 @@ impl BlockEncoder {
         let input_end = unsafe { base.add(avail_end) };
 
         // ZSTD_buildSeqStore: tiny blocks are not worth compressing.
+        let saved_rep = self.rep;
         let compressed = if len < 2 + 3 + 1 + 1 {
             None
         } else {
-            let saved_rep = self.rep;
             // limited update after a very long match (row finder)
             if self.is_row {
                 let curr = pos as u32;
@@ -232,6 +232,7 @@ impl BlockEncoder {
         match compressed {
             Some(c_size) => {
                 if !self.first_block && c_size < 25 && is_rle(block) {
+                    self.rep = saved_rep;
                     write_block_header(out, len, BlockType::Rle, last);
                     out.push(block[0]);
                 } else {

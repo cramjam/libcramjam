@@ -532,6 +532,17 @@ impl LzmaDecoder {
         // (distance validated against `pos - dict_start`).
         unsafe {
             while pos < end {
+                // Once the range decoder has read past the real compressed
+                // data there is no more input to make progress with — a
+                // valid stream exits via the end-of-stream marker before
+                // this ever trips. Without the check a corrupt stream that
+                // declares a huge uncompressed size (e.g. a 13-byte `.lzma`
+                // header claiming 2^62 bytes with no payload) would spin
+                // producing garbage from saturated-zero reads for seconds
+                // (a decompression-time DoS on tiny input).
+                if rc.overrun {
+                    fail!("lzma: range decoder ran out of input before end of stream");
+                }
                 if pos + OUT_HEADROOM > cap {
                     output.set_len(pos);
                     output.reserve((end - pos).min(1 << 22) + OUT_HEADROOM);

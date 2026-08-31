@@ -335,7 +335,12 @@ fn decode_compressed_block(
     let of_t = of_table.as_ref().unwrap();
     let ml_t = ml_table.as_ref().unwrap();
 
-    let bitstream = &seq_data[sr.position()..];
+    let bitstream = seq_data.get(sr.position()..).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "zstd: sequence FSE tables ran past the block data",
+        )
+    })?;
     // Gather the three tables into one buffer (LL at 0, OF at 512, ML at
     // 1024 — each is at most 1 << 9 entries) so the hot loop indexes off a
     // single base pointer. ~12 KB memcpy per block; negligible.

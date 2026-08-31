@@ -203,3 +203,43 @@ fn stream_output_decodes_with_our_decoder_at_every_flush_point() {
     let out = comp.finish().unwrap().into_inner();
     assert_eq!(ours_decode(&out), [a, b].concat());
 }
+
+/// Regression: a streaming flush that emits a pure-run block as an RLE block
+/// used to leave the encoder's repeat-offset state updated (as if the block
+/// had been compressed), desyncing it from the decoder — which sees an RLE
+/// block and keeps its old repeat offsets. The next block's rep-coded
+/// sequences then decoded against the wrong offsets, silently corrupting a
+/// few bytes. Fixed by restoring rep on the RLE path (C's
+/// ZSTD_confirmRepcodesAndEntropyTables only commits repcodes for compressed
+/// blocks). The fixture + op pattern is a fuzzer-found case (firstdiff 7048).
+#[test]
+fn streaming_rle_block_preserves_repeat_offsets() {
+    use std::io::Write;
+    let fed = include_bytes!("fixtures/zstd_stream_rle_rep.bin");
+    // Op pattern: three unflushed-ish writes then many 353-byte flushed writes.
+    let ops: &[(usize, bool)] = &[
+        (121, false), (32, false), (2570, false),
+        (353, true), (353, true), (353, true), (353, true), (353, true),
+        (353, true), (353, true), (353, true), (353, true), (353, true),
+        (353, true), (353, true), (353, true), (359, true),
+    ];
+    for level in [1, 3, 4, 5, 6, 7, 8, 9] {
+        let mut enc = libcramjam::zstd::ZstdStreamCompressor::new(Vec::new(), level).unwrap();
+        let mut pos = 0usize;
+        for &(n, flush) in ops {
+            let e = (pos + n).min(fed.len());
+            enc.write_all(&fed[pos..e]).unwrap();
+            pos = e;
+            if flush {
+                enc.flush().unwrap();
+            }
+        }
+        if pos < fed.len() {
+            enc.write_all(&fed[pos..]).unwrap();
+        }
+        let out = enc.finish().unwrap();
+        let dec = zstd::stream::decode_all(&out[..]).unwrap();
+        assert_eq!(dec.len(), fed.len(), "level {level} length");
+        assert!(dec == fed, "level {level}: streaming output corrupted (rep desync)");
+    }
+}
