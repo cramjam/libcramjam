@@ -315,9 +315,13 @@ fn decode_compressed_block(
 
     // Reserve the worst-case output for this block upfront so neither the
     // literal copies nor the per-sequence match wildcopy need to re-check
-    // capacity. The `+ 32` is dead-zone padding for the SIMD wildcopy
-    // overshoot in `cpu_features::copy_match_unchecked`.
-    output.reserve(ZSTD_BLOCKSIZE_MAX + 32);
+    // capacity. A valid block regenerates <= ZSTD_BLOCKSIZE_MAX; the extra
+    // `2 * ZSTD_BLOCKSIZE_MAX` is slack so the fused loop's last sequence
+    // before it bails on the block-output limit (a malformed block can push
+    // `dst` up to one ll+ml past the limit) still writes inside the buffer,
+    // after which the decoder errors out. The `+ 32` is dead-zone padding for
+    // the SIMD wildcopy overshoot in `cpu_features::copy_match_unchecked`.
+    output.reserve(3 * ZSTD_BLOCKSIZE_MAX + 32);
 
     // --- Sequences Section ---
     let seq_data = &data[r.position()..];
@@ -772,6 +776,12 @@ struct ExecArgs {
     dst: *mut u8,
     lit: *const u8,
     status: usize,
+    /// One past the last output byte this block may produce
+    /// (`out_base + out_off + ZSTD_BLOCKSIZE_MAX`). The fused loop bails to
+    /// the scalar path once `dst` reaches it so a malformed block whose
+    /// sequences regenerate more than a block's worth can't overrun the
+    /// output buffer (offset 56 in the struct; read by the asm prologue).
+    out_limit: *const u8,
 }
 
 /// Fused x86_64 BMI2 sequence loop: decode one sequence, advance the FSE
@@ -828,10 +838,12 @@ unsafe fn decode_exec_bmi2(st: &mut FseState, tabs: *const SeqEntry, args: &mut 
         core::arch::asm!(
             "push rbx",
             "push rbp",
-            "sub rsp, 64",
+            "sub rsp, 80",
             // slots: [0]=cursor_lo [8]=lit_end [16]=out_base [24]=left
             //        [32]=off [40]=ml [48]=ll/cursor spill [56]=args
+            //        [64]=out_limit
             "mov [rsp+56], rdi",
+            "mov r14, [rdi+56]",    "mov [rsp+64], r14",
             "mov r14, [rdi]",       "mov [rsp], r14",
             "mov r14, [rdi+8]",     "mov [rsp+8], r14",
             "mov r14, [rdi+16]",    "mov [rsp+16], r14",
@@ -843,6 +855,8 @@ unsafe fn decode_exec_bmi2(st: &mut FseState, tabs: *const SeqEntry, args: &mut 
             "jbe 9f",
             "cmp rdx, qword ptr [rsp]",
             "jb 9f",
+            "cmp rdi, [rsp+64]",            // dst reached block output limit -> bail
+            "jae 9f",
             // total extra bits <= 31, else bail.
             "movzx r14d, byte ptr [rsi + r10*8 + 0x1002]",
             "movzx r15d, byte ptr [rsi + r9*8 + 0x2002]",
@@ -1024,7 +1038,7 @@ unsafe fn decode_exec_bmi2(st: &mut FseState, tabs: *const SeqEntry, args: &mut 
             "mov [r14+40], rbx",
             "mov r15, [rsp+24]",
             "mov [r14+24], r15",
-            "add rsp, 64",
+            "add rsp, 80",
             "pop rbp",
             "pop rbx",
             inc32 = sym OVL_INC32,
@@ -1111,6 +1125,7 @@ unsafe fn decode_sequences(
                 dst: unsafe { out_base.add(dst) },
                 lit: unsafe { lit_ptr.add(lit_pos) },
                 status: 0,
+                out_limit: unsafe { out_base.add(out_off + ZSTD_BLOCKSIZE_MAX) },
             };
             unsafe { decode_exec_bmi2(&mut st, tabs, &mut args) };
             dst = unsafe { args.dst.offset_from(out_base) } as usize;
@@ -1147,7 +1162,14 @@ unsafe fn decode_sequences(
             let off = offset as usize;
             let bad_lit = (lit_pos + lit_len > lit_total) as u32;
             let bad_off = (off.wrapping_sub(1) >= post_lit) as u32; // off == 0 || off > post_lit
-            if (bad_lit | bad_off) != 0 {
+            // A block regenerates at most ZSTD_BLOCKSIZE_MAX; reject a
+            // malformed block whose sequences would write past that (and past
+            // the reserved output buffer). `out_off` is the block start.
+            let bad_dst = (post_lit + match_len as usize > out_off + ZSTD_BLOCKSIZE_MAX) as u32;
+            if (bad_lit | bad_off | bad_dst) != 0 {
+                if bad_dst != 0 && (bad_lit | bad_off) == 0 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "zstd: block regenerated size exceeds maximum"));
+                }
                 return Err(seq_validation_error(lit_pos, lit_len, lit_total, offset, post_lit));
             }
             unsafe {
