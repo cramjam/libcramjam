@@ -265,9 +265,17 @@ impl TreeState {
             self.bl_count[bits] += 1;
             let xbits = if n >= desc.extra_base { desc.extra_bits[n - desc.extra_base] as u64 } else { 0 };
             let f = tree[n].fc as u64;
-            self.opt_len += f * (bits as u64 + xbits);
+            // zlib accumulates `opt_len`/`static_len` in a `ulg` and the
+            // overflow-repair below can transiently drive it "negative"
+            // (a shortened code subtracts more than was added) before it
+            // nets back positive — modular arithmetic by design. Use
+            // wrapping ops so a debug-assertions build doesn't panic on a
+            // degenerate/adversarial tree (release wraps and still emits a
+            // valid — if not size-optimal — block; the corpus tests pin
+            // byte-identical output for real inputs).
+            self.opt_len = self.opt_len.wrapping_add(f.wrapping_mul(bits as u64 + xbits));
             if let Some(stree) = desc.stree {
-                self.static_len += f * (stree[n].dl as u64 + xbits);
+                self.static_len = self.static_len.wrapping_add(f.wrapping_mul(stree[n].dl as u64 + xbits));
             }
         }
         if overflow == 0 {
@@ -275,8 +283,13 @@ impl TreeState {
         }
         loop {
             let mut bits = max_length - 1;
-            while self.bl_count[bits] == 0 {
+            while bits > 0 && self.bl_count[bits] == 0 {
                 bits -= 1;
+            }
+            if bits == 0 {
+                // No shorter code to lengthen — degenerate tree; stop
+                // repairing (matches zlib terminating; avoids usize underflow).
+                break;
             }
             self.bl_count[bits] -= 1;
             self.bl_count[bits + 1] += 2;

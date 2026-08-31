@@ -49,6 +49,11 @@ pub struct RangeDecoder<'a> {
     pub code: u32,
     pub input: &'a [u8],
     pub pos: usize,
+    /// One past the last valid compressed byte. Defaults to `input.len()`;
+    /// LZMA2 sets it to the chunk's `compressed_size` so a corrupt chunk
+    /// cannot make the range decoder consume the following chunk's bytes
+    /// (or read past the allocation). See `Rc::normalize`.
+    pub end: usize,
 }
 
 impl<'a> RangeDecoder<'a> {
@@ -76,6 +81,7 @@ impl<'a> RangeDecoder<'a> {
             code,
             input,
             pos: 5,
+            end: input.len(),
         })
     }
 

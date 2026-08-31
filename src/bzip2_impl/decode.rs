@@ -676,6 +676,23 @@ impl HufTable {
             count[l as usize] += 1;
         }
 
+        // Reject over-subscribed code lengths: the canonical codes for an
+        // over-full table overflow their bit width and would index past the
+        // peek table. (libbzip2 tolerates *incomplete* tables via the slow
+        // bit-walk, so we only reject the over-full case.)
+        {
+            let mut kraft: u64 = 0;
+            for k in min_len..=max_len {
+                kraft += (count[k as usize] as u64) << (max_len - k);
+            }
+            if kraft > (1u64 << max_len) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bzip2: over-subscribed Huffman code",
+                ));
+            }
+        }
+
         // Build perm[] in canonical order (sorted by length asc, symbol asc).
         let mut perm: Vec<u16> = Vec::with_capacity(lens.len());
         for length in min_len..=max_len {
@@ -717,6 +734,12 @@ impl HufTable {
                     let span = 1usize << pad;
                     for _ in 0..n {
                         let start = (code as usize) << pad;
+                        if start + span > PEEK_TABLE_SIZE {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "bzip2: Huffman code exceeds peek table",
+                            ));
+                        }
                         let sym = perm[perm_idx];
                         for slot in start..start + span {
                             peek_sym[slot] = sym;

@@ -35,14 +35,6 @@ use std::io;
 use super::lzma::{LzmaDecoder, LZMA_LCLP_MAX, LZMA_PB_MAX};
 use super::range_coder::RangeDecoder;
 
-/// Padding bytes appended to each LZMA chunk before handing it to the
-/// `RangeDecoder`.  The fast-path range decoder uses unchecked reads
-/// (`get_unchecked(pos)`) and may over-read by a few bytes when an
-/// over-eager refill happens at the very end of a chunk.  Padding the
-/// chunk with zero bytes makes those over-reads benign — the range
-/// coder reads zero bits which match the LZMA stream's natural
-/// terminator behaviour.
-const RC_PADDING: usize = 16;
 
 /// Decode an LZMA2 stream from `input` into `output`.  `dict_size` is taken
 /// from the surrounding xz block header (one byte: see `lzma2_props_decode`
@@ -61,9 +53,6 @@ pub fn decode_lzma2(input: &[u8], dict_size: u32, output: &mut Vec<u8>) -> io::R
     let mut need_dict_reset = true;
     let mut need_props = true;
     let mut dict_start = output.len();
-    // Reusable padded scratch buffer for chunks that sit at the very end
-    // of `input` (see below).  Avoids one allocation per chunk.
-    let mut chunk_scratch: Vec<u8> = Vec::new();
 
     let mut pos = 0usize;
     while pos < input.len() {
@@ -184,25 +173,14 @@ pub fn decode_lzma2(input: &[u8], dict_size: u32, output: &mut Vec<u8>) -> io::R
                 "lzma2: LZMA payload exceeds remaining input",
             ));
         }
-        // The range decoder's hot path refills with unchecked reads and
-        // may over-read a few bytes past the chunk on corrupt input. When
-        // the chunk is followed by at least RC_PADDING more input bytes
-        // (the usual case: next chunk / index / footer) that over-read
-        // stays inside `input`, so decode straight from it. Only a chunk
-        // at the very tail of `input` is copied into a zero-padded
-        // scratch buffer.
+        // Decode straight from `input`; `RangeDecoder::end` bounds the range
+        // decoder to exactly this chunk's compressed bytes, so a corrupt
+        // chunk can neither read past the input allocation nor bleed into
+        // the following chunk (`Rc::normalize` saturates + flags overrun).
         let chunk_len = compressed_size as usize;
         let chunk_start = pos;
         pos += chunk_len;
-        let rc_input: &[u8] = if pos + RC_PADDING <= input.len() {
-            &input[chunk_start..]
-        } else {
-            chunk_scratch.clear();
-            chunk_scratch.reserve(chunk_len + RC_PADDING);
-            chunk_scratch.extend_from_slice(&input[chunk_start..pos]);
-            chunk_scratch.resize(chunk_len + RC_PADDING, 0);
-            &chunk_scratch
-        };
+        let rc_input: &[u8] = &input[chunk_start..pos];
 
         let d = decoder.as_mut().expect("decoder must exist on LZMA chunk");
         d.dict_start = dict_start;

@@ -141,6 +141,12 @@ struct Rc {
     range: u32,
     code: u32,
     pos: usize,
+    /// One past the last valid compressed byte (chunk length). Reads at or
+    /// beyond this saturate to 0 and set `overrun` instead of touching
+    /// memory — a corrupt stream (e.g. tiny compressed_size but huge
+    /// uncompressed_size) must never read past the input allocation.
+    end: usize,
+    overrun: bool,
 }
 
 const RC_TOP: u32 = 1 << 24;
@@ -185,7 +191,13 @@ impl Rc {
     unsafe fn normalize(&mut self, inp: *const u8) {
         if self.range < RC_TOP {
             self.range <<= 8;
-            self.code = (self.code << 8) | unsafe { *inp.add(self.pos) } as u32;
+            let byte = if self.pos < self.end {
+                unsafe { *inp.add(self.pos) }
+            } else {
+                self.overrun = true;
+                0
+            };
+            self.code = (self.code << 8) | byte as u32;
             self.pos += 1;
         }
     }
@@ -493,7 +505,7 @@ impl LzmaDecoder {
         debug_assert!(dict_start <= start);
         let dict_size = self.dict_size;
         let inp = rd.input.as_ptr();
-        let mut rc = Rc { range: rd.range, code: rd.code, pos: rd.pos };
+        let mut rc = Rc { range: rd.range, code: rd.code, pos: rd.pos, end: rd.end, overrun: false };
         let lc = self.lc;
         let lp_mask = self.lp_mask as usize;
         let pb_mask = self.pb_mask as usize;
@@ -646,6 +658,12 @@ impl LzmaDecoder {
             output.set_len(pos);
         }
 
+        if rc.overrun {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "lzma: range decoder read past end of compressed data",
+            ));
+        }
         rd.range = rc.range;
         rd.code = rc.code;
         rd.pos = rc.pos;
