@@ -45,6 +45,8 @@ jobs:
           key: corpus-full
       - name: Install nasm
         uses: ilammy/setup-nasm@v1
+      - name: Install liblzma (full xz2 reference)
+        run: sudo apt-get update && sudo apt-get install -y liblzma-dev
       - name: Full-corpus cross-impl tests
         run: cargo test -p libcramjam --release --tests -- --ignored
 
