@@ -159,9 +159,25 @@ impl<W: std::io::Write + ?Sized> std::io::Write for SinkRef<'_, W> {
     }
 }
 
-// Shared runtime CPU feature detection + SIMD wildcopy kernel used by the
-// pure-Rust lz4 and zstd decoders. No-op on non-x86_64/aarch64 targets.
-#[cfg(any(feature = "lz4", feature = "zstd"))]
+// Shared runtime CPU feature detection + SIMD wildcopy kernel. No-op on
+// non-x86_64/aarch64 targets. Used by the pure-Rust lz4, zstd, xz and deflate
+// (inflate) decoders, so it must be compiled whenever any of those is enabled.
+#[cfg(any(
+    feature = "lz4",
+    feature = "zstd",
+    feature = "xz",
+    feature = "xz-static",
+    feature = "xz-shared",
+    feature = "deflate",
+    feature = "deflate-static",
+    feature = "deflate-shared",
+    feature = "gzip",
+    feature = "gzip-static",
+    feature = "gzip-shared",
+    feature = "zlib",
+    feature = "zlib-static",
+    feature = "zlib-shared",
+))]
 pub(crate) mod cpu_features;
 
 // Pure-Rust DEFLATE / gzip / zlib implementation (no C dependencies).

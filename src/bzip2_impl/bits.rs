@@ -218,8 +218,13 @@ impl BitWriter {
     /// Drop the writer and return the encoded bytes.  Caller must have
     /// already byte-aligned the stream.
     pub fn finish(mut self) -> Vec<u8> {
-        debug_assert_eq!(self.bits_in_container, 0, "BitWriter::finish called mid-byte");
-        // Defensive: pad if we somehow weren't aligned.
+        // The container may still hold whole, byte-aligned bytes that haven't
+        // been drained yet (the writer only spills in 4-byte chunks once >= 32
+        // bits are queued), so check byte alignment, not emptiness. A *mid*-
+        // byte finish is the real bug: padding it changes the bitstream.
+        debug_assert_eq!(self.bits_in_container % 8, 0, "BitWriter::finish called mid-byte");
+        // Flush any remaining whole bytes (pads only if — defensively — not
+        // byte-aligned).
         if self.bits_in_container > 0 {
             self.align_to_byte();
         }

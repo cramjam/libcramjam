@@ -371,7 +371,14 @@ impl TreeState {
             self.heap[self.heap_max] = n as i32;
             self.heap_max -= 1;
             self.heap[self.heap_max] = m as i32;
-            tree[node].fc = tree[n].fc + tree[m].fc;
+            // zlib sums `ush` (u16) frequencies here and lets them wrap
+            // silently. Real blocks bound every frequency by the block size
+            // (<= 16383 symbols), so the sum never overflows in practice and
+            // this equals a plain add; `wrapping_add` matches zlib exactly and
+            // avoids a debug-assertions overflow panic on synthetic/degenerate
+            // frequency distributions (the tree stays a valid complete code —
+            // fc only orders the priority queue).
+            tree[node].fc = tree[n].fc.wrapping_add(tree[m].fc);
             self.depth[node] = self.depth[n].max(self.depth[m]) + 1;
             tree[n].dl = node as u16;
             tree[m].dl = node as u16;

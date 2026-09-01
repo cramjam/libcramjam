@@ -6,11 +6,23 @@
 # threads direct jumps between states, which recovers ~10% on inflate-style
 # and zstd frame/block decoders.  zlib-rs documents this as load-bearing:
 # https://trifectatech.org/blog/current-zlib-rs-performance/
+# It is target-agnostic, so it applies to every target.
 #
-# `target-cpu=x86-64-v3` — baseline AVX2/BMI2/FMA for local development.
-# Production wheels should either build for the target CPU via per-target
-# rustflags or use runtime dispatch in the hot kernels (see cpu_features.rs).
+# `target-cpu=x86-64-v3` — baseline AVX2/BMI2/FMA for local development and
+# benchmarks. It is an x86-specific flag, so it is scoped to x86_64 below;
+# applied globally it warns and is ignored on aarch64 (e.g. macOS arm64 CI).
+# It is only an auto-vectorization hint: the hot kernels use runtime dispatch
+# (see cpu_features.rs), so the code is correct without it. Production wheels
+# should build for their own target CPU rather than inherit this.
+
 [build]
+rustflags = [
+    "-C", "llvm-args=-enable-dfa-jump-thread",
+]
+
+# cargo does not merge rustflags across sources: when this cfg matches it wins
+# over [build], so the dfa-jump-thread flag is repeated here.
+[target.'cfg(target_arch = "x86_64")']
 rustflags = [
     "-C", "target-cpu=x86-64-v3",
     "-C", "llvm-args=-enable-dfa-jump-thread",
