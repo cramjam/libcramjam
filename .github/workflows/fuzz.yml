@@ -1,0 +1,135 @@
+name: Fuzz
+
+# Fuzzing is expensive, so it does NOT run on every push. It runs when:
+#   * a pushed commit message contains "[fuzz]" (or a PR title contains it),
+#   * it is triggered manually (Actions -> Fuzz -> Run workflow), or
+#   * on the nightly schedule (against the default branch).
+# Every run first replays the committed regression crashes (fuzz/artifacts/**)
+# as a fast guard that previously-fixed bugs stay fixed, then time-bounded
+# fuzzes each target to look for new ones. Any new crash is uploaded as a
+# build artifact and fails the job.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: Seconds to fuzz each target
+        default: "300"
+        required: false
+  schedule:
+    - cron: "0 4 * * *" # 04:00 UTC nightly
+
+concurrency:
+  group: fuzz-${{ github.ref_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  # The full 24-file corpus round-trip tests (`#[ignore]`d in the normal suite
+  # because they take several minutes) run here rather than on every PR, gated
+  # the same way as fuzzing. `cargo test --tests -- --ignored` runs the
+  # `corpus_full` variant of each codec's cross-impl corpus test.
+  corpus-full:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      contains(github.event.head_commit.message, '[fuzz]') ||
+      contains(github.event.pull_request.title, '[fuzz]')
+    name: corpus-full
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: corpus-full
+      - name: Install nasm
+        uses: ilammy/setup-nasm@v1
+      - name: Full-corpus cross-impl tests
+        run: cargo test -p libcramjam --release --tests -- --ignored
+
+  fuzz:
+    # Only spend CI minutes when explicitly requested, dispatched, or scheduled.
+    # `head_commit` is null on pull_request events and `pull_request` is null on
+    # push events, so `contains(null, ...)` is false and the two checks compose.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      contains(github.event.head_commit.message, '[fuzz]') ||
+      contains(github.event.pull_request.title, '[fuzz]')
+    name: fuzz-${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - dec_inflate
+          - dec_zstd
+          - dec_lz4_frame
+          - dec_lz4_block
+          - dec_bzip2
+          - dec_xz
+          - dec_into
+          - enc_roundtrip
+          - enc_stream
+    steps:
+      - uses: actions/checkout@v4
+
+      # libFuzzer + AddressSanitizer require the nightly toolchain.
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target\nfuzz -> target"
+          key: fuzz-${{ matrix.target }}
+
+      - name: Install nasm
+        uses: ilammy/setup-nasm@v1
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Choose fuzz duration
+        run: |
+          case "${{ github.event_name }}" in
+            workflow_dispatch) echo "DURATION=${{ github.event.inputs.duration }}" >> "$GITHUB_ENV" ;;
+            schedule)          echo "DURATION=600" >> "$GITHUB_ENV" ;;
+            *)                 echo "DURATION=180" >> "$GITHUB_ENV" ;;
+          esac
+
+      - name: Build fuzz target
+        run: cargo +nightly fuzz build ${{ matrix.target }}
+
+      # Regression guard: every committed crash input must now decode/encode
+      # cleanly (no panic / OOB / timeout). `-runs=0` replays the inputs and
+      # exits without fuzzing. Skipped if this target has no committed crashes.
+      - name: Replay regression corpus
+        run: |
+          dir="fuzz/artifacts/${{ matrix.target }}"
+          if [ -d "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
+            cargo +nightly fuzz run ${{ matrix.target }} "$dir" -- -runs=0
+          else
+            echo "no committed artifacts for ${{ matrix.target }}, skipping replay"
+          fi
+
+      - name: Fuzz
+        run: |
+          cargo +nightly fuzz run ${{ matrix.target }} -- \
+            -max_total_time=$DURATION \
+            -max_len=131072 \
+            -rss_limit_mb=4096 \
+            -timeout=25
+
+      # On a crash/timeout/OOM, cargo-fuzz writes the reproducer under
+      # fuzz/artifacts/<target>/; surface it so the failure can be reproduced
+      # locally with `cargo +nightly fuzz run <target> <artifact>`.
+      - name: Upload new crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore

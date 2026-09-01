@@ -98,6 +98,16 @@ jobs:
           !matrix.capi && matrix.codec
         run: cargo test -p libcramjam --lib --no-default-features --features ${{ matrix.codec }}
 
+      # Integration tests (tests/*.rs): cross-impl round-trips, corpus ratio +
+      # round-trip on real data, and streaming semantics. These are the real
+      # validation and must run in --release (the codecs are far too slow in
+      # debug). Run once per OS on the full-feature build; the `#[ignore]`d
+      # full-corpus tests are left for the nightly/manual fuzz+corpus runs.
+      - name: Integration tests (release, all codecs)
+        if: |
+          !matrix.capi && !matrix.codec
+        run: cargo test -p libcramjam --release --tests
+
   # build-wasm32:
   #   runs-on: ubuntu-latest
   #   steps:
