@@ -639,7 +639,7 @@ fn bcj_ia64_cross_impl() {
 fn alone_encoder_roundtrips_through_liblzma() {
     use std::io::{Cursor, Read};
     let mut data: Vec<u8> = b"lzma alone format, the way Python's lzma.compress(format=FORMAT_ALONE) writes it. ".repeat(500);
-    data.extend((0..50_000u32).map(|i| ((i * 2654435761u32) >> 24) as u8));
+    data.extend((0..50_000u32).map(|i| ((i.wrapping_mul(2654435761u32)) >> 24) as u8));
     for preset in [0u32, 1, 6, 9] {
         let mut ours = Vec::new();
         libcramjam::xz::compress(
@@ -827,7 +827,7 @@ fn raw_lzma2_cross_impl() {
 #[test]
 fn raw_lzma1_cross_impl() {
     let mut data = gen_text(150_000);
-    data.extend((0..30_000u32).map(|i| ((i * 2654435761u32) >> 24) as u8));
+    data.extend((0..30_000u32).map(|i| ((i.wrapping_mul(2654435761u32)) >> 24) as u8));
     for preset in [0u32, 3, 6, 9] {
         let opts = LzmaOptions::new_preset(preset).unwrap();
         let mut f = Filters::new();
@@ -941,7 +941,7 @@ fn x86_bcj_on_real_call_patterns_matches_liblzma() {
 #[test]
 fn sha256_check_cross_impl() {
     let mut data = gen_text(100_000);
-    data.extend((0..40_000u32).map(|i| ((i * 2654435761u32) >> 24) as u8));
+    data.extend((0..40_000u32).map(|i| ((i.wrapping_mul(2654435761u32)) >> 24) as u8));
     for preset in [1u32, 6] {
         let xz = ours_encode(&data, preset, Format::XZ, Check::Sha256, None);
         assert_eq!(xz[7], 0x0A, "stream flags check id = SHA-256");
