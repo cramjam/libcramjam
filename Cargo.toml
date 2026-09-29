@@ -9,6 +9,8 @@ readme      = "README.md"
 # `criterion_main!`, so we must opt out of auto-discovery and rely on the
 # explicit [[bench]] entries below.
 autobenches = false
+# Bench corpus is ~55 MB; crates.io caps uploads at 10 MB.
+exclude     = ["benches/data/", "fuzz/"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
