@@ -1,6 +1,6 @@
 [package]
 name        = "libcramjam"
-version     = "0.9.0"
+version     = "0.9.1"
 edition     = "2021"
 license     = "MIT"
 description = "Compression library combining a plethora of algorithms in a similar as possible API"
@@ -30,8 +30,8 @@ pure-rust         = ["zstd-pure", "lz4-pure", "bzip2-pure", "deflate-pure", "xz-
 zstd-pure         = []
 lz4-pure          = []
 bzip2-pure        = []
-deflate-pure      = []  # deflate, gzip and zlib share one implementation
-xz-pure           = []
+deflate-pure      = ["dep:crc32fast", "dep:simd-adler32"]  # deflate, gzip and zlib share one implementation
+xz-pure           = ["dep:crc32fast", "dep:crc-fast", "dep:sha2"]
 
 lz4               = ["dep:lz4"]
 bzip2             = ["dep:bzip2"]
@@ -91,10 +91,10 @@ xz2            = { version = "0.1.7", optional = true }
 lzma-sys       = { version = "0.1", optional = true }  # xz2's own dep; raw (container-less) coder, which xz2 doesn't wrap
 blosc2-rs      = { version = "0.4.0+2.15.2", optional = true, default-features = false }
 # pure-Rust backends
-crc32fast      = "^1"
-crc-fast       = "^1.10"  # SIMD CRC-64/XZ for the xz container check
-sha2           = "^0.10"  # SHA-256 xz block check
-simd-adler32   = "^0.3"
+crc32fast      = { version = "^1", optional = true }
+crc-fast       = { version = "^1.9", optional = true }  # SIMD CRC-64/XZ for the xz container check; 1.10+ needs rustc 1.89
+sha2           = { version = "^0.10", optional = true }  # SHA-256 xz block check
+simd-adler32   = { version = "^0.3", optional = true }
 
 # ISA-L not supported on 32-bit; Cargo doesn't offer a way to disable a single feature
 [target.'cfg(target_pointer_width = "64")'.dependencies]
