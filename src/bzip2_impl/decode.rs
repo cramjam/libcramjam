@@ -62,7 +62,9 @@ fn decode_one_frame(
     produced: &mut usize,
 ) -> io::Result<usize> {
     if input.len() < 4 {
-        return Ok(0);
+        // A stream header is 4 bytes; anything shorter is truncated or
+        // garbage, never "no more streams" (the caller stops at the end).
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "bzip2: truncated stream header"));
     }
     if input[0] != b'B' || input[1] != b'Z' || input[2] != FILE_MAGIC_HUFFMAN {
         return Err(io::Error::new(

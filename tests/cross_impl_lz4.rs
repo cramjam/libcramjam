@@ -202,6 +202,7 @@ fn self_roundtrip_all_levels() {
 
 /// Frame options the Python wrapper exposes: independent blocks and the
 /// xxhash32 content checksum. The C decoder verifies both.
+#[cfg(feature = "lz4-pure")] // uses a pure-Rust test hook
 #[test]
 fn frame_options_content_checksum_and_independent_blocks() {
     use std::io::Read;

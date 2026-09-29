@@ -9,7 +9,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-libcramjam = { path = "..", default-features = false, features = ["deflate", "gzip", "zlib", "lz4", "bzip2", "zstd", "xz"] }
+# Fuzzing targets the pure-Rust backend; the C crates below are the references.
+libcramjam = { path = "..", default-features = false, features = ["pure-rust"] }
 flate2 = "^1"
 zstd = "^0.13"
 lz4 = "^1"

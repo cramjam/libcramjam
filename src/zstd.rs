@@ -1,6 +1,8 @@
 //! zstd de/compression interface
 use std::io::{Error, Read, Write};
 
+pub const BACKEND: crate::Backend = crate::Backend::PureRust;
+
 /// Default compression level, matching C zstd's `ZSTD_defaultCLevel()` = 3.
 pub const DEFAULT_COMPRESSION_LEVEL: i32 = 3;
 
@@ -12,6 +14,8 @@ pub fn compress_bound(len: usize) -> usize {
 }
 
 /// Compress a byte slice into a new `Vec`, skipping the generic `Read` copy.
+/// Pure-Rust backend only (bench/diagnostic helper).
+#[doc(hidden)]
 pub fn compress_bytes(input: &[u8], level: Option<i32>) -> Vec<u8> {
     crate::zstd_impl::compress_bytes(input, level)
 }

@@ -95,9 +95,13 @@ fn run(kind: Kind, level: u32, parts: &[&[u8]]) {
                 if i + 1 < parts.len() {
                     enc.flush().unwrap();
                     prefixes.push((enc.get_ref().len(), expected.len()));
-                    // A second flush with nothing new must not emit anything.
+                    // A second flush with nothing new: the pure-Rust backend
+                    // emits nothing; zlib/flate2 emit another (valid) empty
+                    // sync-flush block, which the decodes below cover.
                     enc.flush().unwrap();
-                    assert_eq!(enc.get_ref().len(), prefixes.last().unwrap().0, "empty flush emitted bytes");
+                    if libcramjam::deflate::BACKEND == libcramjam::Backend::PureRust {
+                        assert_eq!(enc.get_ref().len(), prefixes.last().unwrap().0, "empty flush emitted bytes");
+                    }
                 }
             }
             enc.finish().unwrap()

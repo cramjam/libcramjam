@@ -1,6 +1,6 @@
 [package]
 name        = "libcramjam"
-version     = "0.8.0"
+version     = "0.9.0"
 edition     = "2021"
 license     = "MIT"
 description = "Compression library combining a plethora of algorithms in a similar as possible API"
@@ -15,10 +15,25 @@ autobenches = false
 default           = ["snappy", "lz4", "bzip2", "brotli", "xz", "zstd", "gzip", "deflate", "zlib"]
 capi              = ["dep:libc"]
 snappy            = ["dep:snap"]
-lz4               = []
-bzip2             = []
 brotli            = ["dep:brotli"]
-zstd              = []
+
+# Codec features select the C-backed implementation (the default, as in 0.8).
+# The matching `*-pure` feature selects the pure-Rust implementation instead
+# and takes precedence when both are enabled (Cargo unifies features across
+# the dependency graph, so both can end up on). The public API is identical
+# for either backend. A pure-Rust-only build should use
+# `default-features = false, features = ["pure-rust", ...]` so the C
+# libraries aren't compiled at all.
+pure-rust         = ["zstd-pure", "lz4-pure", "bzip2-pure", "deflate-pure", "xz-pure"]
+zstd-pure         = []
+lz4-pure          = []
+bzip2-pure        = []
+deflate-pure      = []  # deflate, gzip and zlib share one implementation
+xz-pure           = []
+
+lz4               = ["dep:lz4"]
+bzip2             = ["dep:bzip2"]
+zstd              = ["dep:zstd"]
 
 igzip             = ["isal-static"]
 igzip-static      = ["isal-static"]
@@ -36,6 +51,8 @@ isal-static       = ["dep:isal-rs", "isal-rs/static"]
 isal-shared       = ["dep:isal-rs", "isal-rs/shared"]
 use-system-isal   = ["dep:isal-rs", "isal-rs/use-system-isal"]
 
+# flate2 uses its default (pure-Rust miniz_oxide) backend; -static/-shared are
+# kept for compatibility and mean the same thing.
 gzip              = ["gzip-static"]
 gzip-static       = ["deflate-static"]
 gzip-shared       = ["deflate-shared"]
@@ -45,12 +62,12 @@ zlib-static       = ["deflate-static"]
 zlib-shared       = ["deflate-shared"]
 
 deflate           = ["deflate-static"]
-deflate-static    = []
-deflate-shared    = []
+deflate-static    = ["dep:flate2"]
+deflate-shared    = ["dep:flate2"]
 
-xz                = []
-xz-static         = []  # kept for API compatibility; xz/lzma is now pure Rust
-xz-shared         = []  # kept for API compatibility; xz/lzma is now pure Rust
+xz                = ["xz-static"]
+xz-static         = ["dep:xz2", "dep:lzma-sys", "xz2/static"]  # builds from vendored source of xz
+xz-shared         = ["dep:xz2", "dep:lzma-sys"]  # _maybe_ uses system xz; probes for it but falls back to building static lib
 
 blosc2            = ["blosc2-static"]
 blosc2-static     = ["dep:blosc2-rs", "blosc2-rs/static"]
@@ -63,13 +80,19 @@ wasm32-compat     = ["blosc2-rs/deactivate-zlib-optim"]
 libc           = { version = "0.2", optional = true }
 snap           = { version = "^1", optional = true }
 brotli         = { version = "^8", default-features = false, features = ["std", "ffi-api"], optional = true }
-crc32fast       = "^1"
-crc-fast        = "^1.10"  # SIMD CRC-64/XZ for the xz container check
-sha2            = "^0.10"  # SHA-256 xz block check
-simd-adler32    = "^0.3"
-# flate2 and libdeflate-sys removed: gzip/deflate/zlib are now pure Rust
+# C backends (see the codec features above)
+bzip2          = { version = ">=0.4,<0.6", optional = true }
+lz4            = { version = "^1", optional = true }
+flate2         = { version = "^1", optional = true }
+zstd           = { version = "^0.13", optional = true }
+xz2            = { version = "0.1.7", optional = true }
+lzma-sys       = { version = "0.1", optional = true }  # xz2's own dep; raw (container-less) coder, which xz2 doesn't wrap
 blosc2-rs      = { version = "0.4.0+2.15.2", optional = true, default-features = false }
-# xz2 removed: xz / lzma is now pure Rust (kept as a dev-dep for benches/tests below)
+# pure-Rust backends
+crc32fast      = "^1"
+crc-fast       = "^1.10"  # SIMD CRC-64/XZ for the xz container check
+sha2           = "^0.10"  # SHA-256 xz block check
+simd-adler32   = "^0.3"
 
 # ISA-L not supported on 32-bit; Cargo doesn't offer a way to disable a single feature
 [target.'cfg(target_pointer_width = "64")'.dependencies]
@@ -95,29 +118,53 @@ xz2 = "0.1.7"  # only for cross-impl testing + benches against the pure-Rust xz_
 lzma-sys = "0.1"  # xz2's own dep; used directly for liblzma's raw coder in tests/cross_impl_xz.rs
 criterion = { version = "0.5", features = ["html_reports"] }
 
+# Benches compare the pure-Rust backend against the C crates (dev-deps).
 [[bench]]
 name = "deflate_bench"
 harness = false
+required-features = ["pure-rust"]
 
 [[bench]]
 name = "zstd_bench"
 harness = false
+required-features = ["pure-rust"]
 
 [[bench]]
 name = "lz4_bench"
 harness = false
+required-features = ["pure-rust"]
 
 [[bench]]
 name = "bzip2_bench"
 harness = false
+required-features = ["pure-rust"]
 
 [[bench]]
 name = "xz_bench"
 harness = false
+required-features = ["pure-rust"]
 
 [[bench]]
 name = "summary"
 harness = false
+required-features = ["pure-rust"]
+
+# Diagnostics that call pure-Rust-only helpers.
+[[example]]
+name = "lz4hc_check"
+required-features = ["lz4-pure"]
+
+[[example]]
+name = "lz4fast_check"
+required-features = ["lz4-pure"]
+
+[[example]]
+name = "zstd_small_check"
+required-features = ["zstd-pure"]
+
+[[example]]
+name = "profile_zstd"
+required-features = ["zstd-pure"]
 
 [profile.release]
 strip = true

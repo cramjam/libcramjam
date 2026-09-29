@@ -6,13 +6,11 @@
 pub mod blosc2;
 #[cfg(feature = "brotli")]
 pub mod brotli;
-#[cfg(feature = "bzip2")]
-pub mod bzip2;
 #[cfg(feature = "capi")]
 mod capi;
 
 /// Test hook: lz4 frame encoder with explicit frame options.
-#[cfg(feature = "lz4")]
+#[cfg(feature = "lz4-pure")]
 #[doc(hidden)]
 pub fn lz4_frame_opts_for_tests(input: &[u8], level: Option<u32>, block_linked: bool, content_checksum: bool) -> Vec<u8> {
     lz4_impl::frame::encode_frame_opts(input, level, block_linked, content_checksum)
@@ -28,7 +26,7 @@ pub fn lz4_frame_opts_for_tests(input: &[u8], level: Option<u32>, block_linked: 
 /// across calls, which is what the old C streaming wrappers effectively got
 /// from their fixed 128 KiB buffers. Buffers above `SCRATCH_KEEP_MAX` are
 /// released after use so a single huge decode doesn't pin memory forever.
-#[cfg(any(feature = "lz4", feature = "zstd", feature = "bzip2", feature = "xz", feature = "deflate-static", feature = "deflate-shared"))]
+#[cfg(feature = "xz-pure")]
 pub(crate) fn with_scratch<W: std::io::Write + ?Sized>(
     output: &mut W,
     f: impl FnOnce(&mut Vec<u8>) -> std::io::Result<()>,
@@ -44,7 +42,7 @@ pub(crate) fn with_scratch<W: std::io::Write + ?Sized>(
 /// generic `Read`/`Write` wrappers of the fast codecs: a fresh 50 MB `Vec`
 /// per call is ~13k page faults (glibc mmaps/unmaps at that size), which on
 /// lz4/zstd is as expensive as the codec itself. Both are cleared on entry.
-#[cfg(any(feature = "lz4", feature = "zstd"))]
+#[cfg(any(feature = "lz4-pure", feature = "zstd-pure"))]
 pub(crate) fn scratch_pair_with<R>(f: impl FnOnce(&mut Vec<u8>, &mut Vec<u8>) -> std::io::Result<R>) -> std::io::Result<R> {
     use std::cell::RefCell;
     const SCRATCH_KEEP_MAX: usize = 64 << 20;
@@ -74,7 +72,7 @@ pub(crate) fn scratch_pair_with<R>(f: impl FnOnce(&mut Vec<u8>, &mut Vec<u8>) ->
 }
 
 /// Raw access to the thread-local scratch buffer (cleared on entry).
-#[cfg(any(feature = "lz4", feature = "zstd", feature = "bzip2", feature = "xz", feature = "deflate-static", feature = "deflate-shared"))]
+#[cfg(any(feature = "bzip2-pure", feature = "xz-pure", feature = "deflate-pure"))]
 pub(crate) fn scratch_with<R>(f: impl FnOnce(&mut Vec<u8>) -> std::io::Result<R>) -> std::io::Result<R> {
     use std::cell::RefCell;
     const SCRATCH_KEEP_MAX: usize = 64 << 20;
@@ -106,7 +104,7 @@ pub(crate) fn scratch_with<R>(f: impl FnOnce(&mut Vec<u8>) -> std::io::Result<R>
 /// few MB (cache-resident) instead of the whole output, which otherwise
 /// costs ~3x the DRAM traffic on outputs larger than L3 — this is what C's
 /// streaming decoders get from their ring buffers.
-#[cfg(any(feature = "lz4", feature = "zstd", feature = "bzip2", feature = "xz", feature = "deflate-static", feature = "deflate-shared"))]
+#[cfg(any(feature = "lz4-pure", feature = "deflate-pure"))]
 pub(crate) struct Streamer<'a> {
     pub sink: Option<&'a mut dyn std::io::Write>,
     keep: usize,
@@ -115,7 +113,7 @@ pub(crate) struct Streamer<'a> {
     pub flushed: usize,
 }
 
-#[cfg(any(feature = "lz4", feature = "zstd", feature = "bzip2", feature = "xz", feature = "deflate-static", feature = "deflate-shared"))]
+#[cfg(any(feature = "lz4-pure", feature = "deflate-pure"))]
 impl<'a> Streamer<'a> {
     pub fn new(sink: Option<&'a mut dyn std::io::Write>, keep: usize, chunk: usize) -> Self {
         Self { sink, keep, chunk, flushed: 0 }
@@ -140,10 +138,10 @@ impl<'a> Streamer<'a> {
 }
 
 /// Sized adapter so an unsized `&mut W` can be passed as `&mut dyn Write`.
-#[cfg(any(feature = "lz4", feature = "zstd", feature = "bzip2", feature = "xz", feature = "deflate-static", feature = "deflate-shared"))]
+#[cfg(any(feature = "lz4-pure", feature = "zstd-pure", feature = "bzip2-pure", feature = "deflate-pure"))]
 pub(crate) struct SinkRef<'a, W: std::io::Write + ?Sized>(pub &'a mut W);
 
-#[cfg(any(feature = "lz4", feature = "zstd", feature = "bzip2", feature = "xz", feature = "deflate-static", feature = "deflate-shared"))]
+#[cfg(any(feature = "lz4-pure", feature = "zstd-pure", feature = "bzip2-pure", feature = "deflate-pure"))]
 impl<W: std::io::Write + ?Sized> std::io::Write for SinkRef<'_, W> {
     #[inline]
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
@@ -162,62 +160,69 @@ impl<W: std::io::Write + ?Sized> std::io::Write for SinkRef<'_, W> {
 // Shared runtime CPU feature detection + SIMD wildcopy kernel. No-op on
 // non-x86_64/aarch64 targets. Used by the pure-Rust lz4, zstd, xz and deflate
 // (inflate) decoders, so it must be compiled whenever any of those is enabled.
-#[cfg(any(
-    feature = "lz4",
-    feature = "zstd",
-    feature = "xz",
-    feature = "xz-static",
-    feature = "xz-shared",
-    feature = "deflate",
-    feature = "deflate-static",
-    feature = "deflate-shared",
-    feature = "gzip",
-    feature = "gzip-static",
-    feature = "gzip-shared",
-    feature = "zlib",
-    feature = "zlib-static",
-    feature = "zlib-shared",
-))]
+#[cfg(any(feature = "lz4-pure", feature = "zstd-pure", feature = "xz-pure", feature = "deflate-pure"))]
 pub(crate) mod cpu_features;
 
-// Pure-Rust DEFLATE / gzip / zlib implementation (no C dependencies).
-#[cfg(any(
-    feature = "deflate",
-    feature = "deflate-static",
-    feature = "deflate-shared",
-    feature = "gzip",
-    feature = "gzip-static",
-    feature = "gzip-shared",
-    feature = "zlib",
-    feature = "zlib-static",
-    feature = "zlib-shared",
-))]
+// Pure-Rust implementations (no C dependencies), used by the public codec
+// modules when the matching `*-pure` feature is enabled.
+#[cfg(feature = "deflate-pure")]
 pub(crate) mod deflate_impl;
-
-// Pure-Rust Zstandard implementation (no C dependencies).
-#[cfg(feature = "zstd")]
+#[cfg(feature = "zstd-pure")]
 pub(crate) mod zstd_impl;
-
-// Pure-Rust LZ4 implementation (no C dependencies).
-#[cfg(feature = "lz4")]
+#[cfg(feature = "lz4-pure")]
 pub(crate) mod lz4_impl;
-
-// Pure-Rust bzip2 implementation (no C dependencies).
-#[cfg(feature = "bzip2")]
+#[cfg(feature = "bzip2-pure")]
+#[doc(hidden)]
 pub mod bzip2_impl;
-
-// Pure-Rust XZ / LZMA implementation (no C dependencies).
-#[cfg(any(feature = "xz", feature = "xz-static", feature = "xz-shared"))]
+#[cfg(feature = "xz-pure")]
+#[doc(hidden)]
 pub mod xz_impl;
 
-#[cfg(any(
-    feature = "deflate",
-    feature = "deflate-static",
-    feature = "deflate-shared"
-))]
+// Public codec modules. Each has two implementations with the same API: the
+// pure-Rust one in `src/<codec>.rs` and the C-backed one in
+// `src/c_backend/<codec>.rs`; the `*-pure` feature wins when both are on.
+#[cfg(feature = "bzip2-pure")]
+pub mod bzip2;
+#[cfg(all(feature = "bzip2", not(feature = "bzip2-pure")))]
+#[path = "c_backend/bzip2.rs"]
+pub mod bzip2;
+
+#[cfg(feature = "deflate-pure")]
 pub mod deflate;
-#[cfg(any(feature = "gzip", feature = "gzip-static", feature = "gzip-shared"))]
+#[cfg(all(any(feature = "deflate", feature = "deflate-static", feature = "deflate-shared"), not(feature = "deflate-pure")))]
+#[path = "c_backend/deflate.rs"]
+pub mod deflate;
+
+#[cfg(feature = "deflate-pure")]
 pub mod gzip;
+#[cfg(all(any(feature = "gzip", feature = "gzip-static", feature = "gzip-shared"), not(feature = "deflate-pure")))]
+#[path = "c_backend/gzip.rs"]
+pub mod gzip;
+
+#[cfg(feature = "deflate-pure")]
+pub mod zlib;
+#[cfg(all(any(feature = "zlib", feature = "zlib-static", feature = "zlib-shared"), not(feature = "deflate-pure")))]
+#[path = "c_backend/zlib.rs"]
+pub mod zlib;
+
+#[cfg(feature = "lz4-pure")]
+pub mod lz4;
+#[cfg(all(feature = "lz4", not(feature = "lz4-pure")))]
+#[path = "c_backend/lz4.rs"]
+pub mod lz4;
+
+#[cfg(feature = "xz-pure")]
+pub mod xz;
+#[cfg(all(any(feature = "xz", feature = "xz-static", feature = "xz-shared"), not(feature = "xz-pure")))]
+#[path = "c_backend/xz.rs"]
+pub mod xz;
+
+#[cfg(feature = "zstd-pure")]
+pub mod zstd;
+#[cfg(all(feature = "zstd", not(feature = "zstd-pure")))]
+#[path = "c_backend/zstd.rs"]
+pub mod zstd;
+
 #[cfg(all(
     any(
         feature = "ideflate",
@@ -237,16 +242,17 @@ pub mod igzip;
     target_pointer_width = "64"
 ))]
 pub mod izlib;
-#[cfg(feature = "lz4")]
-pub mod lz4;
 #[cfg(feature = "snappy")]
 pub mod snappy;
-#[cfg(any(feature = "xz", feature = "xz-static", feature = "xz-shared"))]
-pub mod xz;
-#[cfg(any(feature = "zlib", feature = "zlib-static", feature = "zlib-shared"))]
-pub mod zlib;
-#[cfg(feature = "zstd")]
-pub mod zstd;
+
+/// Which implementation backs a codec module in this build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    /// The C library (or, for deflate/gzip/zlib, `flate2`) as in libcramjam 0.8.
+    C,
+    /// libcramjam's own pure-Rust implementation.
+    PureRust,
+}
 
 #[cfg(test)]
 mod tests {
@@ -337,7 +343,7 @@ mod tests {
     #[cfg(feature = "snappy")]
     test_variant!(snappy);
 
-    #[cfg(feature = "gzip")]
+    #[cfg(any(feature = "gzip", feature = "deflate-pure"))]
     test_variant!(gzip, None);
 
     #[cfg(all(
@@ -365,52 +371,54 @@ mod tests {
     #[cfg(feature = "brotli")]
     test_variant!(brotli, None);
 
-    #[cfg(feature = "bzip2")]
+    #[cfg(any(feature = "bzip2", feature = "bzip2-pure"))]
     test_variant!(bzip2, None);
 
-    #[cfg(feature = "deflate")]
+    #[cfg(any(feature = "deflate", feature = "deflate-pure"))]
     test_variant!(deflate, None);
 
-    #[cfg(feature = "zstd")]
+    #[cfg(any(feature = "zstd", feature = "zstd-pure"))]
     test_variant!(zstd, None, None);
 
-    #[cfg(feature = "zlib")]
+    #[cfg(any(feature = "zlib", feature = "deflate-pure"))]
     test_variant!(zlib, None);
 
-    #[cfg(feature = "lz4")]
+    #[cfg(any(feature = "lz4", feature = "lz4-pure"))]
     test_variant!(lz4, None);
 
     #[cfg(feature = "blosc2")]
     test_variant!(blosc2);
 
-    #[cfg(feature = "xz")]
+    #[cfg(any(feature = "xz", feature = "xz-pure"))]
     #[allow(non_upper_case_globals)]
     const format: Option<crate::xz::Format> = None;
 
     #[allow(non_upper_case_globals)]
-    #[cfg(feature = "xz")]
+    #[cfg(any(feature = "xz", feature = "xz-pure"))]
     const check: Option<crate::xz::Check> = None;
 
     #[allow(non_upper_case_globals)]
-    #[cfg(feature = "xz")]
+    #[cfg(any(feature = "xz", feature = "xz-pure"))]
     const filters: Option<crate::xz::Filters> = None;
 
     #[allow(non_upper_case_globals)]
-    #[cfg(feature = "xz")]
+    #[cfg(any(feature = "xz", feature = "xz-pure"))]
     const opts: Option<crate::xz::LzmaOptions> = None;
 
-    #[cfg(feature = "xz")]
+    #[cfg(any(feature = "xz", feature = "xz-pure"))]
     test_variant!(xz, None, format, check, filters, opts);
 }
 
 /// Bench/diagnostic helper: single-block LZ4 fast compression (no frame).
-#[cfg(feature = "lz4")]
+#[cfg(feature = "lz4-pure")]
+#[doc(hidden)]
 pub fn lz4_impl_block_fast(input: &[u8], output: &mut Vec<u8>) -> usize {
     lz4_impl::block::compress_block(input, output)
 }
 
 /// Bench/diagnostic helper: single-block LZ4 HC compression (no frame).
-#[cfg(feature = "lz4")]
+#[cfg(feature = "lz4-pure")]
+#[doc(hidden)]
 pub fn lz4_impl_block_hc(input: &[u8], output: &mut Vec<u8>, level: u32) -> usize {
     lz4_impl::block::compress_block_hc(input, output, level)
 }

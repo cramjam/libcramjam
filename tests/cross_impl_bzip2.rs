@@ -1,5 +1,8 @@
 //! Cross-implementation tests: our pure-Rust bzip2 decoder against C-backed `bzip2`.
 
+// Exercises the pure-Rust internals directly; backend-neutral checks are in backend_contract.rs.
+#![cfg(feature = "bzip2-pure")]
+
 use std::io::Write;
 
 fn gen_text(size: usize) -> Vec<u8> {

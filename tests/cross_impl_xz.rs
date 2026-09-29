@@ -4,6 +4,9 @@
 //! decompress with our pure-Rust `xz_impl`.  Once the encoder lands we'll
 //! also add ours→C round-trips here, mirroring the bzip2 test layout.
 
+// Exercises the pure-Rust internals directly; backend-neutral checks are in backend_contract.rs.
+#![cfg(feature = "xz-pure")]
+
 use std::io::Write;
 
 fn gen_text(size: usize) -> Vec<u8> {

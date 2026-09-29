@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   build-test:
-    name: ${{ matrix.os }}-capi=${{ matrix.capi }}-codec=${{ matrix.codec || 'all' }}
+    name: ${{ matrix.os }}-${{ matrix.backend }}-capi=${{ matrix.capi }}-codec=${{ matrix.codec || 'all' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false #${{ !( startsWith(github.ref, 'refs/heads/master') || startsWith(github.ref, 'refs/tags/') ) }}
@@ -22,6 +22,11 @@ jobs:
           - macos-13  # x86_64
           - windows-latest
           - ubuntu-latest
+        # Every codec with a pure-Rust implementation is tested with both
+        # backends; see "Select features" below for the mapping.
+        backend:
+          - c
+          - pure
         capi:
           - true
           - false
@@ -36,8 +41,14 @@ jobs:
           - bzip2
           - null  # Use all codecs
 
-        # TODO: codecs not implemented in capi feature
         exclude:
+          # No pure-Rust backend for these (brotli/snappy are Rust already).
+          - backend: pure
+            codec: blosc2
+          - backend: pure
+            codec: brotli
+
+          # TODO: codecs not implemented in capi feature
           - capi: true
             codec: blosc2
           - capi: true
@@ -48,10 +59,13 @@ jobs:
           # TODO: capi feature fails with all enabled due to duplicate export of 'compress' symbol
           # first from the capi here, then from blosc2 internal zlib-ng; probably just rename ours
           # prefixed with 'cramjam_' or something.
-          - capi: true
+          # (The pure-Rust all-codecs build has no blosc2, so it's unaffected.)
+          - backend: c
+            capi: true
             codec: null
             os: ubuntu-latest
-          - capi: true
+          - backend: c
+            capi: true
             codec: null
             os: windows-latest
     steps:
@@ -87,38 +101,64 @@ jobs:
           !matrix.codec && matrix.capi
         run: cargo install cargo-audit && cargo audit
 
-      - name: Test capi and single codec
-        if: matrix.capi && matrix.codec
-        run: cargo test -p libcramjam --no-default-features --features ${{ matrix.codec }} --features capi --lib
+      # FEATURES: the cargo feature flags for this backend/codec cell.
+      #   c,    codec X -> --no-default-features --features X
+      #   c,    all     -> (default features)
+      #   pure, codec X -> --no-default-features --features X-pure
+      #                    (gzip/deflate -> deflate-pure, which also covers zlib)
+      #   pure, all     -> --no-default-features --features pure-rust,snappy,brotli
+      #                    (a pure-Rust-only build: no C codec is compiled)
+      - name: Select features
+        shell: bash
+        run: |
+          codec="${{ matrix.codec }}"
+          if [ "${{ matrix.backend }}" = pure ]; then
+            case "$codec" in
+              "")            f="--no-default-features --features pure-rust,snappy,brotli" ;;
+              gzip|deflate)  f="--no-default-features --features deflate-pure" ;;
+              *)             f="--no-default-features --features ${codec}-pure" ;;
+            esac
+          else
+            if [ -z "$codec" ]; then f=""; else f="--no-default-features --features $codec"; fi
+          fi
+          if [ "${{ matrix.capi }}" = true ]; then f="$f --features capi"; fi
+          echo "FEATURES=$f" >> "$GITHUB_ENV"
+          echo "LIBCRAMJAM_EXPECT_BACKEND=${{ matrix.backend }}" >> "$GITHUB_ENV"
+          echo "features: $f"
 
-      - name: Test capi and all codecs
-        if: matrix.capi && !matrix.codec
-        run: cargo test -p libcramjam --features capi --lib
+      - name: Unit tests
+        run: cargo test -p libcramjam --lib ${{ env.FEATURES }}
 
-      - name: Test no capi and all codecs
-        if: |
-          !matrix.capi && !matrix.codec
-        run: cargo test -p libcramjam --lib
+      # A pure-Rust-only build must not pull in any C codec library.
+      - name: No C codec dependencies in the pure-Rust build
+        if: matrix.backend == 'pure' && !matrix.codec && !matrix.capi
+        shell: bash
+        run: |
+          sys=$(cargo tree -p libcramjam -e normal --prefix none ${{ env.FEATURES }} | grep -E -- '-sys v' | sort -u || true)
+          if [ -n "$sys" ]; then echo "unexpected C dependencies:"; echo "$sys"; exit 1; fi
 
-      - name: Test no capi and single codec
-        if: |
-          !matrix.capi && matrix.codec
-        run: cargo test -p libcramjam --lib --no-default-features --features ${{ matrix.codec }}
-
-      # Integration tests (tests/*.rs): cross-impl round-trips, corpus ratio +
-      # round-trip on real data, and streaming semantics. These are the real
-      # validation and must run in --release (the codecs are far too slow in
-      # debug). They compare against the C reference crates, and the xz ones
-      # need a full liblzma (all BCJ filters) — which lzma-sys links only from
-      # a system library, available on Linux (installed above) but not under
-      # msvc, which always builds a reduced vendored liblzma. So this runs on
-      # Linux; every platform still gets full unit-test (`--lib`) coverage
-      # above. The `#[ignore]`d full-corpus tests are left for the
-      # nightly/manual fuzz+corpus runs.
+      # Integration tests (tests/*.rs): the backend contract (public API vs
+      # the reference C crates, identical for both backends), cross-impl
+      # round-trips, corpus ratio + round-trip on real data, and streaming
+      # semantics. These must run in --release (the codecs are far too slow
+      # in debug). The xz ones need a full liblzma (all BCJ filters) — which
+      # lzma-sys links only from a system library, available on Linux
+      # (installed above) but not under msvc, which always builds a reduced
+      # vendored liblzma. So this runs on Linux; every platform still gets
+      # full unit-test (`--lib`) coverage above. The `#[ignore]`d full-corpus
+      # tests are left for the nightly/manual fuzz+corpus runs.
       - name: Integration tests (release, all codecs)
         if: |
           !matrix.capi && !matrix.codec && runner.os == 'Linux'
-        run: cargo test -p libcramjam --release --tests
+        run: cargo test -p libcramjam --release --tests ${{ env.FEATURES }}
+
+      # Cargo unifies features across a dependency graph, so a user can end
+      # up with both a C codec feature and its `-pure` one; the pure-Rust
+      # backend must win and still pass the contract.
+      - name: Contract tests with C and pure-Rust features both enabled
+        if: |
+          matrix.backend == 'pure' && !matrix.capi && !matrix.codec && runner.os == 'Linux'
+        run: cargo test -p libcramjam --release --test backend_contract --features pure-rust
 
   # build-wasm32:
   #   runs-on: ubuntu-latest

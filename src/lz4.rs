@@ -2,6 +2,8 @@
 
 use std::io::{Error, Read, Write};
 
+pub const BACKEND: crate::Backend = crate::Backend::PureRust;
+
 /// Default compression level for LZ4 HC mode, matching the previously used
 /// C `lz4` crate's `EncoderBuilder` default of 4.  Levels 0-2 use the fast
 /// hash-table parser; levels 3-12 use the HC (High Compression) parser.

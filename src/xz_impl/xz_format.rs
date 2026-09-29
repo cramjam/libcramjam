@@ -44,7 +44,8 @@ use std::io;
 
 use super::check::{crc32, crc64, sha256};
 use super::lzma2::decode_lzma2;
-use super::options::{bcj_encode, split_chain, Check, ResolvedFilter};
+use super::bcj::bcj_encode;
+use super::options::{split_chain, Check, ResolvedFilter};
 
 const HEADER_MAGIC: [u8; 6] = [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00];
 const FOOTER_MAGIC: [u8; 2] = [0x59, 0x5A];
@@ -110,9 +111,17 @@ pub fn decode_xz_stream(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize>
 
     while pos < input.len() {
         // Permit a sequence of concatenated streams (per the spec).
-        // Skip any 4-byte-aligned stream padding zeros between streams.
+        // Skip stream padding between streams: zeros, a multiple of 4
+        // bytes long (liblzma rejects any other length).
+        let pad_start = pos;
         while pos < input.len() && input[pos] == 0 {
             pos += 1;
+        }
+        if (pos - pad_start) % 4 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "xz: stream padding must be a multiple of 4 bytes",
+            ));
         }
         if pos == input.len() {
             break;

@@ -178,16 +178,21 @@ fn incompressible_and_rle_blocks() {
     assert_eq!(c_decode_all(&out), [random, zeros].concat());
 }
 
+/// libzstd semantics: level 0 is the default level (3), never "store".
 #[test]
-fn level_zero_is_raw_blocks() {
+fn level_zero_is_the_default_level() {
     let data = text(200_000, 5);
-    let mut comp = compressor(0);
-    comp.write_all(&data).unwrap();
-    comp.flush().unwrap();
-    assert_eq!(c_decode_prefix(&emitted(&comp)), data);
-    let out = comp.finish().unwrap().into_inner();
+    let run = |level| {
+        let mut comp = compressor(level);
+        comp.write_all(&data).unwrap();
+        comp.flush().unwrap();
+        assert_eq!(c_decode_prefix(&emitted(&comp)), data);
+        comp.finish().unwrap().into_inner()
+    };
+    let out = run(0);
     assert_eq!(c_decode_all(&out), data);
-    assert!(out.len() >= data.len());
+    assert_eq!(out, run(3));
+    assert!(out.len() < data.len() / 2);
 }
 
 #[test]

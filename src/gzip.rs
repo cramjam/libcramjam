@@ -2,6 +2,8 @@
 use std::io::prelude::*;
 use std::io::Error;
 
+pub const BACKEND: crate::Backend = crate::Backend::PureRust;
+
 pub const DEFAULT_COMPRESSION_LEVEL: u32 = 6;
 
 pub use crate::deflate_impl::GzipStreamCompressor;

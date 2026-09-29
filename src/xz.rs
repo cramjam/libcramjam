@@ -6,6 +6,8 @@
 //! of `xz2`.
 use std::io::{self, Read, Result, Write};
 
+pub const BACKEND: crate::Backend = crate::Backend::PureRust;
+
 // Re-export the pure-Rust API types so cramjam-python's `libcramjam::xz::Format`
 // (etc.) imports keep working.
 pub use crate::xz_impl::options::{

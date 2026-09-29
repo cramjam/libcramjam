@@ -315,9 +315,12 @@ pub fn decode_frame_streaming(
         }
         p += 4;
     }
-    // Header checksum byte (we don't validate it — non-critical).
+    // Header checksum: byte 2 of xxhash32 over FLG..end of descriptor.
     if p >= input.len() {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "lz4: header checksum truncated"));
+    }
+    if (xxhash32(&input[4..p], 0) >> 8) as u8 != input[p] {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "lz4: header checksum mismatch"));
     }
     p += 1;
 
@@ -325,6 +328,7 @@ pub fn decode_frame_streaming(
         output.clear();
     }
     let out_start = output.len();
+    let mut content_hash = content_checksum.then(Xxh32::new);
     // Size the output once so the block decoder never has to grow it:
     // exact when the frame carries its content size, else amortised via
     // one block-max step per block.
@@ -365,17 +369,29 @@ pub fn decode_frame_streaming(
             if p + 4 > input.len() {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "lz4: block checksum truncated"));
             }
-            // We don't verify the per-block checksum (non-critical).
+            // xxhash32 of the block as stored (compressed or not).
+            if xxhash32(block_data, 0) != read_u32_le(input, p) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "lz4: block checksum mismatch"));
+            }
             p += 4;
         }
-        st.maybe_flush(output, |_| {})?;
+        st.maybe_flush(output, |flushed| {
+            if let Some(h) = content_hash.as_mut() {
+                h.update(flushed);
+            }
+        })?;
     }
 
     if content_checksum {
         if p + 4 > input.len() {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "lz4: content checksum truncated"));
         }
-        // We don't verify the content checksum (non-critical).
+        if let Some(h) = content_hash.as_mut() {
+            h.update(&output[out_start..]);
+            if h.finish() != read_u32_le(input, p) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "lz4: content checksum mismatch"));
+            }
+        }
         p += 4;
     }
 
@@ -393,8 +409,7 @@ pub fn decode_frame_streaming(
 }
 
 // =========================================================================
-// xxhash32 (used for the header checksum byte; we don't verify it on decode
-// but we do produce a correct one on encode).
+// xxhash32 (header, block and content checksums; verified on decode).
 // =========================================================================
 
 const PRIME32_1: u32 = 0x9E3779B1;

@@ -7,7 +7,8 @@
 
 use std::io;
 
-use super::options::{bcj_encode, split_chain, ResolvedFilter};
+use super::bcj::bcj_encode;
+use super::options::{split_chain, ResolvedFilter};
 
 pub(crate) fn encode_raw(input: &[u8], chain: &[ResolvedFilter], output: &mut Vec<u8>) -> io::Result<()> {
     let (bcj, last) = split_chain(chain)?;

@@ -198,6 +198,10 @@ pub fn decompress<W: Write + ?Sized, R: Read>(
     let mut sink = crate::SinkRef(output);
     crate::scratch_pair_with(|data, buf| {
         input.read_to_end(data)?;
+        if data.is_empty() {
+            // Not a stream; the C library rejects it too.
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "lz4: empty input"));
+        }
         let mut consumed = 0usize;
         let mut total = 0usize;
         while consumed < data.len() {

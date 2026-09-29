@@ -1,6 +1,8 @@
 //! bzip2 de/compression interface — pure Rust implementation.
 use std::io::{Error, Read, Write};
 
+pub const BACKEND: crate::Backend = crate::Backend::PureRust;
+
 /// Default compression level, matching C bzip2's default blockSize100k = 6.
 pub const DEFAULT_COMPRESSION_LEVEL: u32 = 6;
 
@@ -11,6 +13,10 @@ pub use crate::bzip2_impl::Bzip2StreamCompressor;
 pub fn decompress<W: Write + ?Sized, R: Read>(mut input: R, output: &mut W) -> Result<usize, Error> {
     let mut data = Vec::new();
     input.read_to_end(&mut data)?;
+    if data.is_empty() {
+        // Not a stream; libbzip2 rejects it too.
+        return Err(Error::new(std::io::ErrorKind::UnexpectedEof, "bzip2: empty input"));
+    }
     let mut sink = crate::SinkRef(output);
     crate::scratch_with(|buf| {
         let (_, produced) = crate::bzip2_impl::decode::decode_stream_streaming(&data, buf, Some(&mut sink))?;

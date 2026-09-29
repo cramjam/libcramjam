@@ -106,6 +106,10 @@ pub fn gzip_decompress<W: Write + ?Sized, R: Read>(
 ) -> io::Result<usize> {
     let mut data = Vec::new();
     input.read_to_end(&mut data)?;
+    if data.is_empty() {
+        // Not a stream; zlib/flate2 reject it too.
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "gzip: empty input"));
+    }
 
     // Use the ISIZE hint from the last 4 bytes of the gzip footer to pre-allocate.
     // For single-member streams this gives the exact size; for multi-member
@@ -123,23 +127,19 @@ pub fn gzip_decompress<W: Write + ?Sized, R: Read>(
 
     while pos < data.len() {
         // Header.
+        // Anything after a member must be another member, as with zlib /
+        // flate2's multi-member decoder (trailing garbage is an error).
         if data.len() - pos < 10 {
-            if pos == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "gzip: truncated header",
-                ));
-            }
-            break;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "gzip: truncated header",
+            ));
         }
         if data[pos] != 0x1F || data[pos + 1] != 0x8B {
-            if pos == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "gzip: invalid magic number",
-                ));
-            }
-            break;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "gzip: invalid magic number",
+            ));
         }
         if data[pos + 2] != 8 {
             return Err(io::Error::new(

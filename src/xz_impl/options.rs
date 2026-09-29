@@ -4,8 +4,24 @@
 //! the `xz2` crate so the cramjam Python wrapper can keep using the
 //! `libcramjam::xz::*` import paths it has today.  All types are pure-Rust
 //! enums and POD structs — no C bindings.
+//!
+//! This file is shared by both xz backends (the C one includes it with
+//! `#[path]`), so it must not depend on the rest of `xz_impl`.
 
 use std::io;
+
+/// xz filter ID for the x86 BCJ filter.
+pub const FILTER_X86: u64 = 0x04;
+/// xz filter ID for the PowerPC BCJ filter.
+pub const FILTER_POWERPC: u64 = 0x05;
+/// xz filter ID for the IA-64 (Itanium) BCJ filter.
+pub const FILTER_IA64: u64 = 0x06;
+/// xz filter ID for the ARM (32-bit) BCJ filter.
+pub const FILTER_ARM: u64 = 0x07;
+/// xz filter ID for the ARM-Thumb BCJ filter.
+pub const FILTER_ARMTHUMB: u64 = 0x08;
+/// xz filter ID for the SPARC BCJ filter.
+pub const FILTER_SPARC: u64 = 0x09;
 
 /// Top-level container format selector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -345,7 +361,6 @@ pub(crate) enum ResolvedFilter {
 
 impl Filter {
     pub(crate) fn bcj_id(self) -> Option<u64> {
-        use super::bcj::*;
         Some(match self {
             Filter::X86 => FILTER_X86,
             Filter::PowerPC => FILTER_POWERPC,
@@ -374,18 +389,4 @@ pub(crate) fn split_chain(chain: &[ResolvedFilter]) -> io::Result<(Vec<u64>, &Re
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "xz: filter chain must end with LZMA1/LZMA2"));
     }
     Ok((ids, last))
-}
-
-/// Run the BCJ encoders of `bcj` (chain order) over a copy of `input`, or
-/// hand back `input` itself when there are none.
-pub(crate) fn bcj_encode<'a>(input: &'a [u8], bcj: &[u64], scratch: &'a mut Vec<u8>) -> &'a [u8] {
-    if bcj.is_empty() {
-        return input;
-    }
-    scratch.clear();
-    scratch.extend_from_slice(input);
-    for &id in bcj {
-        super::bcj::apply(id, scratch, 0, true);
-    }
-    scratch
 }

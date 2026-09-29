@@ -19,8 +19,20 @@ mod huf;
 use std::io::{self, Read, Write};
 
 /// Default zstd compression level, matching C zstd's `ZSTD_defaultCLevel()` = 3.
-/// Level 0 emits raw blocks (store-only); levels >= 1 use entropy coding.
 pub const DEFAULT_COMPRESSION_LEVEL: i32 = 3;
+
+/// Map a public (libzstd-semantics) level to the encoder's: 0 means the
+/// default level and values above 22 clamp, as in `ZSTD_compressStream2`.
+/// Negative ("fast") levels aren't implemented; they use level 1, the
+/// fastest strategy we have (never the encoder's internal raw-block mode,
+/// which would silently store data uncompressed).
+pub(crate) fn api_level(level: i32) -> i32 {
+    match level {
+        0 => DEFAULT_COMPRESSION_LEVEL,
+        l if l < 0 => 1, // ponytail: approximates libzstd's negative levels; add an acceleration knob if anyone needs them
+        l => l.min(cparams::MAX_CLEVEL),
+    }
+}
 
 /// Decompress a zstd frame.
 pub fn decompress<W: Write + ?Sized, R: Read>(
@@ -30,6 +42,10 @@ pub fn decompress<W: Write + ?Sized, R: Read>(
     let mut sink = crate::SinkRef(output);
     crate::scratch_pair_with(|data, buf| {
         input.read_to_end(data)?;
+        if data.is_empty() {
+            // Not a stream; the C library rejects it too.
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "zstd: empty input"));
+        }
         let mut consumed = 0usize;
         let mut total = 0usize;
         while consumed < data.len() {
@@ -55,7 +71,7 @@ pub fn compress<W: Write + ?Sized, R: Read>(
     level: Option<i32>,
     input_size: Option<usize>,
 ) -> io::Result<usize> {
-    let level = level.unwrap_or(DEFAULT_COMPRESSION_LEVEL);
+    let level = api_level(level.unwrap_or(DEFAULT_COMPRESSION_LEVEL));
     crate::scratch_pair_with(|data, out| {
         if let Some(hint) = input_size {
             data.reserve(hint);
@@ -69,7 +85,7 @@ pub fn compress<W: Write + ?Sized, R: Read>(
 
 /// Compress a byte slice into a new `Vec` (no intermediate input copy).
 pub fn compress_bytes(input: &[u8], level: Option<i32>) -> Vec<u8> {
-    let level = level.unwrap_or(DEFAULT_COMPRESSION_LEVEL);
+    let level = api_level(level.unwrap_or(DEFAULT_COMPRESSION_LEVEL));
     encode::encode_frame(input, level, Some(input.len() as u64))
 }
 
@@ -93,7 +109,7 @@ pub struct ZstdStreamCompressor<W: Write = Vec<u8>> {
 impl<W: Write> ZstdStreamCompressor<W> {
     pub fn new(output: W, level: i32) -> io::Result<Self> {
         Ok(Self {
-            enc: encode::StreamEncoder::new(level),
+            enc: encode::StreamEncoder::new(api_level(level)),
             out: Vec::new(),
             output,
         })

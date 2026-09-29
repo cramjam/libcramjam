@@ -19,18 +19,8 @@
 //! stream — for one-shot block decode this is the BCJ filter's
 //! `start_offset` property (or 0 if not present).
 
-/// xz filter ID for the x86 BCJ filter.
-pub const FILTER_X86: u64 = 0x04;
-/// xz filter ID for the PowerPC BCJ filter.
-pub const FILTER_POWERPC: u64 = 0x05;
-/// xz filter ID for the IA-64 (Itanium) BCJ filter.
-pub const FILTER_IA64: u64 = 0x06;
-/// xz filter ID for the ARM (32-bit) BCJ filter.
-pub const FILTER_ARM: u64 = 0x07;
-/// xz filter ID for the ARM-Thumb BCJ filter.
-pub const FILTER_ARMTHUMB: u64 = 0x08;
-/// xz filter ID for the SPARC BCJ filter.
-pub const FILTER_SPARC: u64 = 0x09;
+// The filter ids live with the shared option types (also used by the C backend).
+pub use super::options::{FILTER_ARM, FILTER_ARMTHUMB, FILTER_IA64, FILTER_POWERPC, FILTER_SPARC, FILTER_X86};
 
 /// True iff `id` is a BCJ filter id.
 pub fn is_bcj(id: u64) -> bool {
@@ -393,4 +383,18 @@ mod tests {
             roundtrip(id, buf.clone());
         }
     }
+}
+
+/// Run the BCJ encoders of `bcj` (chain order) over a copy of `input`, or
+/// hand back `input` itself when there are none.
+pub(crate) fn bcj_encode<'a>(input: &'a [u8], bcj: &[u64], scratch: &'a mut Vec<u8>) -> &'a [u8] {
+    if bcj.is_empty() {
+        return input;
+    }
+    scratch.clear();
+    scratch.extend_from_slice(input);
+    for &id in bcj {
+        apply(id, scratch, 0, true);
+    }
+    scratch
 }

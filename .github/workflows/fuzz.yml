@@ -47,8 +47,9 @@ jobs:
         uses: ilammy/setup-nasm@v1
       - name: Install liblzma (full xz2 reference)
         run: sudo apt-get update && sudo apt-get install -y liblzma-dev
+      # The corpus_full tests compare the pure-Rust backend with the C crates.
       - name: Full-corpus cross-impl tests
-        run: cargo test -p libcramjam --release --tests -- --ignored
+        run: cargo test -p libcramjam --release --tests --no-default-features --features pure-rust,snappy,brotli -- --ignored
 
   fuzz:
     # Only spend CI minutes when explicitly requested, dispatched, or scheduled.
