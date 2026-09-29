@@ -4,6 +4,7 @@ version     = "0.9.1"
 edition     = "2021"
 license     = "MIT"
 description = "Compression library combining a plethora of algorithms in a similar as possible API"
+repository  = "https://github.com/cramjam/libcramjam"
 readme      = "README.md"
 # `benches/common.rs` is shared by all benches via #[path] include — it has no
 # `criterion_main!`, so we must opt out of auto-discovery and rely on the
