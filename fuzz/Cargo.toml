@@ -1,0 +1,81 @@
+[package]
+name = "libcramjam-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# Fuzzing targets the pure-Rust backend; the C crates below are the references.
+libcramjam = { path = "..", default-features = false, features = ["pure-rust"] }
+flate2 = "^1"
+zstd = "^0.13"
+lz4 = "^1"
+bzip2 = ">=0.4,<0.6"
+xz2 = "0.1.7"
+
+[[bin]]
+name = "dec_inflate"
+path = "fuzz_targets/dec_inflate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dec_zstd"
+path = "fuzz_targets/dec_zstd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dec_lz4_frame"
+path = "fuzz_targets/dec_lz4_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dec_lz4_block"
+path = "fuzz_targets/dec_lz4_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dec_bzip2"
+path = "fuzz_targets/dec_bzip2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dec_xz"
+path = "fuzz_targets/dec_xz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dec_into"
+path = "fuzz_targets/dec_into.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "enc_roundtrip"
+path = "fuzz_targets/enc_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "enc_stream"
+path = "fuzz_targets/enc_stream.rs"
+test = false
+doc = false
+bench = false
