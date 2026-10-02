@@ -293,7 +293,7 @@ impl HufTable {
                 refill!(a3, c3);
                 macro_rules! sym {
                     ($a:ident, $p:ident, $k:expr) => {{
-                        let e = unsafe { *table.add(($a >> shift) as usize) };
+                        let e = u16::from_le(unsafe { *table.add(($a >> shift) as usize) });
                         $a <<= e >> 8;
                         unsafe { *out_ptr.add($p + $k) = e as u8 };
                     }};

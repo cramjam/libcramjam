@@ -134,8 +134,6 @@ impl FseTable {
         let mut remaining = table_size as i32 + 1;
         let mut threshold = table_size as i32;
         let mut nb_bits = accuracy_log + 1;
-        #[cfg(test)]
-        eprintln!("[fse_init] accuracy_log={accuracy_log} table_size={table_size} remaining={remaining} threshold={threshold} nb_bits={nb_bits}");
         let mut weights: Vec<i16> = Vec::new();
         let max_sym = max_symbol as usize + 1;
 
@@ -176,10 +174,6 @@ impl FseTable {
 
             let prob = count - 1; // -1 means "less than 1"
             weights.push(prob as i16);
-
-            #[cfg(test)]
-            eprintln!("[fse] sym={} remaining={remaining} threshold={threshold} nb_bits={nb_bits} max_val={max_val} low={low} count={count} prob={prob}",
-                weights.len()-1);
 
             remaining -= if prob < 0 { 1 } else { prob as i32 };
 

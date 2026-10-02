@@ -160,6 +160,40 @@ jobs:
           matrix.backend == 'pure' && !matrix.capi && !matrix.codec && runner.os == 'Linux'
         run: cargo test -p libcramjam --release --test backend_contract --features pure-rust
 
+  # Big-endian coverage for the pure-Rust backend (s390x under qemu-user),
+  # with the C backends alongside as the contract reference — the default
+  # features plus `pure-rust`, as distro packagers build it (issue #35).
+  test-big-endian:
+    name: s390x-pure (big-endian)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_S390X_UNKNOWN_LINUX_GNU_LINKER: s390x-linux-gnu-gcc
+      CARGO_TARGET_S390X_UNKNOWN_LINUX_GNU_RUNNER: qemu-s390x -L /usr/s390x-linux-gnu
+      LIBCRAMJAM_EXPECT_BACKEND: pure
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: s390x-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        name: Rust Cache
+
+      - name: Install s390x cross toolchain and qemu
+        run: sudo apt-get update && sudo apt-get install -y gcc-s390x-linux-gnu libc6-dev-s390x-cross qemu-user
+
+      - name: Unit tests
+        run: cargo test -p libcramjam --lib --target s390x-unknown-linux-gnu --features pure-rust --no-fail-fast
+
+      # The default `xz` feature builds a vendored liblzma without the
+      # ARM/PowerPC/IA-64 BCJ filters, so those cross-impl tests can't run
+      # against it here (they fail with `Options` on x86_64 too).
+      - name: Integration tests (release)
+        if: ${{ !cancelled() }}
+        run: cargo test -p libcramjam --release --tests --target s390x-unknown-linux-gnu --features pure-rust --no-fail-fast -- --skip corpus_ --skip bcj_arm --skip bcj_ia64 --skip bcj_powerpc --skip bcj_encoders --skip x86_bcj_on_real
+
   # build-wasm32:
   #   runs-on: ubuntu-latest
   #   steps:

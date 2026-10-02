@@ -345,8 +345,9 @@ impl Deflater {
                     // Extend from byte 2 in 8-byte steps.
                     let mut len = 2usize;
                     while len + 8 <= max_len {
-                        let a = core::ptr::read_unaligned(scan.add(len) as *const u64);
-                        let b = core::ptr::read_unaligned(m.add(len) as *const u64);
+                        // from_le: trailing_zeros below must find the first differing byte.
+                        let a = u64::from_le(core::ptr::read_unaligned(scan.add(len) as *const u64));
+                        let b = u64::from_le(core::ptr::read_unaligned(m.add(len) as *const u64));
                         let x = a ^ b;
                         if x != 0 {
                             len += (x.trailing_zeros() >> 3) as usize;
