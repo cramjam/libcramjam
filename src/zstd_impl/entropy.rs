@@ -377,6 +377,11 @@ impl HufStream {
         // `nb_bits == 0` only happens on an empty join step; the two-step
         // shift avoids shifting by 64.
         let data = (self.container[0] >> 1) >> (63 - nb_bits);
+        // SAFETY: `dst` is the reserved tail of a `Vec` with
+        // `(n * table_log >> 3) + 32` bytes of capacity (see
+        // `huf_compress_1x`); the stream emits at most `n * table_log + 1`
+        // bits, so `pos` never exceeds the reservation minus the 8-byte
+        // store.
         unsafe {
             core::ptr::write_unaligned(self.dst.add(self.pos) as *mut u64, data.to_le());
         }
@@ -405,6 +410,10 @@ fn huf_compress_1x_loop<const K: usize>(bc: &mut HufStream, src: &[u8], elt: &[u
         n -= K;
     }
     while n > 0 {
+        // SAFETY: the two preambles above reduced `n` to a multiple of `2K`,
+        // so `n >= 2K` here and every `n - u` / `n - K - u` index is in
+        // `0..src.len()`; `elt` has 256 entries indexed by a byte.
+        // (Unchecked on purpose: this is the literal-encoding hot loop.)
         unsafe {
             for u in 1..=K {
                 bc.add(*elt.get_unchecked(*p.add(n - u) as usize), 0);
@@ -426,7 +435,9 @@ fn huf_compress_1x(out: &mut Vec<u8>, src: &[u8], ct: &HufCTable) -> usize {
     let n = src.len();
     out.reserve((n * ct.table_log as usize >> 3) + 32);
     let start = out.len();
-    let mut bc = HufStream { dst: unsafe { out.as_mut_ptr().add(start) }, pos: 0, container: [0; 2], bit_pos: [0; 2] };
+    // SAFETY: `start <= capacity`, so one-past-len is inside the allocation.
+    let dst = unsafe { out.as_mut_ptr().add(start) };
+    let mut bc = HufStream { dst, pos: 0, container: [0; 2], bit_pos: [0; 2] };
     match ct.table_log {
         11 | 10 => huf_compress_1x_loop::<5>(&mut bc, src, &ct.elt),
         9 => huf_compress_1x_loop::<6>(&mut bc, src, &ct.elt),
@@ -439,6 +450,9 @@ fn huf_compress_1x(out: &mut Vec<u8>, src: &[u8], ct: &HufCTable) -> usize {
     bc.flush();
     let total = bc.pos + (bc.bit_pos[0] > 0) as usize;
     debug_assert!(start + total <= out.capacity());
+    // SAFETY: every byte in `start..start + total` was stored by a
+    // `HufStream::flush` (8-byte stores at `pos`, covering the final partial
+    // byte), within the capacity reserved above.
     unsafe { out.set_len(start + total) };
     total
 }
@@ -864,7 +878,12 @@ fn encode_sequences(
 
     let sp = seqs.as_ptr();
     for n in (0..last).rev() {
-        // SAFETY: n < nb_seq and the code tables are nb_seq long.
+        // SAFETY: `n < nb_seq`, and `seqs` and the three code tables are
+        // `nb_seq` long; the codes index the 36/53-entry LL/ML tables by
+        // construction (`ll_code`/`ml_code`) and are in each CTable's
+        // alphabet with non-zero probability (the tables were built from
+        // these very codes), as `encode` requires. Unchecked on purpose:
+        // sequence-encoding hot loop.
         unsafe {
             let ll_c = *ll_codes.get_unchecked(n);
             let of_c = *of_codes.get_unchecked(n);

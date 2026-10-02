@@ -229,18 +229,17 @@ impl HuffmanDecoder {
     #[inline(always)]
     pub fn lookup<const MB: u32>(&self, reader: &BitReader) -> u32 {
         debug_assert_eq!(MB, self.main_bits);
-        // SAFETY: main table has `1 << MB` entries and `peek` masks to that
-        // width; a subtable pointer's start + (sub_bits-wide index) lies
-        // inside the exactly-sized subtable appended in `from_lengths`.
-        unsafe {
-            let mut e = *self.table.get_unchecked(reader.peek(MB) as usize);
-            if e & KIND_MASK == KIND_SUB << KIND_SHIFT {
-                let sub_bits = (e >> EXTRA_SHIFT) & EXTRA_MASK;
-                let idx = (reader.peek(MB + sub_bits) >> MB) as usize;
-                e = *self.table.get_unchecked((e >> 16) as usize + idx);
-            }
-            e
+        // The main table has `1 << MB` entries and `peek` masks to that
+        // width; a subtable's start + (sub_bits-wide index) lies inside the
+        // exactly-sized subtable appended in `from_lengths`. The bounds
+        // checks here measured as free (inflate is table-load bound).
+        let mut e = self.table[reader.peek(MB) as usize];
+        if e & KIND_MASK == KIND_SUB << KIND_SHIFT {
+            let sub_bits = (e >> EXTRA_SHIFT) & EXTRA_MASK;
+            let idx = (reader.peek(MB + sub_bits) >> MB) as usize;
+            e = self.table[(e >> 16) as usize + idx];
         }
+        e
     }
 
     /// Decode one symbol (checked; used for headers).  Returns the raw

@@ -55,18 +55,21 @@ pub const OUT_SLACK: usize = 64;
 /// and `dst - src >= 16` when the regions overlap.
 #[inline(always)]
 unsafe fn wildcopy32(mut src: *const u8, mut dst: *mut u8, length: usize) {
-    let end = unsafe { dst.add(length) };
-    loop {
-        unsafe {
+    // SAFETY: per the contract every 32-byte step reads/writes inside the
+    // `length + 32` windows, and with `dst - src >= 16` the two ordered
+    // 16-byte moves only read bytes written by earlier steps.
+    unsafe {
+        let end = dst.add(length);
+        loop {
             let a = core::ptr::read_unaligned(src as *const [u8; 16]);
             core::ptr::write_unaligned(dst as *mut [u8; 16], a);
             let b = core::ptr::read_unaligned(src.add(16) as *const [u8; 16]);
             core::ptr::write_unaligned(dst.add(16) as *mut [u8; 16], b);
             src = src.add(32);
             dst = dst.add(32);
-        }
-        if dst >= end {
-            return;
+            if dst >= end {
+                return;
+            }
         }
     }
 }
@@ -98,7 +101,6 @@ pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize>
 
     let start = output.len();
     let in_len = input.len();
-    let ibase = input.as_ptr();
     let mut ip = 0usize;
 
     let mut base = output.as_mut_ptr();
@@ -120,6 +122,7 @@ pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize>
     }
     macro_rules! fail {
         ($kind:expr, $msg:expr) => {{
+            // SAFETY: every byte in start..op has been written.
             unsafe { output.set_len(op) };
             return Err(io::Error::new($kind, $msg));
         }};
@@ -127,7 +130,7 @@ pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize>
 
     while ip < in_len {
         ensure_out!(0);
-        let token = unsafe { *ibase.add(ip) };
+        let token = input[ip];
         ip += 1;
 
         // -- Literal run --
@@ -140,7 +143,7 @@ pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize>
                 if ip >= in_len {
                     fail!(io::ErrorKind::UnexpectedEof, "lz4: unexpected end while reading literal length");
                 }
-                let b = unsafe { *ibase.add(ip) };
+                let b = input[ip];
                 ip += 1;
                 length += b as usize;
                 if b != 255 {
@@ -153,11 +156,15 @@ pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize>
                 // over-read 31 and the offset/ML are still in bounds.
                 // Very long runs (incompressible data) are cheaper as a
                 // real memcpy (rep movsb / AVX loops).
+                let src = &input[ip..ip + length + 32];
+                // SAFETY: `src` covers the literals plus the 31-byte
+                // over-read; `ensure_out!(length)` left `length + OUT_SLACK`
+                // writable bytes at `base + op`.
                 unsafe {
                     if length >= 1024 {
-                        core::ptr::copy_nonoverlapping(ibase.add(ip), base.add(op), length);
+                        core::ptr::copy_nonoverlapping(src.as_ptr(), base.add(op), length);
                     } else {
-                        wildcopy32(ibase.add(ip), base.add(op), length);
+                        wildcopy32(src.as_ptr(), base.add(op), length);
                     }
                 }
                 ip += length;
@@ -167,7 +174,10 @@ pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize>
                 if ip + length > in_len {
                     fail!(io::ErrorKind::UnexpectedEof, "lz4: literal run exceeds input");
                 }
-                unsafe { core::ptr::copy_nonoverlapping(ibase.add(ip), base.add(op), length) };
+                let src = &input[ip..ip + length];
+                // SAFETY: `ensure_out!(length)` left `length` writable bytes
+                // at `base + op`; `src` is a disjoint input slice.
+                unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), base.add(op), length) };
                 ip += length;
                 op += length;
                 if ip == in_len {
@@ -178,8 +188,12 @@ pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize>
         } else if ip + 17 <= in_len {
             // Literals ≤ 14 bytes: blind 16-byte copy, and the 2-byte offset
             // plus the match nibble are readable.
+            // SAFETY: `ip + 17 <= in_len` (checked just above) so 16 bytes
+            // are readable at `ip`; the loop-top `ensure_out!(0)` guarantees
+            // `OUT_SLACK` (64) writable bytes at `base + op`. (A checked
+            // `input[ip..ip + 16]` here cost ~5% of decode instructions.)
             unsafe {
-                let v = core::ptr::read_unaligned(ibase.add(ip) as *const [u8; 16]);
+                let v = core::ptr::read_unaligned(input.as_ptr().add(ip) as *const [u8; 16]);
                 core::ptr::write_unaligned(base.add(op) as *mut [u8; 16], v);
             }
             ip += length;
@@ -189,7 +203,10 @@ pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize>
             if ip + length > in_len {
                 fail!(io::ErrorKind::UnexpectedEof, "lz4: literal run exceeds input");
             }
-            unsafe { core::ptr::copy_nonoverlapping(ibase.add(ip), base.add(op), length) };
+            let src = &input[ip..ip + length];
+            // SAFETY: `length <= 14 < OUT_SLACK` writable bytes at
+            // `base + op` from the loop-top `ensure_out!(0)`.
+            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), base.add(op), length) };
             ip += length;
             op += length;
             if ip == in_len {
@@ -203,7 +220,11 @@ pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize>
         if !checked_tail && ip + 2 > in_len {
             fail!(io::ErrorKind::UnexpectedEof, "lz4: missing match offset");
         }
-        let offset = unsafe { u16::from_le_bytes([*ibase.add(ip), *ibase.add(ip + 1)]) } as usize;
+        // SAFETY: `ip + 2 <= in_len`, either by the check just above or
+        // because `checked_tail` came from a path that verified
+        // `ip + length + 32 <= in_len` / `ip + 17 <= in_len` before
+        // advancing `ip` by `length` (<= 14 on the latter).
+        let offset = unsafe { u16::from_le_bytes([byte_at(input, ip), byte_at(input, ip + 1)]) } as usize;
         ip += 2;
         // Rejects offset == 0 (wraps to usize::MAX) and offset > bytes produced.
         if offset.wrapping_sub(1) >= op {
@@ -215,7 +236,7 @@ pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize>
                 if ip >= in_len {
                     fail!(io::ErrorKind::UnexpectedEof, "lz4: unexpected end while reading match length");
                 }
-                let b = unsafe { *ibase.add(ip) };
+                let b = input[ip];
                 ip += 1;
                 ml += b as usize;
                 if b != 255 {
@@ -224,6 +245,9 @@ pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize>
             }
             ml += MIN_MATCH;
             ensure_out!(ml);
+            // SAFETY: `1 <= offset <= op` so the source is inside the
+            // written region; `ensure_out!(ml)` left `ml + OUT_SLACK`
+            // writable bytes for the copy and its <= 31-byte overshoot.
             unsafe {
                 let m = base.add(op - offset);
                 let d = base.add(op);
@@ -239,6 +263,8 @@ pub fn decompress_block(input: &[u8], output: &mut Vec<u8>) -> io::Result<usize>
             // `cap - op >= OUT_SLACK - 14 >= 33` here (loop-top invariant
             // minus the ≤14-byte literal), enough for 18 bytes or a
             // ≤18-byte match plus the kernel's 15-byte overshoot.
+            // SAFETY: see above; `1 <= offset <= op` keeps the source
+            // inside the written region.
             unsafe {
                 let m = base.add(op - offset);
                 let d = base.add(op);
@@ -295,11 +321,18 @@ const LZ4_64K_LIMIT: usize = 65_536 + MFLIMIT - 1;
 /// `LZ4_minLength`: smaller inputs are emitted as one literal run.
 const MIN_LENGTH: usize = MFLIMIT + 1;
 
+/// Hash table flavour for the fast parser. All three accessors are unchecked
+/// (a bounds check per access measured 4-7% on this loop).
+///
+/// # Safety
+/// `hash`: `pos + 8 <= input.len()` (u32 table) / `pos + 4 <= input.len()`
+/// (u16 table). `get`/`put`: `h` is a value returned by `hash` (so it is
+/// below the table size).
 trait FastTable {
     const U16: bool;
-    fn hash(input: &[u8], pos: usize) -> usize;
-    fn get(&self, h: usize) -> usize;
-    fn put(&mut self, h: usize, pos: usize);
+    unsafe fn hash(input: &[u8], pos: usize) -> usize;
+    unsafe fn get(&self, h: usize) -> usize;
+    unsafe fn put(&mut self, h: usize, pos: usize);
 }
 
 struct TableU32(Vec<u32>);
@@ -308,16 +341,19 @@ struct TableU16(Vec<u16>);
 impl FastTable for TableU32 {
     const U16: bool = false;
     #[inline(always)]
-    fn hash(input: &[u8], pos: usize) -> usize {
+    unsafe fn hash(input: &[u8], pos: usize) -> usize {
+        // SAFETY: per the trait contract.
         let seq = unsafe { read_u64(input, pos) };
         ((seq << 24).wrapping_mul(889_523_592_379) >> (64 - HASHLOG)) as usize
     }
     #[inline(always)]
-    fn get(&self, h: usize) -> usize {
+    unsafe fn get(&self, h: usize) -> usize {
+        // SAFETY: `hash` yields `HASHLOG`-bit values; the table has 2^HASHLOG entries.
         unsafe { *self.0.get_unchecked(h) as usize }
     }
     #[inline(always)]
-    fn put(&mut self, h: usize, pos: usize) {
+    unsafe fn put(&mut self, h: usize, pos: usize) {
+        // SAFETY: as in `get`.
         unsafe { *self.0.get_unchecked_mut(h) = pos as u32 }
     }
 }
@@ -325,16 +361,19 @@ impl FastTable for TableU32 {
 impl FastTable for TableU16 {
     const U16: bool = true;
     #[inline(always)]
-    fn hash(input: &[u8], pos: usize) -> usize {
+    unsafe fn hash(input: &[u8], pos: usize) -> usize {
+        // SAFETY: per the trait contract.
         let seq = unsafe { read_u32(input, pos) };
         (seq.wrapping_mul(2_654_435_761) >> (32 - (HASHLOG + 1))) as usize
     }
     #[inline(always)]
-    fn get(&self, h: usize) -> usize {
+    unsafe fn get(&self, h: usize) -> usize {
+        // SAFETY: `hash` yields `HASHLOG + 1`-bit values; the table has 2^(HASHLOG+1) entries.
         unsafe { *self.0.get_unchecked(h) as usize }
     }
     #[inline(always)]
-    fn put(&mut self, h: usize, pos: usize) {
+    unsafe fn put(&mut self, h: usize, pos: usize) {
+        // SAFETY: as in `get`.
         unsafe { *self.0.get_unchecked_mut(h) = pos as u16 }
     }
 }
@@ -416,10 +455,10 @@ fn compress_generic<T: FastTable>(
         let mflimit_plus_one = end - MFLIMIT + 1;
         let matchlimit = end - LAST_LITERALS;
 
-        // SAFETY (all get_unchecked / unaligned reads below): positions are
-        // kept below `mflimit_plus_one` (8-byte hashes end 3 bytes before
-        // `end`) or are table entries < the current position; the backward
-        // extension stops at `low_limit`/`anchor`.
+        // SAFETY: every unchecked read below is at a position kept below
+        // `mflimit_plus_one` (8-byte hashes end 3 bytes before `end`) or at
+        // a table entry < the current position; the backward extension
+        // stops at `low_limit`/`anchor`; table indices come from `hash`.
         unsafe {
             let mut ip = start;
             t.put(T::hash(input, ip), ip);
@@ -458,14 +497,14 @@ fn compress_generic<T: FastTable>(
 
                 // ---- Catch up ----
                 if match_pos > low_limit
-                    && *input.get_unchecked(ip - 1) == *input.get_unchecked(match_pos - 1)
+                    && byte_at(input, ip - 1) == byte_at(input, match_pos - 1)
                 {
                     loop {
                         ip -= 1;
                         match_pos -= 1;
                         if !(ip > anchor
                             && match_pos > low_limit
-                            && *input.get_unchecked(ip - 1) == *input.get_unchecked(match_pos - 1))
+                            && byte_at(input, ip - 1) == byte_at(input, match_pos - 1))
                         {
                             break;
                         }
@@ -513,32 +552,53 @@ fn compress_generic<T: FastTable>(
 
 
 /// Read a little-endian u32 from `buf` starting at byte position `pos`
-/// using a single unaligned load.
+/// using a single unaligned load. These unchecked reads are the encoders'
+/// one remaining kind of unsafe: a bounds check per hash/compare measured
+/// 4-7% on lz4 HC compress.
 ///
-/// SAFETY: caller must guarantee `pos + 4 <= buf.len()`.
+/// # Safety
+/// `pos + 4 <= buf.len()`.
 #[inline(always)]
 pub(super) unsafe fn read_u32(buf: &[u8], pos: usize) -> u32 {
     debug_assert!(pos + 4 <= buf.len());
-    std::ptr::read_unaligned(buf.as_ptr().add(pos) as *const u32).to_le()
+    // SAFETY: per the contract.
+    unsafe { std::ptr::read_unaligned(buf.as_ptr().add(pos) as *const u32).to_le() }
 }
 
 /// Read a little-endian u64 from `buf` starting at byte position `pos`
 /// using a single unaligned load.
 ///
-/// SAFETY: caller must guarantee `pos + 8 <= buf.len()`.
+/// # Safety
+/// `pos + 8 <= buf.len()`.
 #[inline(always)]
 pub(super) unsafe fn read_u64(buf: &[u8], pos: usize) -> u64 {
     debug_assert!(pos + 8 <= buf.len());
-    std::ptr::read_unaligned(buf.as_ptr().add(pos) as *const u64).to_le()
+    // SAFETY: per the contract.
+    unsafe { std::ptr::read_unaligned(buf.as_ptr().add(pos) as *const u64).to_le() }
+}
+
+/// Unchecked byte read.
+///
+/// # Safety
+/// `pos < buf.len()`.
+#[inline(always)]
+pub(super) unsafe fn byte_at(buf: &[u8], pos: usize) -> u8 {
+    debug_assert!(pos < buf.len());
+    // SAFETY: per the contract.
+    unsafe { *buf.get_unchecked(pos) }
 }
 
 /// Count how many consecutive bytes starting at `(input[ms..], input[is..])`
 /// are equal, stopping at `limit` (exclusive bound on `is`).  Reads 8 bytes
 /// at a time and finds the first differing byte via XOR + trailing-zero.
+/// `ms < is` and `limit <= input.len()` (both hold for every caller: `ms`
+/// is an earlier match position, `limit` is `matchlimit`).
 #[inline(always)]
 pub(super) fn count_match(input: &[u8], mut ms: usize, mut is: usize, limit: usize) -> usize {
+    debug_assert!(ms < is && limit <= input.len());
     let start = is;
     while is + 8 <= limit {
+        // SAFETY: `is + 8 <= limit <= input.len()` and `ms < is`.
         let diff = unsafe { read_u64(input, ms) ^ read_u64(input, is) };
         if diff == 0 {
             ms += 8;
@@ -547,7 +607,8 @@ pub(super) fn count_match(input: &[u8], mut ms: usize, mut is: usize, limit: usi
             return (is - start) + (diff.trailing_zeros() as usize >> 3);
         }
     }
-    while is < limit && unsafe { *input.get_unchecked(ms) == *input.get_unchecked(is) } {
+    // SAFETY: `is < limit <= input.len()` and `ms < is`.
+    while is < limit && unsafe { byte_at(input, ms) == byte_at(input, is) } {
         ms += 1;
         is += 1;
     }

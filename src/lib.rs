@@ -1,3 +1,7 @@
+// Every unsafe operation must sit in its own `unsafe {}` block with a
+// `// SAFETY:` comment, even inside `unsafe fn` (edition-2024 default).
+#![deny(unsafe_op_in_unsafe_fn)]
+
 #[cfg(any(
     feature = "blosc2",
     feature = "blosc2-static",

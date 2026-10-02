@@ -1,6 +1,10 @@
 //! Pure-Rust bzip2 implementation (RFC: bzip2 has no RFC, but the format is
 //! documented at <https://en.wikipedia.org/wiki/Bzip2#File_format> and the
 //! reference implementation is `libbzip2`).
+// Every `unsafe {}` block in the pure-Rust codecs carries a `// SAFETY:`
+// comment naming the invariant it relies on (checked by Miri in CI).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 
 pub mod bits;
 pub mod crc;

@@ -18,7 +18,7 @@
 //! blocks may match into the previous 64 KiB, which is what the reference
 //! encoder's default *linked* block mode does.
 
-use super::block::{compress_bound, count_match, emit_literal_only, emit_sequence, read_u32, read_u64};
+use super::block::{byte_at, compress_bound, count_match, emit_literal_only, emit_sequence, read_u32, read_u64};
 
 const MINMATCH: usize = 4;
 const MFLIMIT: usize = 12;
@@ -105,13 +105,16 @@ fn count_back(input: &[u8], ip: usize, mp: usize, i_min: usize, m_min: usize) ->
     let min = (ip - i_min).min(mp - m_min);
     let mut back = 0usize;
     while min - back > 3 {
+        // SAFETY: `back + 4 <= min <= ip, mp` so both reads start at >= 0
+        // and end before `ip`/`mp`, which are inside the input.
         let v = unsafe { read_u32(input, ip - back - 4) ^ read_u32(input, mp - back - 4) };
         if v != 0 {
             return back + (v.leading_zeros() >> 3) as usize;
         }
         back += 4;
     }
-    while back < min && unsafe { *input.get_unchecked(ip - back - 1) == *input.get_unchecked(mp - back - 1) } {
+    // SAFETY: `back < min <= ip, mp`.
+    while back < min && unsafe { byte_at(input, ip - back - 1) == byte_at(input, mp - back - 1) } {
         back += 1;
     }
     back
@@ -123,6 +126,7 @@ fn count_pattern(input: &[u8], mut ip: usize, i_end: usize, pattern32: u32) -> u
     let start = ip;
     let pattern = pattern32 as u64 | ((pattern32 as u64) << 32);
     while ip + 8 <= i_end {
+        // SAFETY: `ip + 8 <= i_end <= input.len()`.
         let diff = unsafe { read_u64(input, ip) } ^ pattern;
         if diff != 0 {
             return ip - start + (diff.trailing_zeros() >> 3) as usize;
@@ -141,6 +145,7 @@ fn count_pattern(input: &[u8], mut ip: usize, i_end: usize, pattern32: u32) -> u
 fn reverse_count_pattern(input: &[u8], mut ip: usize, i_low: usize, pattern: u32) -> usize {
     let start = ip;
     while ip >= i_low + 4 {
+        // SAFETY: `i_low <= ip - 4 < ip <= input.len()`.
         if unsafe { read_u32(input, ip - 4) } != pattern {
             break;
         }
@@ -178,6 +183,8 @@ impl HcCtx {
         while idx < target {
             // SAFETY: idx - HC_BASE < ip <= mflimit, so 4 bytes are readable.
             let h = hash_ptr(unsafe { read_u32(input, (idx - HC_BASE) as usize) });
+            // SAFETY: `h < HASH_SIZE == hash.len()` (hash_ptr keeps HASH_LOG
+            // bits) and `(idx & 0xFFFF) < CHAIN_SIZE == chain.len()`.
             unsafe {
                 let mut delta = idx - *hash.add(h);
                 if delta > DISTANCE_MAX {
@@ -193,6 +200,7 @@ impl HcCtx {
 
     #[inline(always)]
     fn delta(&self, idx: u32) -> u32 {
+        // SAFETY: `(idx & 0xFFFF) < CHAIN_SIZE == chain.len()`.
         unsafe { *self.chain.get_unchecked((idx & 0xFFFF) as usize) as u32 }
     }
 
@@ -218,6 +226,7 @@ impl HcCtx {
         let look_back = ip - i_low;
         let mut nb = max_attempts;
         let mut chain_pos: u32 = 0;
+        // SAFETY: `ip <= mflimit = block_end - 12`, so 4 bytes are readable.
         let pattern = unsafe { read_u32(input, ip) };
         let mut repeat: u8 = 0; // 0 untested, 1 not, 2 confirmed
         let mut src_pattern_len = 0usize;
@@ -241,6 +250,7 @@ impl HcCtx {
                 let b = input.as_ptr().add(mp.wrapping_sub(look_back).wrapping_add(longest - 1));
                 core::ptr::read_unaligned(a as *const u16) == core::ptr::read_unaligned(b as *const u16)
             };
+            // SAFETY: `mp < ip <= mflimit`, so 4 bytes are readable at `mp`.
             if same_tail && unsafe { read_u32(input, mp) } == pattern {
                 let back = if look_back != 0 { count_back(input, ip, mp, i_low, 0) } else { 0 };
                 let ml = MINMATCH + count_match(input, mp + MINMATCH, ip + MINMATCH, i_high) + back;
@@ -296,6 +306,7 @@ impl HcCtx {
                 }
                 if repeat == 2 && cand >= lowest {
                     let cmp = (cand - HC_BASE) as usize;
+                    // SAFETY: `cmp < mp < ip <= mflimit`.
                     if unsafe { read_u32(input, cmp) } == pattern {
                         let forward = count_pattern(input, cmp + 4, i_high, pattern) + 4;
                         let back_len = reverse_count_pattern(input, cmp, 0, pattern);
@@ -782,6 +793,7 @@ fn compress_mid(ctx: &mut HcCtx, input: &[u8], block_start: usize, block_end: us
         let match_dist: u32;
 
         // Long match candidate.
+        // SAFETY: `ip <= mflimit` (see above).
         let hh8 = mid_hash8(unsafe { read_u64(input, ip) });
         let pos8 = h8[hh8];
         h8[hh8] = ip_index;
@@ -795,6 +807,7 @@ fn compress_mid(ctx: &mut HcCtx, input: &[u8], block_start: usize, block_end: us
             }
         }
         // Short match candidate.
+        // SAFETY: `ip <= mflimit`.
         let hh4 = mid_hash4(unsafe { read_u32(input, ip) });
         let pos4 = h4[hh4];
         h4[hh4] = ip_index;
@@ -803,6 +816,7 @@ fn compress_mid(ctx: &mut HcCtx, input: &[u8], block_start: usize, block_end: us
             match_len = count_match(input, mp, ip, matchlimit);
             if match_len >= MINMATCH {
                 // Short match found; check ip+1 for a longer one.
+                // SAFETY: `ip + 1 + 8 <= mflimit + 9 < block_end`.
                 let hh8b = mid_hash8(unsafe { read_u64(input, ip + 1) });
                 let pos8b = h8[hh8b];
                 let m2_dist = (ip_index + 1).wrapping_sub(pos8b);
@@ -850,6 +864,8 @@ fn encode_mid(
         match_len += 1;
     }
     // Fill table with the beginning of the match.
+    // SAFETY: `*ip <= mflimit = block_end - 12`, so 8-byte loads at
+    // `ip + 1` and `ip + 2` stay inside the block.
     unsafe {
         h8[mid_hash8(read_u64(input, *ip + 1))] = ip_index + 1;
         h8[mid_hash8(read_u64(input, *ip + 2))] = ip_index + 2;
@@ -861,6 +877,8 @@ fn encode_mid(
     let pos_m2 = end_idx - 2;
     if pos_m2 < ilimit_idx {
         let p = *ip;
+        // SAFETY: `pos_m2 < ilimit_idx` means `p - 2 + 8 <= block_end`, and
+        // `p > 5` guards the earliest load.
         unsafe {
             if p > 5 {
                 h8[mid_hash8(read_u64(input, p - 5))] = end_idx - 5;

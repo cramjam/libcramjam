@@ -198,8 +198,10 @@ impl<'a> OutCursor<'a> {
         unsafe { self.vec.set_len(len) };
         self.vec.reserve((64 * 1024).max(OUT_HEADROOM));
         self.base = self.vec.as_mut_ptr();
-        // SAFETY: len <= capacity.
+        // SAFETY: `len <= capacity`, so both offsets stay within (or one
+        // past the end of) the Vec's allocation.
         self.op = unsafe { self.base.add(len) };
+        // SAFETY: as above.
         self.end = unsafe { self.base.add(self.vec.capacity()) };
     }
 
@@ -247,6 +249,7 @@ fn decode_block(
             e = lit_dec.lookup::<LITLEN_TABLE_BITS>(reader);
             reader.consume(e & LEN_MASK);
             if e & KIND_MASK == KIND_LITERAL << KIND_SHIFT {
+                // SAFETY: same headroom as the first literal above.
                 unsafe {
                     *out.op = (e >> 16) as u8;
                     out.op = out.op.add(1);
@@ -319,6 +322,9 @@ mod tests {
     }
 
     #[test]
+    // Every level over a large input: > 8 min under Miri; the small
+    // trailing-garbage and level tests cover the same paths.
+    #[cfg_attr(miri, ignore)]
     fn test_inflate_all_levels_with_trailing_garbage() {
         let mut data = Vec::new();
         for i in 0..50_000u32 {

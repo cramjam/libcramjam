@@ -40,6 +40,9 @@ impl<'a> BitCStream<'a> {
     pub fn flush(&mut self) {
         let nb_bytes = (self.bit_pos >> 3) as usize;
         debug_assert!(self.pos + 8 <= self.out.capacity());
+        // SAFETY: `new` reserved `max_bytes + 16` bytes past `start` and the
+        // caller writes at most `max_bytes` bytes, so `pos <= start +
+        // max_bytes` and the 8-byte store ends inside the allocation.
         unsafe {
             core::ptr::write_unaligned(self.out.as_mut_ptr().add(self.pos) as *mut u64, self.container.to_le());
         }
@@ -55,6 +58,9 @@ impl<'a> BitCStream<'a> {
         self.flush();
         let total = self.pos + (self.bit_pos > 0) as usize;
         debug_assert!(total <= self.out.capacity());
+        // SAFETY: every byte in `start..total` was stored by a `flush` (each
+        // one writes 8 bytes at `pos`, covering the partial byte counted in
+        // `total`), and `total <= capacity` per the `flush` invariant.
         unsafe { self.out.set_len(total) };
         total - self.start
     }
@@ -65,6 +71,7 @@ impl<'a> BitCStream<'a> {
         self.flush();
         let total = self.pos + (self.bit_pos > 0) as usize;
         debug_assert!(total <= self.out.capacity());
+        // SAFETY: as in `close`.
         unsafe { self.out.set_len(total) };
         total - self.start
     }
@@ -184,13 +191,22 @@ impl FseCTable {
     ///
     /// # Safety
     /// `symbol` must be within the table's alphabet and have non-zero
-    /// probability.
+    /// probability, and `state` must have come from `init_state` / a previous
+    /// `encode` with this table. (Unchecked on purpose: a bounds check here
+    /// measured ~4% on zstd L3 compression.)
     #[inline(always)]
     pub unsafe fn encode(&self, state: &mut FseCState, symbol: u8, bits: &mut BitCStream) {
+        debug_assert!((symbol as usize) < self.symbol_tt.len());
+        // SAFETY: `symbol` is in the alphabet (caller contract) and
+        // `symbol_tt` has one entry per alphabet symbol.
         let tt = unsafe { *self.symbol_tt.get_unchecked(symbol as usize) };
         let nb_bits_out = state.value.wrapping_add(tt.delta_nb_bits) >> 16;
         bits.add_bits(state.value, nb_bits_out);
         let idx = ((state.value >> nb_bits_out) as i32 + tt.delta_find_state) as usize;
+        debug_assert!(idx < self.state_table.len());
+        // SAFETY: `FSE_encodeSymbol` invariant — for a symbol with non-zero
+        // probability, `(state >> nb_bits_out) + delta_find_state` lands in
+        // that symbol's slice of `state_table` (built by `new`).
         state.value = unsafe { *self.state_table.get_unchecked(idx) } as u32;
     }
 

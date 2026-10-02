@@ -134,6 +134,9 @@ fn memcmplen(buf: &[u8], a: usize, b: usize, mut len: u32, limit: u32) -> u32 {
     debug_assert!(len <= limit);
     debug_assert!(a + limit as usize <= buf.len());
     let p = buf.as_ptr();
+    // SAFETY: `a + limit <= buf.len()` and `b < a`, so every read at
+    // `a + len` / `b + len` with `len + 8 <= limit` (or `len < limit` for the
+    // byte tail) is inside `buf`.
     unsafe {
         while len + 8 <= limit {
             // from_le: trailing_zeros below must find the first differing byte.
@@ -192,22 +195,12 @@ static CRC32_TABLE: [u32; 256] = {
     t
 };
 
-// SAFETY: `buf_ptr` is a plain view into memory the owner controls (the
-// streaming encoder's own `Vec`, or a one-shot input slice that outlives the
-// `Mf`); it carries no thread affinity and the owner re-points it with
-// `set_buf` after every change, so moving/sharing `Mf` across threads is no
-// different from moving the `Vec`. Needed so `XzStreamCompressor` stays
-// `Send + Sync` (pyo3 `#[pyclass]` in cramjam requires it).
-unsafe impl Send for Mf {}
-unsafe impl Sync for Mf {}
-
+/// The match finder does not hold the input buffer: every method that reads
+/// bytes takes it as `buf: &[u8]`, and the owner (the streaming driver's
+/// `Vec`, or a one-shot input slice) calls [`Mf::set_buf_len`] after every
+/// change so `write_pos` tracks `buf.len()`. That keeps `Mf` plain data
+/// (`Send + Sync` for free; `XzStreamCompressor` is a pyo3 `#[pyclass]`).
 pub struct Mf {
-    /// The input buffer. A raw view rather than a borrow so the streaming
-    /// driver can own, grow and slide the buffer between calls (it must
-    /// call [`Mf::set_buf`] after every change); the one-shot paths point
-    /// it at their input slice for the whole run.
-    buf_ptr: *const u8,
-    buf_len: usize,
     /// `buf[read_pos]` is the next byte to run through the match finder.
     read_pos: u32,
     /// Bytes run through the match finder but not yet encoded.
@@ -239,7 +232,8 @@ pub struct Mf {
 }
 
 impl Mf {
-    pub fn new(buf: &[u8], dict_size: u32, kind: MatchFinder, nice_len: u32, depth: u32) -> Self {
+    /// `buf_len` is the current length of the caller's input buffer.
+    pub fn new(buf_len: usize, dict_size: u32, kind: MatchFinder, nice_len: u32, depth: u32) -> Self {
         let hash_bytes: u32 = match kind {
             MatchFinder::BinaryTree2 => 2,
             MatchFinder::HashChain3 | MatchFinder::BinaryTree3 => 3,
@@ -285,12 +279,10 @@ impl Mf {
         };
 
         Self {
-            buf_ptr: buf.as_ptr(),
-            buf_len: buf.len(),
             read_pos: 0,
             read_ahead: 0,
             pending: 0,
-            write_pos: buf.len() as u32,
+            write_pos: buf_len as u32,
             offset: cyclic_size,
             hash: vec![EMPTY_HASH_VALUE; hash_count],
             // C leaves `son` uninitialized; zero is the empty marker anyway.
@@ -305,21 +297,10 @@ impl Mf {
         }
     }
 
-    /// The input buffer.
-    #[inline(always)]
-    fn buf(&self) -> &[u8] {
-        // SAFETY: `buf_ptr`/`buf_len` always describe the caller's live
-        // buffer (see `set_buf`); the one-shot paths never change it and
-        // the streaming driver refreshes it before every call.
-        unsafe { core::slice::from_raw_parts(self.buf_ptr, self.buf_len) }
-    }
-
-    /// Point the match finder at (the current version of) its input
-    /// buffer; `write_pos` becomes its length.
-    pub fn set_buf(&mut self, buf: &[u8]) {
-        self.buf_ptr = buf.as_ptr();
-        self.buf_len = buf.len();
-        self.write_pos = buf.len() as u32;
+    /// Tell the match finder the input buffer's current length (the
+    /// streaming driver grows/slides its `Vec` between calls).
+    pub fn set_buf_len(&mut self, len: usize) {
+        self.write_pos = len as u32;
     }
 
     #[inline(always)]
@@ -354,18 +335,18 @@ impl Mf {
     /// `fill_window`'s restart after a sync flush: bytes consumed by
     /// `move_pending` are rewound and run through the hash so later data
     /// can match against them. Doesn't touch `read_ahead`.
-    pub fn rehash_pending(&mut self, read_limit: u32) {
+    pub fn rehash_pending(&mut self, buf: &[u8], read_limit: u32) {
         if self.pending > 0 && self.read_pos < read_limit {
             let pending = self.pending;
             self.pending = 0;
             debug_assert!(self.read_pos >= pending);
             self.read_pos -= pending;
             match self.kind {
-                MatchFinder::HashChain3 => self.hc3_skip(pending),
-                MatchFinder::HashChain4 => self.hc4_skip(pending),
-                MatchFinder::BinaryTree2 => self.bt2_skip(pending),
-                MatchFinder::BinaryTree3 => self.bt3_skip(pending),
-                MatchFinder::BinaryTree4 => self.bt4_skip(pending),
+                MatchFinder::HashChain3 => self.hc3_skip(buf, pending),
+                MatchFinder::HashChain4 => self.hc4_skip(buf, pending),
+                MatchFinder::BinaryTree2 => self.bt2_skip(buf, pending),
+                MatchFinder::BinaryTree3 => self.bt3_skip(buf, pending),
+                MatchFinder::BinaryTree4 => self.bt4_skip(buf, pending),
             }
         }
     }
@@ -433,13 +414,11 @@ impl Mf {
         }
     }
 
-    /// SAFETY (hash3/hash4): callers check `avail() >= 3 / 4` first, so
-    /// `cur + 2 / cur + 3 < write_pos == buf.len()`.
+    /// Callers check `avail() >= 3 / 4` first, so the 3/4-byte window is in
+    /// bounds and the slice check below is a single never-taken branch.
     #[inline(always)]
-    fn hash3(&self, cur: usize) -> (u32, u32) {
-        debug_assert!(cur + 3 <= self.buf().len());
-        let b = self.buf().as_ptr();
-        let (b0, b1, b2) = unsafe { (*b.add(cur), *b.add(cur + 1), *b.add(cur + 2)) };
+    fn hash3(&self, buf: &[u8], cur: usize) -> (u32, u32) {
+        let [b0, b1, b2] = buf[cur..cur + 3] else { unreachable!() };
         let temp = CRC32_TABLE[b0 as usize] ^ b1 as u32;
         let h2 = temp & HASH_2_MASK;
         let hv = (temp ^ ((b2 as u32) << 8)) & self.hash_mask;
@@ -447,10 +426,8 @@ impl Mf {
     }
 
     #[inline(always)]
-    fn hash4(&self, cur: usize) -> (u32, u32, u32) {
-        debug_assert!(cur + 4 <= self.buf().len());
-        let b = self.buf().as_ptr();
-        let (b0, b1, b2, b3) = unsafe { (*b.add(cur), *b.add(cur + 1), *b.add(cur + 2), *b.add(cur + 3)) };
+    fn hash4(&self, buf: &[u8], cur: usize) -> (u32, u32, u32) {
+        let [b0, b1, b2, b3] = buf[cur..cur + 4] else { unreachable!() };
         let temp = CRC32_TABLE[b0 as usize] ^ b1 as u32;
         let h2 = temp & HASH_2_MASK;
         let h3 = (temp ^ ((b2 as u32) << 8)) & HASH_3_MASK;
@@ -461,13 +438,13 @@ impl Mf {
     /// `lzma_mf_find`: matches for the current byte (sorted by increasing
     /// length, the last one is the longest), then advance. Returns the
     /// longest length (extended past `nice_len` when it hit it).
-    pub fn find(&mut self, matches: &mut [Match; MATCH_LEN_MAX as usize + 1]) -> (u32, usize) {
+    pub fn find(&mut self, buf: &[u8], matches: &mut [Match; MATCH_LEN_MAX as usize + 1]) -> (u32, usize) {
         let count = match self.kind {
-            MatchFinder::HashChain3 => self.hc3_find(matches),
-            MatchFinder::HashChain4 => self.hc4_find(matches),
-            MatchFinder::BinaryTree2 => self.bt2_find(matches),
-            MatchFinder::BinaryTree3 => self.bt3_find(matches),
-            MatchFinder::BinaryTree4 => self.bt4_find(matches),
+            MatchFinder::HashChain3 => self.hc3_find(buf, matches),
+            MatchFinder::HashChain4 => self.hc4_find(buf, matches),
+            MatchFinder::BinaryTree2 => self.bt2_find(buf, matches),
+            MatchFinder::BinaryTree3 => self.bt3_find(buf, matches),
+            MatchFinder::BinaryTree4 => self.bt4_find(buf, matches),
         };
         let mut len_best = 0;
         if count > 0 {
@@ -479,7 +456,7 @@ impl Mf {
                 }
                 let p1 = self.read_pos as usize - 1;
                 let p2 = p1 - matches[count - 1].dist as usize - 1;
-                len_best = memcmplen(self.buf(), p1, p2, len_best, limit);
+                len_best = memcmplen(buf, p1, p2, len_best, limit);
             }
         }
         self.read_ahead += 1;
@@ -487,14 +464,14 @@ impl Mf {
     }
 
     /// `mf_skip`.
-    pub fn skip(&mut self, amount: u32) {
+    pub fn skip(&mut self, buf: &[u8], amount: u32) {
         if amount != 0 {
             match self.kind {
-                MatchFinder::HashChain3 => self.hc3_skip(amount),
-                MatchFinder::HashChain4 => self.hc4_skip(amount),
-                MatchFinder::BinaryTree2 => self.bt2_skip(amount),
-                MatchFinder::BinaryTree3 => self.bt3_skip(amount),
-                MatchFinder::BinaryTree4 => self.bt4_skip(amount),
+                MatchFinder::HashChain3 => self.hc3_skip(buf, amount),
+                MatchFinder::HashChain4 => self.hc4_skip(buf, amount),
+                MatchFinder::BinaryTree2 => self.bt2_skip(buf, amount),
+                MatchFinder::BinaryTree3 => self.bt3_skip(buf, amount),
+                MatchFinder::BinaryTree4 => self.bt4_skip(buf, amount),
             }
             self.read_ahead += amount;
         }
@@ -504,6 +481,7 @@ impl Mf {
 
     fn hc_find_func(
         &mut self,
+        buf: &[u8],
         len_limit: u32,
         pos: u32,
         cur: usize,
@@ -516,12 +494,14 @@ impl Mf {
         let cyclic_size = self.cyclic_size;
         let mut depth = self.depth;
         let min_valid = self.min_valid_pos;
+        let son = self.son.as_mut_ptr();
+        let b = buf.as_ptr();
         // SAFETY: son indices are reduced modulo cyclic_size (son.len() ==
         // cyclic_size for hash chains); `delta < cyclic_size <= pos` keeps
         // `pb` inside the buffer, and `len_best < len_limit <= avail` keeps
-        // `cur + len_best < buf.len()`.
-        let son = self.son.as_mut_ptr();
-        let b = self.buf().as_ptr();
+        // `cur + len_best < buf.len()`. `count` never exceeds the number of
+        // distinct lengths in `1..=len_limit <= MATCH_LEN_MAX`, so the
+        // `matches` write is in bounds.
         unsafe {
             *son.add(cyclic_pos as usize) = cur_match;
             loop {
@@ -533,7 +513,7 @@ impl Mf {
                 let pb = cur - delta as usize;
                 cur_match = *son.add(cyclic_pos.wrapping_sub(delta).wrapping_add(if delta > cyclic_pos { cyclic_size } else { 0 }) as usize);
                 if *b.add(pb + len_best as usize) == *b.add(cur + len_best as usize) && *b.add(pb) == *b.add(cur) {
-                    let len = memcmplen(self.buf(), cur, pb, 1, len_limit);
+                    let len = memcmplen(buf, cur, pb, 1, len_limit);
                     if len_best < len {
                         len_best = len;
                         *matches.get_unchecked_mut(count) = Match { len, dist: delta - 1 };
@@ -554,11 +534,11 @@ impl Mf {
     }
 
     #[inline]
-    fn hc3_find(&mut self, matches: &mut [Match; MATCH_LEN_MAX as usize + 1]) -> usize {
+    fn hc3_find(&mut self, buf: &[u8], matches: &mut [Match; MATCH_LEN_MAX as usize + 1]) -> usize {
         let Some(len_limit) = self.len_limit(3) else { return 0 };
         let cur = self.read_pos as usize;
         let pos = self.read_pos + self.offset;
-        let (h2, hv) = self.hash3(cur);
+        let (h2, hv) = self.hash3(buf, cur);
         let delta2 = pos.wrapping_sub(self.hash[h2 as usize]);
         let cur_match = self.hash[(FIX_3_HASH_SIZE + hv) as usize];
         self.hash[h2 as usize] = pos;
@@ -566,8 +546,8 @@ impl Mf {
 
         let mut len_best = 2;
         let mut count = 0usize;
-        if delta2 < self.cyclic_size && self.buf()[cur - delta2 as usize] == self.buf()[cur] {
-            len_best = memcmplen(self.buf(), cur, cur - delta2 as usize, len_best, len_limit);
+        if delta2 < self.cyclic_size && buf[cur - delta2 as usize] == buf[cur] {
+            len_best = memcmplen(buf, cur, cur - delta2 as usize, len_best, len_limit);
             matches[0] = Match { len: len_best, dist: delta2 - 1 };
             count = 1;
             if len_best == len_limit {
@@ -575,20 +555,20 @@ impl Mf {
                 return 1;
             }
         }
-        let n = self.hc_find_func(len_limit, pos, cur, cur_match, matches, count, len_best);
+        let n = self.hc_find_func(buf, len_limit, pos, cur, cur_match, matches, count, len_best);
         self.move_pos();
         n
     }
 
     #[inline]
-    fn hc3_skip(&mut self, mut amount: u32) {
+    fn hc3_skip(&mut self, buf: &[u8], mut amount: u32) {
         loop {
             if self.avail() < 3 {
                 self.move_pending();
             } else {
                 let cur = self.read_pos as usize;
                 let pos = self.read_pos + self.offset;
-                let (h2, hv) = self.hash3(cur);
+                let (h2, hv) = self.hash3(buf, cur);
                 let cur_match = self.hash[(FIX_3_HASH_SIZE + hv) as usize];
                 self.hash[h2 as usize] = pos;
                 self.hash[(FIX_3_HASH_SIZE + hv) as usize] = pos;
@@ -602,11 +582,11 @@ impl Mf {
     }
 
     #[inline]
-    fn hc4_find(&mut self, matches: &mut [Match; MATCH_LEN_MAX as usize + 1]) -> usize {
+    fn hc4_find(&mut self, buf: &[u8], matches: &mut [Match; MATCH_LEN_MAX as usize + 1]) -> usize {
         let Some(len_limit) = self.len_limit(4) else { return 0 };
         let cur = self.read_pos as usize;
         let pos = self.read_pos + self.offset;
-        let (h2, h3, hv) = self.hash4(cur);
+        let (h2, h3, hv) = self.hash4(buf, cur);
         let mut delta2 = pos.wrapping_sub(self.hash[h2 as usize]);
         let delta3 = pos.wrapping_sub(self.hash[(FIX_3_HASH_SIZE + h3) as usize]);
         let cur_match = self.hash[(FIX_4_HASH_SIZE + hv) as usize];
@@ -616,19 +596,19 @@ impl Mf {
 
         let mut len_best = 1;
         let mut count = 0usize;
-        if delta2 < self.cyclic_size && self.buf()[cur - delta2 as usize] == self.buf()[cur] {
+        if delta2 < self.cyclic_size && buf[cur - delta2 as usize] == buf[cur] {
             len_best = 2;
             matches[0] = Match { len: 2, dist: delta2 - 1 };
             count = 1;
         }
-        if delta2 != delta3 && delta3 < self.cyclic_size && self.buf()[cur - delta3 as usize] == self.buf()[cur] {
+        if delta2 != delta3 && delta3 < self.cyclic_size && buf[cur - delta3 as usize] == buf[cur] {
             len_best = 3;
             matches[count].dist = delta3 - 1;
             count += 1;
             delta2 = delta3;
         }
         if count != 0 {
-            len_best = memcmplen(self.buf(), cur, cur - delta2 as usize, len_best, len_limit);
+            len_best = memcmplen(buf, cur, cur - delta2 as usize, len_best, len_limit);
             matches[count - 1].len = len_best;
             if len_best == len_limit {
                 self.hc_skip_one(cur_match);
@@ -638,20 +618,20 @@ impl Mf {
         if len_best < 3 {
             len_best = 3;
         }
-        let n = self.hc_find_func(len_limit, pos, cur, cur_match, matches, count, len_best);
+        let n = self.hc_find_func(buf, len_limit, pos, cur, cur_match, matches, count, len_best);
         self.move_pos();
         n
     }
 
     #[inline]
-    fn hc4_skip(&mut self, mut amount: u32) {
+    fn hc4_skip(&mut self, buf: &[u8], mut amount: u32) {
         loop {
             if self.avail() < 4 {
                 self.move_pending();
             } else {
                 let cur = self.read_pos as usize;
                 let pos = self.read_pos + self.offset;
-                let (h2, h3, hv) = self.hash4(cur);
+                let (h2, h3, hv) = self.hash4(buf, cur);
                 let cur_match = self.hash[(FIX_4_HASH_SIZE + hv) as usize];
                 self.hash[h2 as usize] = pos;
                 self.hash[(FIX_3_HASH_SIZE + h3) as usize] = pos;
@@ -669,6 +649,7 @@ impl Mf {
 
     fn bt_find_func(
         &mut self,
+        buf: &[u8],
         len_limit: u32,
         pos: u32,
         cur: usize,
@@ -681,15 +662,15 @@ impl Mf {
         let cyclic_size = self.cyclic_size;
         let mut depth = self.depth;
         let min_valid = self.min_valid_pos;
-        // SAFETY: as in `hc_find_func`; son.len() == 2 * cyclic_size here and
-        // every index is `2 * (x mod cyclic_size) + {0, 1}`. `len < len_limit`
-        // whenever `b[.. + len]` is read (a full-length match returns).
         let son = self.son.as_mut_ptr();
-        let b = self.buf().as_ptr();
+        let b = buf.as_ptr();
         let mut ptr0 = ((cyclic_pos as usize) << 1) + 1;
         let mut ptr1 = (cyclic_pos as usize) << 1;
         let mut len0 = 0u32;
         let mut len1 = 0u32;
+        // SAFETY: as in `hc_find_func`; son.len() == 2 * cyclic_size here and
+        // every index is `2 * (x mod cyclic_size) + {0, 1}`. `len < len_limit`
+        // whenever `b[.. + len]` is read (a full-length match returns).
         unsafe {
             loop {
                 let delta = pos.wrapping_sub(cur_match);
@@ -703,7 +684,7 @@ impl Mf {
                 let pb = cur - delta as usize;
                 let mut len = len0.min(len1);
                 if *b.add(pb + len as usize) == *b.add(cur + len as usize) {
-                    len = memcmplen(self.buf(), cur, pb, len + 1, len_limit);
+                    len = memcmplen(buf, cur, pb, len + 1, len_limit);
                     if len_best < len {
                         len_best = len;
                         *matches.get_unchecked_mut(count) = Match { len, dist: delta - 1 };
@@ -730,18 +711,18 @@ impl Mf {
         }
     }
 
-    fn bt_skip_func(&mut self, len_limit: u32, pos: u32, cur: usize, mut cur_match: u32) {
+    fn bt_skip_func(&mut self, buf: &[u8], len_limit: u32, pos: u32, cur: usize, mut cur_match: u32) {
         let cyclic_pos = self.cyclic_pos;
         let cyclic_size = self.cyclic_size;
         let mut depth = self.depth;
         let min_valid = self.min_valid_pos;
-        // SAFETY: see `bt_find_func`.
         let son = self.son.as_mut_ptr();
-        let b = self.buf().as_ptr();
+        let b = buf.as_ptr();
         let mut ptr0 = ((cyclic_pos as usize) << 1) + 1;
         let mut ptr1 = (cyclic_pos as usize) << 1;
         let mut len0 = 0u32;
         let mut len1 = 0u32;
+        // SAFETY: see `bt_find_func`.
         unsafe {
             loop {
                 let delta = pos.wrapping_sub(cur_match);
@@ -755,7 +736,7 @@ impl Mf {
                 let pb = cur - delta as usize;
                 let mut len = len0.min(len1);
                 if *b.add(pb + len as usize) == *b.add(cur + len as usize) {
-                    len = memcmplen(self.buf(), cur, pb, len + 1, len_limit);
+                    len = memcmplen(buf, cur, pb, len + 1, len_limit);
                     if len == len_limit {
                         *son.add(ptr1) = *son.add(pair);
                         *son.add(ptr0) = *son.add(pair + 1);
@@ -778,33 +759,33 @@ impl Mf {
     }
 
     #[inline(always)]
-    fn hash2(&self, cur: usize) -> u32 {
-        (self.buf()[cur] as u32) | ((self.buf()[cur + 1] as u32) << 8)
+    fn hash2(&self, buf: &[u8], cur: usize) -> u32 {
+        (buf[cur] as u32) | ((buf[cur + 1] as u32) << 8)
     }
 
     #[inline]
-    fn bt2_find(&mut self, matches: &mut [Match; MATCH_LEN_MAX as usize + 1]) -> usize {
+    fn bt2_find(&mut self, buf: &[u8], matches: &mut [Match; MATCH_LEN_MAX as usize + 1]) -> usize {
         let Some(len_limit) = self.len_limit(2) else { return 0 };
         let cur = self.read_pos as usize;
         let pos = self.read_pos + self.offset;
-        let hv = self.hash2(cur);
+        let hv = self.hash2(buf, cur);
         let cur_match = self.hash[hv as usize];
         self.hash[hv as usize] = pos;
-        let n = self.bt_find_func(len_limit, pos, cur, cur_match, matches, 0, 1);
+        let n = self.bt_find_func(buf, len_limit, pos, cur, cur_match, matches, 0, 1);
         self.move_pos();
         n
     }
 
     #[inline]
-    fn bt2_skip(&mut self, mut amount: u32) {
+    fn bt2_skip(&mut self, buf: &[u8], mut amount: u32) {
         loop {
             if let Some(len_limit) = self.len_limit(2) {
                 let cur = self.read_pos as usize;
                 let pos = self.read_pos + self.offset;
-                let hv = self.hash2(cur);
+                let hv = self.hash2(buf, cur);
                 let cur_match = self.hash[hv as usize];
                 self.hash[hv as usize] = pos;
-                self.bt_skip_func(len_limit, pos, cur, cur_match);
+                self.bt_skip_func(buf, len_limit, pos, cur, cur_match);
                 self.move_pos();
             }
             amount -= 1;
@@ -815,11 +796,11 @@ impl Mf {
     }
 
     #[inline]
-    fn bt3_find(&mut self, matches: &mut [Match; MATCH_LEN_MAX as usize + 1]) -> usize {
+    fn bt3_find(&mut self, buf: &[u8], matches: &mut [Match; MATCH_LEN_MAX as usize + 1]) -> usize {
         let Some(len_limit) = self.len_limit(3) else { return 0 };
         let cur = self.read_pos as usize;
         let pos = self.read_pos + self.offset;
-        let (h2, hv) = self.hash3(cur);
+        let (h2, hv) = self.hash3(buf, cur);
         let delta2 = pos.wrapping_sub(self.hash[h2 as usize]);
         let cur_match = self.hash[(FIX_3_HASH_SIZE + hv) as usize];
         self.hash[h2 as usize] = pos;
@@ -827,32 +808,32 @@ impl Mf {
 
         let mut len_best = 2;
         let mut count = 0usize;
-        if delta2 < self.cyclic_size && self.buf()[cur - delta2 as usize] == self.buf()[cur] {
-            len_best = memcmplen(self.buf(), cur, cur - delta2 as usize, len_best, len_limit);
+        if delta2 < self.cyclic_size && buf[cur - delta2 as usize] == buf[cur] {
+            len_best = memcmplen(buf, cur, cur - delta2 as usize, len_best, len_limit);
             matches[0] = Match { len: len_best, dist: delta2 - 1 };
             count = 1;
             if len_best == len_limit {
-                self.bt_skip_func(len_limit, pos, cur, cur_match);
+                self.bt_skip_func(buf, len_limit, pos, cur, cur_match);
                 self.move_pos();
                 return 1;
             }
         }
-        let n = self.bt_find_func(len_limit, pos, cur, cur_match, matches, count, len_best);
+        let n = self.bt_find_func(buf, len_limit, pos, cur, cur_match, matches, count, len_best);
         self.move_pos();
         n
     }
 
     #[inline]
-    fn bt3_skip(&mut self, mut amount: u32) {
+    fn bt3_skip(&mut self, buf: &[u8], mut amount: u32) {
         loop {
             if let Some(len_limit) = self.len_limit(3) {
                 let cur = self.read_pos as usize;
                 let pos = self.read_pos + self.offset;
-                let (h2, hv) = self.hash3(cur);
+                let (h2, hv) = self.hash3(buf, cur);
                 let cur_match = self.hash[(FIX_3_HASH_SIZE + hv) as usize];
                 self.hash[h2 as usize] = pos;
                 self.hash[(FIX_3_HASH_SIZE + hv) as usize] = pos;
-                self.bt_skip_func(len_limit, pos, cur, cur_match);
+                self.bt_skip_func(buf, len_limit, pos, cur, cur_match);
                 self.move_pos();
             }
             amount -= 1;
@@ -863,11 +844,11 @@ impl Mf {
     }
 
     #[inline]
-    fn bt4_find(&mut self, matches: &mut [Match; MATCH_LEN_MAX as usize + 1]) -> usize {
+    fn bt4_find(&mut self, buf: &[u8], matches: &mut [Match; MATCH_LEN_MAX as usize + 1]) -> usize {
         let Some(len_limit) = self.len_limit(4) else { return 0 };
         let cur = self.read_pos as usize;
         let pos = self.read_pos + self.offset;
-        let (h2, h3, hv) = self.hash4(cur);
+        let (h2, h3, hv) = self.hash4(buf, cur);
         let mut delta2 = pos.wrapping_sub(self.hash[h2 as usize]);
         let delta3 = pos.wrapping_sub(self.hash[(FIX_3_HASH_SIZE + h3) as usize]);
         let cur_match = self.hash[(FIX_4_HASH_SIZE + hv) as usize];
@@ -877,22 +858,22 @@ impl Mf {
 
         let mut len_best = 1;
         let mut count = 0usize;
-        if delta2 < self.cyclic_size && self.buf()[cur - delta2 as usize] == self.buf()[cur] {
+        if delta2 < self.cyclic_size && buf[cur - delta2 as usize] == buf[cur] {
             len_best = 2;
             matches[0] = Match { len: 2, dist: delta2 - 1 };
             count = 1;
         }
-        if delta2 != delta3 && delta3 < self.cyclic_size && self.buf()[cur - delta3 as usize] == self.buf()[cur] {
+        if delta2 != delta3 && delta3 < self.cyclic_size && buf[cur - delta3 as usize] == buf[cur] {
             len_best = 3;
             matches[count].dist = delta3 - 1;
             count += 1;
             delta2 = delta3;
         }
         if count != 0 {
-            len_best = memcmplen(self.buf(), cur, cur - delta2 as usize, len_best, len_limit);
+            len_best = memcmplen(buf, cur, cur - delta2 as usize, len_best, len_limit);
             matches[count - 1].len = len_best;
             if len_best == len_limit {
-                self.bt_skip_func(len_limit, pos, cur, cur_match);
+                self.bt_skip_func(buf, len_limit, pos, cur, cur_match);
                 self.move_pos();
                 return count;
             }
@@ -900,23 +881,23 @@ impl Mf {
         if len_best < 3 {
             len_best = 3;
         }
-        let n = self.bt_find_func(len_limit, pos, cur, cur_match, matches, count, len_best);
+        let n = self.bt_find_func(buf, len_limit, pos, cur, cur_match, matches, count, len_best);
         self.move_pos();
         n
     }
 
     #[inline]
-    fn bt4_skip(&mut self, mut amount: u32) {
+    fn bt4_skip(&mut self, buf: &[u8], mut amount: u32) {
         loop {
             if let Some(len_limit) = self.len_limit(4) {
                 let cur = self.read_pos as usize;
                 let pos = self.read_pos + self.offset;
-                let (h2, h3, hv) = self.hash4(cur);
+                let (h2, h3, hv) = self.hash4(buf, cur);
                 let cur_match = self.hash[(FIX_4_HASH_SIZE + hv) as usize];
                 self.hash[h2 as usize] = pos;
                 self.hash[(FIX_3_HASH_SIZE + h3) as usize] = pos;
                 self.hash[(FIX_4_HASH_SIZE + hv) as usize] = pos;
-                self.bt_skip_func(len_limit, pos, cur, cur_match);
+                self.bt_skip_func(buf, len_limit, pos, cur, cur_match);
                 self.move_pos();
             }
             amount -= 1;
@@ -1306,7 +1287,7 @@ impl Lzma1Encoder {
         if mf.read_pos == mf.write_pos {
             // Empty input: nothing to do.
         } else {
-            mf.skip(1);
+            mf.skip(buf, 1);
             mf.read_ahead = 0;
             self.rc.encode_bit(&mut self.is_match[0][0], 0);
             self.rc.encode_bittree(&mut self.literal[0..0x100], 8, buf[0] as u32);
@@ -1426,7 +1407,7 @@ impl Lzma1Encoder {
         }
         let nice_len = mf.nice_len;
         let (mut len_main, mut matches_count) = if mf.read_ahead == 0 {
-            mf.find(&mut self.matches)
+            mf.find(buf, &mut self.matches)
         } else {
             debug_assert_eq!(mf.read_ahead, 1);
             (self.longest_match_length, self.matches_count)
@@ -1446,7 +1427,7 @@ impl Lzma1Encoder {
             }
             let len = memcmplen(buf, cur, back, 2, buf_avail);
             if len >= nice_len {
-                mf.skip(len - 1);
+                mf.skip(buf, len - 1);
                 return (i as u32, len);
             }
             if len > rep_len {
@@ -1457,7 +1438,7 @@ impl Lzma1Encoder {
 
         if len_main >= nice_len {
             let back = self.matches[matches_count - 1].dist + REPS as u32;
-            mf.skip(len_main - 1);
+            mf.skip(buf, len_main - 1);
             return (back, len_main);
         }
 
@@ -1482,7 +1463,7 @@ impl Lzma1Encoder {
                 || (rep_len + 2 >= len_main && back_main > (1 << 9))
                 || (rep_len + 3 >= len_main && back_main > (1 << 15)))
         {
-            mf.skip(rep_len - 1);
+            mf.skip(buf, rep_len - 1);
             return (rep_index, rep_len);
         }
 
@@ -1491,7 +1472,7 @@ impl Lzma1Encoder {
         }
 
         // Matches for the next byte: a better one there makes this a literal.
-        let (lml, mc) = mf.find(&mut self.matches);
+        let (lml, mc) = mf.find(buf, &mut self.matches);
         self.longest_match_length = lml;
         self.matches_count = mc;
         if lml >= 2 {
@@ -1514,7 +1495,7 @@ impl Lzma1Encoder {
             }
         }
 
-        mf.skip(len_main - 2);
+        mf.skip(buf, len_main - 2);
         (back_main + REPS as u32, len_main)
     }
 
@@ -1656,7 +1637,7 @@ impl Lzma1Encoder {
     fn helper1(&mut self, buf: &[u8], mf: &mut Mf, position: u32) -> Result<u32, (u32, u32)> {
         let nice_len = mf.nice_len;
         let (len_main, matches_count) = if mf.read_ahead == 0 {
-            mf.find(&mut self.matches)
+            mf.find(buf, &mut self.matches)
         } else {
             debug_assert_eq!(mf.read_ahead, 1);
             (self.longest_match_length, self.matches_count)
@@ -1682,12 +1663,12 @@ impl Lzma1Encoder {
         }
         if rep_lens[rep_max_index] >= nice_len {
             let len = rep_lens[rep_max_index];
-            mf.skip(len - 1);
+            mf.skip(buf, len - 1);
             return Err((rep_max_index as u32, len));
         }
         if len_main >= nice_len {
             let back = self.matches[matches_count - 1].dist + REPS as u32;
-            mf.skip(len_main - 1);
+            mf.skip(buf, len_main - 1);
             return Err((back, len_main));
         }
 
@@ -2117,7 +2098,7 @@ impl Lzma1Encoder {
         let mut cur = 1u32;
         while cur < len_end {
             debug_assert!((cur as usize) < OPTS);
-            let (lml, mc) = mf.find(&mut self.matches);
+            let (lml, mc) = mf.find(buf, &mut self.matches);
             self.longest_match_length = lml;
             self.matches_count = mc;
             if lml >= mf.nice_len {
@@ -2192,7 +2173,7 @@ pub fn encode_lzma_to_lzma2(input: &[u8], opts: &LzmaOptions, output: &mut Vec<u
     eopts.nice_len = nice_len;
 
     let mut enc = Lzma1Encoder::new(&eopts)?;
-    let mut mf = Mf::new(input, dict_size, opts.mf, nice_len, opts.depth);
+    let mut mf = Mf::new(input.len(), dict_size, opts.mf, nice_len, opts.depth);
 
     let mut need_properties = true;
     let mut need_state_reset = false;
@@ -2281,7 +2262,7 @@ pub fn encode_lzma1_raw(input: &[u8], opts: &LzmaOptions, output: &mut Vec<u8>) 
     eopts.nice_len = nice_len;
 
     let mut enc = Lzma1Encoder::new(&eopts)?;
-    let mut mf = Mf::new(input, eopts.dict_size, opts.mf, nice_len, opts.depth);
+    let mut mf = Mf::new(input.len(), eopts.dict_size, opts.mf, nice_len, opts.depth);
     enc.encode_stream(input, &mut mf);
     output.extend_from_slice(&enc.rc.output);
     Ok(())
@@ -2337,7 +2318,7 @@ impl Lzma2StreamEncoder {
         eopts.dict_size = dict_size;
         eopts.nice_len = nice_len;
         let enc = Lzma1Encoder::new(&eopts)?;
-        let mf = Mf::new(&[], dict_size, opts.mf, nice_len, opts.depth);
+        let mf = Mf::new(0, dict_size, opts.mf, nice_len, opts.depth);
         // lz_encoder_prepare(): before_size = OPTS (raised so that
         // before + dict >= LZMA2_CHUNK_MAX for the uncompressed-chunk copy),
         // after_size = LOOP_INPUT_MAX, plus match_len_max.
@@ -2382,7 +2363,7 @@ impl Lzma2StreamEncoder {
             if off > 0 {
                 self.buf.drain(..off);
                 self.read_limit = self.read_limit.saturating_sub(off as u32);
-                self.mf.set_buf(&self.buf);
+                self.mf.set_buf_len(self.buf.len());
             }
         }
     }
@@ -2405,12 +2386,12 @@ impl Lzma2StreamEncoder {
             let take = room.min(data.len());
             self.buf.extend_from_slice(&data[..take]);
             data = &data[take..];
-            self.mf.set_buf(&self.buf);
+            self.mf.set_buf_len(self.buf.len());
             let write_pos = self.mf.write_pos;
             if write_pos > self.keep_size_after {
                 self.read_limit = write_pos - self.keep_size_after;
             }
-            self.mf.rehash_pending(self.read_limit);
+            self.mf.rehash_pending(&self.buf, self.read_limit);
             self.encode(Action::Run);
         }
     }
@@ -2421,7 +2402,7 @@ impl Lzma2StreamEncoder {
     pub fn finish_input(&mut self, action: Action) {
         debug_assert!(action != Action::Run);
         self.read_limit = self.mf.write_pos;
-        self.mf.rehash_pending(self.read_limit);
+        self.mf.rehash_pending(&self.buf, self.read_limit);
         self.encode(action);
         if action == Action::Flush {
             // Forget all match-finder history before this flush boundary

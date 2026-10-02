@@ -17,8 +17,9 @@
 //! builds the runtime check picks up the real CPU.
 
 #![allow(dead_code)]
+#![deny(clippy::undocumented_unsafe_blocks)]
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(miri)))]
 use std::sync::atomic::{AtomicU32, Ordering};
 
 // ---------------------------------------------------------------------------
@@ -30,7 +31,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// Cached after first call. Returns `false` on non-x86_64 targets.
 #[inline(always)]
 pub fn has_avx2() -> bool {
-    #[cfg(target_arch = "x86_64")]
+    // Miri has no SIMD/asm support: force the portable paths.
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
     {
         // Sentinel: `u32::MAX` = not yet detected.
         static CACHE: AtomicU32 = AtomicU32::new(u32::MAX);
@@ -42,7 +44,7 @@ pub fn has_avx2() -> bool {
         CACHE.store(detected as u32, Ordering::Relaxed);
         detected
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(any(not(target_arch = "x86_64"), miri))]
     {
         false
     }
@@ -52,7 +54,7 @@ pub fn has_avx2() -> bool {
 /// [`has_avx2`]. Returns `false` on non-x86_64 targets.
 #[inline(always)]
 pub fn has_bmi2() -> bool {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
     {
         static CACHE: AtomicU32 = AtomicU32::new(u32::MAX);
         let cached = CACHE.load(Ordering::Relaxed);
@@ -63,7 +65,7 @@ pub fn has_bmi2() -> bool {
         CACHE.store(detected as u32, Ordering::Relaxed);
         detected
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(any(not(target_arch = "x86_64"), miri))]
     {
         false
     }
@@ -119,22 +121,32 @@ pub unsafe fn wildcopy_chunks<const N: usize>(
     mut dst: *mut u8,
     length: usize,
 ) {
-    let end = unsafe { dst.add(length) };
-    loop {
-        let chunk: [u8; N] = unsafe { core::ptr::read_unaligned(src.cast::<[u8; N]>()) };
-        unsafe { core::ptr::write_unaligned(dst.cast::<[u8; N]>(), chunk) };
-        src = unsafe { src.add(N) };
-        dst = unsafe { dst.add(N) };
-        if dst >= end {
-            return;
+    // SAFETY: per the contract each N-byte step stays inside the
+    // `max(length, N) + N` windows, and overlapping regions satisfy
+    // `dst >= src + N` so every read sees already-written bytes.
+    unsafe {
+        let end = dst.add(length);
+        loop {
+            let chunk: [u8; N] = core::ptr::read_unaligned(src.cast::<[u8; N]>());
+            core::ptr::write_unaligned(dst.cast::<[u8; N]>(), chunk);
+            src = src.add(N);
+            dst = dst.add(N);
+            if dst >= end {
+                return;
+            }
         }
     }
 }
 
+/// # Safety
+/// 8 bytes readable at `src` and writable at `dst`.
 #[inline(always)]
 unsafe fn copy8(src: *const u8, dst: *mut u8) {
-    let v = unsafe { core::ptr::read_unaligned(src as *const u64) };
-    unsafe { core::ptr::write_unaligned(dst as *mut u64, v) };
+    // SAFETY: per the contract.
+    unsafe {
+        let v = core::ptr::read_unaligned(src as *const u64);
+        core::ptr::write_unaligned(dst as *mut u64, v);
+    }
 }
 
 /// After the first 8 bytes of an overlapping copy with `offset < 8`, shift
@@ -155,6 +167,9 @@ const DEC64: [isize; 8] = [0, 0, 0, -1, -4, 1, 2, 3];
 #[inline(always)]
 pub unsafe fn copy_match_unchecked_32(src: *const u8, dst: *mut u8, offset: usize, match_len: usize) {
     if offset >= 16 {
+        // SAFETY: `offset >= 16` makes each ordered 16-byte move read bytes
+        // written before it; the caller provides `match_len + 32` writable
+        // bytes, and `offset >= match_len` makes the memcpy non-overlapping.
         unsafe {
             let a: [u8; 16] = core::ptr::read_unaligned(src.cast());
             core::ptr::write_unaligned(dst.cast::<[u8; 16]>(), a);
@@ -181,6 +196,7 @@ pub unsafe fn copy_match_unchecked_32(src: *const u8, dst: *mut u8, offset: usiz
             }
         }
     }
+    // SAFETY: same contract, 16 bytes of headroom is a subset of 32.
     unsafe { copy_match_unchecked(src, dst, offset, match_len) }
 }
 
@@ -206,16 +222,23 @@ pub unsafe fn copy_match_unchecked(src: *const u8, dst: *mut u8, offset: usize, 
         // Long, non-overlapping matches (nci-style data): libc memcpy moves
         // 32-64 bytes/cycle with AVX/`rep movsb`, vs 16 per iteration here.
         if match_len > 64 && offset >= match_len {
+            // SAFETY: `offset >= match_len` means the regions are disjoint.
             unsafe { core::ptr::copy_nonoverlapping(src, dst, match_len) };
             return;
         }
+        // SAFETY: `offset >= 16 == N` satisfies the kernel's overlap rule;
+        // the caller provides the `+ 16` headroom.
         unsafe { wildcopy_chunks::<16>(src, dst, match_len) };
         return;
     }
     let mut src = src;
     let mut dst = dst;
-    let end = unsafe { dst.add(match_len) };
+    // SAFETY: `offset >= 1`: the first 8 bytes are produced byte-wise (or
+    // via the inc/dec tables) so that afterwards `dst - src >= 8`, and the
+    // 8-byte loop then only reads written bytes; writes stay within the
+    // caller's `max(match_len, 16) + 16` window.
     unsafe {
+        let end = dst.add(match_len);
         if offset < 8 {
             *dst = *src;
             *dst.add(1) = *src.add(1);
@@ -244,18 +267,23 @@ mod tests {
 
     #[test]
     fn wildcopy_basic() {
-        let src = b"Hello, world! This is a test string. More bytes here.";
-        let mut dst = vec![0u8; 64];
+        let text = b"Hello, world! This is a test string. More bytes here.";
+        // The kernel over-reads up to N bytes: give the source that slack.
+        let mut src = text.to_vec();
+        src.resize(text.len() + 32, 0);
+        let mut dst = vec![0u8; 128];
+        // SAFETY: `src` has `len + 32` readable bytes, `dst` 128 writable.
         unsafe {
-            wildcopy_chunks::<16>(src.as_ptr(), dst.as_mut_ptr(), src.len());
+            wildcopy_chunks::<16>(src.as_ptr(), dst.as_mut_ptr(), text.len());
         }
-        assert_eq!(&dst[..src.len()], src);
+        assert_eq!(&dst[..text.len()], text);
     }
 
     #[test]
     fn copy_match_non_overlapping() {
         let mut buf = vec![0u8; 128];
         buf[..20].copy_from_slice(b"abcdefghijklmnopqrst");
+        // SAFETY: 128-byte buffer, copy touches at most `[0, 20 + 15 + 16)`.
         unsafe {
             let p = buf.as_mut_ptr();
             copy_match_unchecked(p, p.add(20), 20, 15);
@@ -267,6 +295,7 @@ mod tests {
     fn copy_match_rle_one() {
         let mut buf = vec![0u8; 64];
         buf[0] = b'Z';
+        // SAFETY: 64-byte buffer, copy touches at most `[0, 1 + 10 + 16)`.
         unsafe {
             let p = buf.as_mut_ptr();
             copy_match_unchecked(p, p.add(1), 1, 10);
@@ -278,6 +307,7 @@ mod tests {
     fn copy_match_overlapping_small() {
         let mut buf = vec![0u8; 64];
         buf[..4].copy_from_slice(b"ABCD");
+        // SAFETY: 64-byte buffer, copy touches at most `[0, 4 + 10 + 16)`.
         unsafe {
             let p = buf.as_mut_ptr();
             copy_match_unchecked(p, p.add(4), 4, 10);

@@ -43,11 +43,9 @@ impl<'a> BitReader<'a> {
     /// bits have already been consumed (i.e. the input is truncated).
     #[inline(always)]
     pub fn refill(&mut self) -> bool {
-        if self.pos + 8 <= self.data.len() {
-            // SAFETY: 8 bytes available at `pos`.
-            let v = unsafe {
-                u64::from_le(std::ptr::read_unaligned(self.data.as_ptr().add(self.pos) as *const u64))
-            };
+        if let Some(bytes) = self.data.get(self.pos..self.pos + 8) {
+            // One unaligned load: the `get` above is the only bounds check.
+            let v = u64::from_le_bytes(bytes.try_into().unwrap());
             // bit_count <= 63 so the shift is in range; whole bytes that fit
             // are consumed and the count lands in 56..=63.
             self.bit_buf |= v << self.bit_count;

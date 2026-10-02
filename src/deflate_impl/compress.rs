@@ -545,6 +545,9 @@ mod tests {
     }
 
     #[test]
+    // ~700 KB through every level takes > 30 min under Miri; the small
+    // shapes and the other tests give it the same code paths.
+    #[cfg_attr(miri, ignore)]
     fn roundtrip_levels_and_shapes() {
         let text: Vec<u8> = b"the quick brown fox jumps over the lazy dog. ".repeat(3000);
         let mut rnd = Vec::new();

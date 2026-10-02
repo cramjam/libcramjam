@@ -1,6 +1,10 @@
 //! Pure-Rust DEFLATE / gzip / zlib implementation.
 //!
 //! Implements RFC 1951 (DEFLATE), RFC 1952 (gzip), and RFC 1950 (zlib).
+// Every `unsafe {}` block in the pure-Rust codecs carries a `// SAFETY:`
+// comment naming the invariant it relies on (checked by Miri in CI).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 
 pub mod adler32;
 mod bitreader;
