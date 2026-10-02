@@ -555,14 +555,20 @@ unsafe fn decode_sequence_batch_rust(st: &mut FseState, tabs: *const SeqEntry, o
         done += 1;
 
         // Advance states (LL, ML, OF: <= 26 bits). Low 4 bytes of an entry =
-        // next_state (u16) | nb_bits << 24; volatile so the loads happen
-        // here rather than being hoisted across the branches above.
+        // next_state (u16) | nb_additional (u8) | nb_bits (u8) in memory
+        // order; volatile so the loads happen here rather than being hoisted
+        // across the branches above.
         let ll_w = unsafe { core::ptr::read_volatile(ll_p as *const u32) };
         let ml_w = unsafe { core::ptr::read_volatile(ml_p as *const u32) };
         let of_w = unsafe { core::ptr::read_volatile(of_p as *const u32) };
-        ll_state = (ll_w & 0xFFFF) + read!(ll_w >> 24);
-        ml_state = (ml_w & 0xFFFF) + read!(ml_w >> 24);
-        of_state = (of_w & 0xFFFF) + read!(of_w >> 24);
+        // (next_state, nb_bits) of that word, per the target's byte order.
+        let split = |w: u32| if cfg!(target_endian = "little") { (w & 0xFFFF, w >> 24) } else { (w >> 16, w & 0xFF) };
+        let (ll_next, ll_nb) = split(ll_w);
+        let (ml_next, ml_nb) = split(ml_w);
+        let (of_next, of_nb) = split(of_w);
+        ll_state = ll_next + read!(ll_nb);
+        ml_state = ml_next + read!(ml_nb);
+        of_state = of_next + read!(of_nb);
 
         // Refill: consumed <= 7 + 31 + 26 = 64 here; index >= 8 guarantees
         // the window stays inside the source.

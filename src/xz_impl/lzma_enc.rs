@@ -136,8 +136,9 @@ fn memcmplen(buf: &[u8], a: usize, b: usize, mut len: u32, limit: u32) -> u32 {
     let p = buf.as_ptr();
     unsafe {
         while len + 8 <= limit {
-            let x = core::ptr::read_unaligned(p.add(a + len as usize) as *const u64)
-                ^ core::ptr::read_unaligned(p.add(b + len as usize) as *const u64);
+            // from_le: trailing_zeros below must find the first differing byte.
+            let x = u64::from_le(core::ptr::read_unaligned(p.add(a + len as usize) as *const u64))
+                ^ u64::from_le(core::ptr::read_unaligned(p.add(b + len as usize) as *const u64));
             if x != 0 {
                 return len + (x.trailing_zeros() >> 3);
             }
