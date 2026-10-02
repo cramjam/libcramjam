@@ -62,6 +62,10 @@ jobs:
       contains(github.event.pull_request.title, '[fuzz]')
     name: fuzz-${{ matrix.target }}
     runs-on: ubuntu-latest
+    env:
+      # The prebuilt cargo-fuzz from install-action is a musl binary and defaults
+      # `--target` to its own triple; ASan needs the gnu target.
+      TRIPLE: x86_64-unknown-linux-gnu
     strategy:
       fail-fast: false
       matrix:
@@ -104,7 +108,7 @@ jobs:
           esac
 
       - name: Build fuzz target
-        run: cargo +nightly fuzz build ${{ matrix.target }}
+        run: cargo +nightly fuzz build --target "$TRIPLE" ${{ matrix.target }}
 
       # Regression guard: every committed crash input must now decode/encode
       # cleanly (no panic / OOB / timeout). `-runs=0` replays the inputs and
@@ -113,14 +117,14 @@ jobs:
         run: |
           dir="fuzz/artifacts/${{ matrix.target }}"
           if [ -d "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
-            cargo +nightly fuzz run ${{ matrix.target }} "$dir" -- -runs=0
+            cargo +nightly fuzz run --target "$TRIPLE" ${{ matrix.target }} "$dir" -- -runs=0
           else
             echo "no committed artifacts for ${{ matrix.target }}, skipping replay"
           fi
 
       - name: Fuzz
         run: |
-          cargo +nightly fuzz run ${{ matrix.target }} -- \
+          cargo +nightly fuzz run --target "$TRIPLE" ${{ matrix.target }} -- \
             -max_total_time=$DURATION \
             -max_len=131072 \
             -rss_limit_mb=4096 \
