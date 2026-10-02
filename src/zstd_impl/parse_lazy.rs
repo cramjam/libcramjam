@@ -144,39 +144,27 @@ fn row_prefetch(hash_table: &[u32], tag_table: &[u8], rel_row: usize, row_log: u
 #[inline(always)]
 fn row_get_match_mask(tag_row: &[u8], tag: u8, head: u32, row_entries: u32) -> u64 {
     debug_assert!(tag_row.len() >= row_entries as usize);
-    #[cfg(target_arch = "x86_64")]
-    // SAFETY: SSE2 is baseline on x86_64, and each 16-byte load is within
-    // the first `row_entries <= tag_row.len()` bytes of the slice. The
-    // intrinsics are what turn a 16..64-way byte compare into one
-    // `pcmpeqb`/`pmovmskb` pair per 16 tags.
-    unsafe {
-        use core::arch::x86_64::*;
-        let p = tag_row.as_ptr();
-        let cmp = _mm_set1_epi8(tag as i8);
-        let m0 = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(p as *const __m128i), cmp)) as u32 as u64;
-        if row_entries == 16 {
-            return (m0 as u16).rotate_right(head) as u64;
+    /// 16-way compare to a bit mask; written so LLVM recognises the
+    /// movemask idiom (`pcmpeqb` + `pmovmskb` on x86_64).
+    #[inline(always)]
+    fn mask16(chunk: &[u8; 16], tag: u8) -> u16 {
+        let mut m = 0u16;
+        for (j, &t) in chunk.iter().enumerate() {
+            m |= ((t == tag) as u16) << j;
         }
-        let m1 = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(p.add(16) as *const __m128i), cmp)) as u32 as u64;
-        if row_entries == 32 {
-            return ((m1 << 16 | m0) as u32).rotate_right(head) as u64;
-        }
-        let m2 = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(p.add(32) as *const __m128i), cmp)) as u32 as u64;
-        let m3 = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(p.add(48) as *const __m128i), cmp)) as u32 as u64;
-        (m3 << 48 | m2 << 32 | m1 << 16 | m0).rotate_right(head)
+        m
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let mut matches: u64 = 0;
-        for &t in tag_row[..row_entries as usize].iter().rev() {
-            matches = (matches << 1) | (t == tag) as u64;
-        }
-        match row_entries {
-            16 => (matches as u16).rotate_right(head) as u64,
-            32 => (matches as u32).rotate_right(head) as u64,
-            _ => matches.rotate_right(head),
-        }
+    let m0 = mask16(tag_row[0..16].try_into().unwrap(), tag) as u64;
+    if row_entries == 16 {
+        return (m0 as u16).rotate_right(head) as u64;
     }
+    let m1 = mask16(tag_row[16..32].try_into().unwrap(), tag) as u64;
+    if row_entries == 32 {
+        return ((m1 << 16 | m0) as u32).rotate_right(head) as u64;
+    }
+    let m2 = mask16(tag_row[32..48].try_into().unwrap(), tag) as u64;
+    let m3 = mask16(tag_row[48..64].try_into().unwrap(), tag) as u64;
+    (m3 << 48 | m2 << 32 | m1 << 16 | m0).rotate_right(head)
 }
 
 /// `ZSTD_row_fillHashCache`: hash positions `idx ..= i_limit` (at most

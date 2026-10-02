@@ -55,5 +55,26 @@ per backend: `cargo test --release --tests` (C) and
 The benches (`cargo bench --features pure-rust`) compare the pure-Rust
 backend with the C libraries.
 
+Measured 2026-10-02 on one x86-64 Linux workstation over the bench subset
+(11 files, 8.3 MB), default levels, median of 5, ours and C interleaved per
+iteration (`cargo bench --bench summary --features pure-rust`). Compressed
+output is byte-identical to the C libraries for zstd, lz4, bzip2 and xz, and
+equal in size for deflate at levels 4 to 9 (smaller at levels 1 to 3).
+
+| codec          | compress vs C | decompress vs C |
+|----------------|---------------|-----------------|
+| deflate / gzip | 1.00x         | 1.6x faster     |
+| zstd           | 1.04x faster  | 1.08x faster    |
+| lz4            | 1.05x faster  | 1.9x faster     |
+| bzip2          | 1.02x slower  | 1.3x faster     |
+| xz             | 1.2x faster   | 1.2x faster     |
+
+Ratios swing a few percent run to run; treat anything within 5% as parity.
+
+The pure-Rust codecs keep `unsafe` only in encoder hot loops, SIMD and asm
+kernels, and output-buffer cursors. Every block carries a `SAFETY` comment
+(enforced by `clippy::undocumented_unsafe_blocks`), and the unit tests run
+under Miri in CI.
+
 
 Pre-compiled libraries available on [![Anaconda-Server Badge](https://anaconda.org/conda-forge/libcramjam/badges/version.svg)](https://anaconda.org/conda-forge/libcramjam)
