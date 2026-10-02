@@ -1,4 +1,8 @@
 //! Pure-Rust LZ4 implementation (frame + block formats).
+// Every `unsafe {}` block in the pure-Rust codecs carries a `// SAFETY:`
+// comment naming the invariant it relies on (checked by Miri in CI).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 
 pub mod block;
 pub mod frame;

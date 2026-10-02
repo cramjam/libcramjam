@@ -79,11 +79,9 @@ impl<'a> ReverseBitReader<'a> {
         if new_index < self.refill_limit {
             self.index = new_index;
             self.bits_consumed &= 7;
-            // SAFETY: `new_index + 8 <= source.len()` just checked.
-            unsafe {
-                let ptr = self.source.as_ptr().add(new_index) as *const u64;
-                self.bit_container = u64::from_le(std::ptr::read_unaligned(ptr));
-            }
+            // `new_index + 8 <= source.len()` was just checked; the slice
+            // bounds check below folds into that compare.
+            self.bit_container = u64::from_le_bytes(self.source[new_index..new_index + 8].try_into().unwrap());
             return;
         }
         *self = self.refill_slow();
@@ -117,10 +115,7 @@ impl<'a> ReverseBitReader<'a> {
         } else if self.index > 0 {
             // Last partial load: read from offset 0.
             if self.source.len() >= 8 {
-                unsafe {
-                    let ptr = self.source.as_ptr() as *const u64;
-                    self.bit_container = u64::from_le(std::ptr::read_unaligned(ptr));
-                }
+                self.bit_container = u64::from_le_bytes(self.source[..8].try_into().unwrap());
             } else {
                 let mut buf = [0u8; 8];
                 buf[..self.source.len()].copy_from_slice(self.source);
@@ -280,14 +275,7 @@ impl ForwardBitWriter {
         debug_assert!(n == 64 || bits >> n == 0, "extra bits set above n");
         // Fast drain: 4 bytes at a time when bits_in_partial is high enough.
         if self.bits_in_partial + n > 64 && self.bits_in_partial >= 32 {
-            self.output.reserve(4);
-            unsafe {
-                let len = self.output.len();
-                let ptr = self.output.as_mut_ptr().add(len);
-                let lo = self.partial as u32;
-                std::ptr::write_unaligned(ptr as *mut u32, lo.to_le());
-                self.output.set_len(len + 4);
-            }
+            self.output.extend_from_slice(&(self.partial as u32).to_le_bytes());
             self.partial >>= 32;
             self.bits_in_partial -= 32;
         }

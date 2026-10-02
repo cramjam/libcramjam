@@ -284,9 +284,9 @@ pub(crate) fn forward_rle1_capped(input: &[u8], max_out: usize) -> (Vec<u8>, usi
     // While `len <= safe_len` a step of up to 5 bytes can't exceed `max_out`,
     // so the cap check is skipped on the hot path.
     let safe_len = max_out.saturating_sub(5);
-    // SAFETY (all raw writes): every step first ensures `len + step_out <=
-    // max_out` and `len + step_out <= i + step_out <= n + n / 4 + 8`, so the
-    // writes stay within `cap`.
+    // SAFETY: every step first ensures `len + step_out <= max_out` and
+    // `len + step_out <= i + step_out <= n + n / 4 + 8`, so the raw writes
+    // stay within `cap`; every input read is at an index `< n`.
     unsafe {
         while i < n {
             let b = *input.get_unchecked(i);
@@ -513,8 +513,10 @@ fn bwt_via_main_sort(input: &[u8]) -> Option<(Vec<u8>, usize)> {
     // Last column: input[p - 1] (wrapping) for each sorted rotation start p.
     let mut last: Vec<u8> = Vec::with_capacity(n);
     let mut origin = 0usize;
-    // SAFETY: `ptr` holds a permutation of 0..n, `last` has capacity n and
-    // every slot 0..n is written exactly once before `set_len`.
+    // SAFETY: `ptr` holds a permutation of `0..n` (so `src < n ==
+    // input.len()`), `last` has capacity `n`, and every slot `0..n` is
+    // written exactly once before `set_len`. Checked indexing here measured
+    // +2-4% on bzip2 compress, which is already the slowest codec vs C.
     unsafe {
         let lp = last.as_mut_ptr();
         let bp = input.as_ptr();
@@ -580,6 +582,9 @@ fn main_qsort3(
         }
 
         let at = |ptr: &[u32], i: i32| -> u8 {
+            // SAFETY: `lo <= i <= hi < ptr.len()`, `ptr` holds positions
+            // `< nblock`, and `block` has `nblock + BZ_OVERSHOOT` bytes with
+            // `d <= MAIN_QSORT_DEPTH_THRESH < BZ_OVERSHOOT`.
             unsafe { *block.get_unchecked(*ptr.get_unchecked(i as usize) as usize + d as usize) }
         };
         let med = mmed3(at(ptr, lo), at(ptr, hi), at(ptr, (lo + hi) >> 1)) as i32;
@@ -702,6 +707,8 @@ fn main_simple_sort(
         let h = SHELL_INCS[hp];
         let mut i = lo + h;
         while i <= hi {
+            // SAFETY: `lo <= j - h < j <= i <= hi < ptr.len()` throughout
+            // the insertion walk; `main_gt_u` does its own bounds reasoning.
             unsafe {
                 let v = *ptr.get_unchecked(i as usize);
                 let mut j = i;
@@ -741,6 +748,8 @@ fn main_gt_u(
     budget: &mut i32,
 ) -> bool {
     debug_assert!(i1 != i2);
+    // SAFETY: `i1, i2 < nblock + depth` and `block` carries `BZ_OVERSHOOT`
+    // (>= depth + 12) bytes of wrap-around padding past `nblock`.
     unsafe {
         macro_rules! cmp1 {
             () => {
@@ -773,6 +782,9 @@ fn main_gt_u_deep(
     budget: &mut i32,
 ) -> bool {
     let mut b = *budget;
+    // SAFETY: indices are reduced modulo `nblock` after every 8 compares
+    // and `block`/`quadrant` have `BZ_OVERSHOOT` entries of padding past
+    // `nblock`, so `i1, i2 < nblock + BZ_OVERSHOOT` always holds.
     unsafe {
         let mut k = nblock as i32 + 8;
         let r = loop {
@@ -1212,8 +1224,8 @@ fn assign_selectors(symbols: &[u16], tables: &[HufTable]) -> Vec<u8> {
         let mut c01 = 0u32;
         let mut c23 = 0u32;
         let mut c45 = 0u32;
-        // SAFETY: `s < alpha_size == len_pack.len()` by construction.
         for &s in chunk {
+            // SAFETY: `s < alpha_size == len_pack.len()` by construction.
             let p = unsafe { len_pack.get_unchecked(s as usize) };
             c01 += p[0];
             c23 += p[1];

@@ -173,8 +173,9 @@ impl BlockEncoder {
     fn encode_block(&mut self, out: &mut Vec<u8>, buf: &[u8], pos: usize, len: usize, avail_end: usize, last: bool, scratch: &mut Scratch) {
         let params = &self.params;
         let block = &buf[pos..pos + len];
-        let base = buf.as_ptr();
-        let input_end = unsafe { base.add(avail_end) };
+        // Everything the match finders may read: history, block, and the
+        // readable tail (literal-copy / count limit).
+        let base = &buf[..avail_end];
 
         // ZSTD_buildSeqStore: tiny blocks are not worth compressing.
         let saved_rep = self.rep;
@@ -194,11 +195,14 @@ impl BlockEncoder {
                 base,
                 istart: pos as u32,
                 block_len: len,
-                input_end,
                 window_log: params.window_log,
                 target_length: params.target_length,
                 rep: &mut self.rep,
             };
+            // SAFETY: the match-finder tables were sized by `reset` in
+            // `new` for these params and have only ever been fed prefixes
+            // of `buf` by these parsers (`rebase` keeps stored positions
+            // below the new start), and `seq.reset(len)` ran just above.
             let last_lits = unsafe {
                 match params.strategy {
                     Strategy::Fast => compress_block_fast(&mut scratch.fast, &mut scratch.seq, &mut ctx, params.hash_log, params.min_match),
@@ -494,6 +498,9 @@ mod tests {
     }
 
     #[test]
+    // 21 sizes up to 300 KB through every parser: > 8 min under Miri; the
+    // other round-trips exercise the same code on small inputs.
+    #[cfg_attr(miri, ignore)]
     fn frame_roundtrip_sizes() {
         let mut s: u32 = 12345;
         for n in [0usize, 1, 2, 7, 8, 9, 15, 16, 17, 31, 63, 64, 100, 255, 256, 1000, 4095, 4096, 70_000, 200_000, 300_000] {

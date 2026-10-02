@@ -26,6 +26,10 @@
 //!
 //! All numeric constants and probability-update rules are taken straight
 //! from liblzma's `range_common.h` / `lzma_common.h`.
+// Every `unsafe {}` block in the pure-Rust codecs carries a `// SAFETY:`
+// comment naming the invariant it relies on (checked by Miri in CI).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 
 pub mod alone;
 pub mod bcj;

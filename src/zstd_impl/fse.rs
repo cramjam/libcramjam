@@ -209,27 +209,19 @@ impl FseTable {
         Self::from_weights(&weights, accuracy_log)
     }
 
-    /// Peek at the symbol for the current state.
-    ///
-    /// # Safety
-    /// `state` must be `< self.table.len()`. Callers coming out of FSE init /
-    /// `next_state` always satisfy this: state is either produced from
-    /// `bits.get_bits(acc_log)` (bounded by `table_size = 1 << acc_log`) or
-    /// from a previous `next_state` return (bounded by construction).
+    /// Peek at the symbol for the current state. `state < table.len()` by
+    /// construction (initial states are `acc_log` bits wide; `next_state`
+    /// returns `baseline + num_bits bits`, also inside the table), so the
+    /// bounds check is a predicted branch in a per-block header path.
     #[inline(always)]
     pub fn symbol(&self, state: u32) -> u8 {
-        debug_assert!((state as usize) < self.table.len());
-        unsafe { self.table.get_unchecked(state as usize).symbol }
+        self.table[state as usize].symbol
     }
 
     /// Advance to the next state by reading bits from the backward bitstream.
-    ///
-    /// # Safety invariant
-    /// Same as [`symbol`]: `state < table.len()`.
     #[inline(always)]
     pub fn next_state(&self, state: u32, bits: &mut ReverseBitReader) -> u32 {
-        debug_assert!((state as usize) < self.table.len());
-        let entry = unsafe { self.table.get_unchecked(state as usize) };
+        let entry = &self.table[state as usize];
         let low_bits = bits.get_bits(entry.num_bits as u32);
         entry.baseline as u32 + low_bits
     }
@@ -504,7 +496,7 @@ impl FseEncoder {
     #[inline(always)]
     pub fn encode_symbol(&self, prev_state: u32, sym: u8, w: &mut ForwardBitWriter) -> u32 {
         let idx = sym as usize * self.table_size as usize + prev_state as usize;
-        let entry = unsafe { *self.table.get_unchecked(idx) };
+        let entry = self.table[idx];
         let diff = prev_state.wrapping_sub(entry.base);
         w.write_bits(diff as u64, entry.num_bits as u32);
         entry.new_state as u32

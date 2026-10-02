@@ -133,9 +133,10 @@ pub fn update_short_rep(state: u32) -> u32 {
 /// written back at exit so the per-bit path never touches memory except
 /// for the probability itself and the input byte on normalize.
 ///
-/// Every method is `unsafe`: the caller guarantees `inp` has at least
-/// `RC_PADDING`-style slack past the real data (see lzma2.rs) so the
-/// normalize refill never needs a bounds check.
+/// The probability pointers are raw (`*mut Prob`) so the per-bit path is
+/// free of borrow-checker-driven reloads; the methods are `unsafe` for that
+/// reason only. The input is a plain slice: the refill read is bounds
+/// checked, which costs one predictable branch per *input byte*.
 #[derive(Clone, Copy)]
 struct Rc {
     range: u32,
@@ -163,7 +164,8 @@ const RC_MODEL_OFFSET: u32 = (1 << RC_MOVE) - 1; // 31
 /// ~45% of all decoder mispredicts on the "branchless" direct-bits path.
 #[inline(always)]
 fn lt_mask(a: u32, b: u32) -> u32 {
-    #[cfg(target_arch = "x86_64")]
+    // Miri cannot execute inline asm; it gets the portable form.
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
     {
         let mask: u32;
         // SAFETY: pure register arithmetic; `sbb m, m` yields -CF whatever
@@ -180,7 +182,7 @@ fn lt_mask(a: u32, b: u32) -> u32 {
         }
         mask
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(all(target_arch = "x86_64", not(miri))))]
     {
         0u32.wrapping_sub((a < b) as u32)
     }
@@ -188,11 +190,11 @@ fn lt_mask(a: u32, b: u32) -> u32 {
 
 impl Rc {
     #[inline(always)]
-    unsafe fn normalize(&mut self, inp: *const u8) {
+    fn normalize(&mut self, inp: &[u8]) {
         if self.range < RC_TOP {
             self.range <<= 8;
             let byte = if self.pos < self.end {
-                unsafe { *inp.add(self.pos) }
+                inp[self.pos]
             } else {
                 self.overrun = true;
                 0
@@ -206,9 +208,13 @@ impl Rc {
     /// is bit-exact with the classic branchy form:
     ///   bit 0: p += (2048 - p) >> 5  ==  p - ((p + 31) >> 5) + 64
     ///   bit 1: p -= p >> 5
+    ///
+    /// # Safety
+    /// `p` must point at a live `Prob`.
     #[inline(always)]
-    unsafe fn bit(&mut self, p: *mut Prob, inp: *const u8) -> u32 {
-        unsafe { self.normalize(inp) };
+    unsafe fn bit(&mut self, p: *mut Prob, inp: &[u8]) -> u32 {
+        self.normalize(inp);
+        // SAFETY: `p` is valid per the contract.
         let prob = unsafe { *p } as u32;
         let bound = (self.range >> RC_MODEL_BITS) * prob;
         // t = all ones for bit 0 (code < bound), 0 for bit 1. NB: this must
@@ -219,6 +225,7 @@ impl Rc {
         // bit 0: range = bound;   bit 1: range -= bound, code -= bound
         self.range = bound.wrapping_add(nt & self.range.wrapping_sub(bound << 1));
         self.code = self.code.wrapping_sub(nt & bound);
+        // SAFETY: as above.
         unsafe { *p = (prob - ((prob + (t & RC_MODEL_OFFSET)) >> RC_MOVE) + (t & 64)) as Prob };
         nt & 1
     }
@@ -226,28 +233,38 @@ impl Rc {
     /// Classic branchy bit decode — better for well-predicted bits
     /// (is_match / is_rep / length choice), where a branch costs nothing
     /// and saves the mask arithmetic.
+    ///
+    /// # Safety
+    /// `p` must point at a live `Prob`.
     #[inline(always)]
-    unsafe fn bit_br(&mut self, p: *mut Prob, inp: *const u8) -> u32 {
-        unsafe { self.normalize(inp) };
+    unsafe fn bit_br(&mut self, p: *mut Prob, inp: &[u8]) -> u32 {
+        self.normalize(inp);
+        // SAFETY: `p` is valid per the contract.
         let prob = unsafe { *p } as u32;
         let bound = (self.range >> RC_MODEL_BITS) * prob;
         if self.code < bound {
             self.range = bound;
+            // SAFETY: as above.
             unsafe { *p = (prob + ((2048 - prob) >> RC_MOVE)) as Prob };
             0
         } else {
             self.range -= bound;
             self.code -= bound;
+            // SAFETY: as above.
             unsafe { *p = (prob - (prob >> RC_MOVE)) as Prob };
             1
         }
     }
 
     /// Forward bittree over `probs[1 .. 2^num_bits]`.
+    ///
+    /// # Safety
+    /// `probs` must point at `>= 2^num_bits` live `Prob`s.
     #[inline(always)]
-    unsafe fn bittree(&mut self, probs: *mut Prob, num_bits: u32, inp: *const u8) -> u32 {
+    unsafe fn bittree(&mut self, probs: *mut Prob, num_bits: u32, inp: &[u8]) -> u32 {
         let mut symbol = 1u32;
         for _ in 0..num_bits {
+            // SAFETY: `symbol < 2^num_bits` inside the loop.
             let b = unsafe { self.bit(probs.add(symbol as usize), inp) };
             symbol = (symbol << 1) | b;
         }
@@ -255,11 +272,15 @@ impl Rc {
     }
 
     /// Reverse bittree (LSB first).
+    ///
+    /// # Safety
+    /// `probs` must point at `>= 2^num_bits` live `Prob`s.
     #[inline(always)]
-    unsafe fn bittree_rev(&mut self, probs: *mut Prob, num_bits: u32, inp: *const u8) -> u32 {
+    unsafe fn bittree_rev(&mut self, probs: *mut Prob, num_bits: u32, inp: &[u8]) -> u32 {
         let mut symbol = 1u32;
         let mut result = 0u32;
         for i in 0..num_bits {
+            // SAFETY: `symbol < 2^num_bits` inside the loop.
             let b = unsafe { self.bit(probs.add(symbol as usize), inp) };
             symbol = (symbol << 1) | b;
             result |= b << i;
@@ -269,10 +290,10 @@ impl Rc {
 
     /// Uniform "direct" bits.
     #[inline(always)]
-    unsafe fn direct(&mut self, num_bits: u32, inp: *const u8) -> u32 {
+    fn direct(&mut self, num_bits: u32, inp: &[u8]) -> u32 {
         let mut result = 0u32;
         for _ in 0..num_bits {
-            unsafe { self.normalize(inp) };
+            self.normalize(inp);
             self.range >>= 1;
             // t = all ones when code < range (bit 0).
             let t = lt_mask(self.code, self.range);
@@ -321,8 +342,14 @@ impl LenDecoder {
 
     /// Decode a match length, returning the *raw* length (not adjusted by
     /// MATCH_LEN_MIN).  Caller adds MATCH_LEN_MIN to get the actual length.
+    ///
+    /// # Safety
+    /// `pos_state < POS_STATES_MAX`.
     #[inline(always)]
-    unsafe fn decode(&mut self, rc: &mut Rc, pos_state: usize, inp: *const u8) -> u32 {
+    unsafe fn decode(&mut self, rc: &mut Rc, pos_state: usize, inp: &[u8]) -> u32 {
+        // SAFETY: `pos_state` indexes the per-state rows per the contract;
+        // every probability pointer is into one of `self`'s arrays with the
+        // tree size the bittree reads.
         unsafe {
             if rc.bit_br(&mut self.choice, inp) == 0 {
                 rc.bittree(self.low.get_unchecked_mut(pos_state).as_mut_ptr(), LEN_LOW_BITS, inp)
@@ -456,8 +483,11 @@ impl LzmaDecoder {
 
     /// Decode the match-distance using the slot/direct/align scheme.
     #[inline(always)]
-    unsafe fn decode_distance(&mut self, rc: &mut Rc, len: u32, inp: *const u8) -> u32 {
+    fn decode_distance(&mut self, rc: &mut Rc, len: u32, inp: &[u8]) -> u32 {
         let dist_state = get_dist_state(len) as usize;
+        // SAFETY: `dist_state < DIST_STATES`; `dist_special` is sized
+        // `FULL_DISTANCES` so `base - slot + 2^num_direct <= 128` stays in
+        // bounds; `dist_align` has `ALIGN_SIZE = 2^ALIGN_BITS` entries.
         unsafe {
             let slot = rc.bittree(
                 self.dist_slot.get_unchecked_mut(dist_state).as_mut_ptr(),
@@ -504,7 +534,7 @@ impl LzmaDecoder {
         let dict_start = self.dict_start;
         debug_assert!(dict_start <= start);
         let dict_size = self.dict_size;
-        let inp = rd.input.as_ptr();
+        let inp: &[u8] = rd.input;
         let mut rc = Rc { range: rd.range, code: rd.code, pos: rd.pos, end: rd.end, overrun: false };
         let lc = self.lc;
         let lp_mask = self.lp_mask as usize;

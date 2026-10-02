@@ -351,15 +351,12 @@ fn decode_one_frame(
             // Move-to-front: shift mtf_list[0..mtf_index] right by one slot
             // (memmove via copy_within), then update slot 0.  No position
             // table needed because the decoder receives the index directly.
-            unsafe {
-                let p = mtf_list.as_mut_ptr();
-                let alpha_idx = *p.add(mtf_index);
-                std::ptr::copy(p, p.add(1), mtf_index);
-                *p = alpha_idx;
-                let byte = *alphabet_to_byte.get_unchecked(alpha_idx as usize);
-                bucket[byte as usize] += 1;
-                tt.push(byte as u32);
-            }
+            let alpha_idx = mtf_list[mtf_index];
+            mtf_list.copy_within(0..mtf_index, 1);
+            mtf_list[0] = alpha_idx;
+            let byte = alphabet_to_byte[alpha_idx as usize];
+            bucket[byte as usize] += 1;
+            tt.push(byte as u32);
         }
 
         // -- Fused forward inverse-BWT walk + inverse RLE1 + CRC + output extend --
@@ -453,10 +450,12 @@ fn forward_inverse_bwt_rle1_crc(
     // Forward walk + fused RLE1 + CRC + output.
     //
     // We write output bytes through a raw pointer with `set_len` called
-    // ONCE at the end, skipping the per-byte capacity-check + length-update
-    // overhead of `Vec::push`.  Reserve a generous upper bound on the
-    // post-RLE1 expansion before entering the loop; if a pathological run
-    // sequence ever pushes us past it, fall back to a slow re-reserve.
+    // ONCE at the end. (Pre-sizing the Vec and writing through checked
+    // slices instead measured +12% instructions / ~5% time: the Vec's
+    // pointer and length have to be reloaded around every `resize`-capable
+    // call.) Reserve a generous upper bound on the post-RLE1 expansion
+    // before entering the loop; if a pathological run sequence ever pushes
+    // us past it, fall back to a slow re-reserve.
     //
     // Worst-case RLE1 expansion: any 5 bytes "bbbbN" → at most 259 output
     // bytes.  So an n-byte BWT block expands to at most ⌈n * 259 / 5⌉ output
@@ -468,13 +467,12 @@ fn forward_inverse_bwt_rle1_crc(
     let mut t_pos = (tt[origin] >> 8) as usize;
     let mut consumed = 0usize;
 
-    let tt_ptr = tt.as_ptr();
-
     // Per-iter bounds checks on `t_pos` aren't needed: the FL setup loop
-    // guarantees every `tt[k] >> 8` is in `[0, n)`, so the walk can never
-    // index outside the array.  Wrong input can cause the walk to enter a
-    // short sub-cycle and emit garbage, but that's caught by the CRC at the
-    // end.  We do a single start-of-walk check.
+    // guarantees every `tt[k] >> 8` is in `[0, n)` (it ORs in `i < n` for
+    // every slot), so the walk can never index outside the array.  Wrong
+    // input can cause the walk to enter a short sub-cycle and emit garbage,
+    // but that's caught by the CRC at the end.  We do a single
+    // start-of-walk check.
     if t_pos >= n {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -485,7 +483,13 @@ fn forward_inverse_bwt_rle1_crc(
     // Output cursor: write through `out_ptr.add(out_idx)`, then `set_len`
     // once at the end.  Bytes already in `output` (other blocks of the
     // same stream) stay intact at offsets `< out_base`.
+    //
+    // Invariant for every raw write below: `out_base + out_idx + cc <=
+    // output.capacity()` (established by `ensure_cap!(cc)` right before),
+    // and every byte in `out_base .. out_base + out_idx` has been written,
+    // so each `set_len(out_base + out_idx)` only exposes initialised bytes.
     let out_base = output.len();
+    // SAFETY: `out_base <= capacity`.
     let mut out_ptr = unsafe { output.as_mut_ptr().add(out_base) };
     let mut out_idx: usize = 0;
 
@@ -496,8 +500,10 @@ fn forward_inverse_bwt_rle1_crc(
         ($extra:expr) => {{
             let need = $extra;
             if out_base + out_idx + need > output.capacity() {
-                unsafe { output.set_len(out_base + out_idx); }
+                // SAFETY: the invariant above.
+                unsafe { output.set_len(out_base + out_idx) };
                 output.reserve(need + 1024);
+                // SAFETY: `out_base <= len <= capacity`.
                 out_ptr = unsafe { output.as_mut_ptr().add(out_base) };
             }
         }};
@@ -515,7 +521,10 @@ fn forward_inverse_bwt_rle1_crc(
     // Helper macros to keep the unrolled code compact.
     macro_rules! load_next {
         () => {{
-            let e = unsafe { *tt_ptr.add(t_pos) };
+            // SAFETY: `t_pos < n == tt.len()`: checked for the start
+            // position above, and every later value is a `tt[k] >> 8`
+            // written as `i < n` by the FL setup loop.
+            let e = unsafe { *tt.get_unchecked(t_pos) };
             let b = e as u8;
             t_pos = (e >> 8) as usize;
             consumed += 1;
@@ -527,7 +536,9 @@ fn forward_inverse_bwt_rle1_crc(
             let bb: u8 = $byte;
             let cc: usize = $count;
             ensure_cap!(cc);
-            unsafe { std::ptr::write_bytes(out_ptr.add(out_idx), bb, cc); }
+            // SAFETY: `ensure_cap!(cc)` guarantees `cc` bytes of spare
+            // capacity at `out_ptr + out_idx`.
+            unsafe { std::ptr::write_bytes(out_ptr.add(out_idx), bb, cc) };
             out_idx += cc;
             for _ in 0..cc {
                 let idx = (((crc_state >> 24) as u8) ^ bb) as usize;
@@ -537,7 +548,8 @@ fn forward_inverse_bwt_rle1_crc(
     }
     // Pre-prime: read the FIRST BWT byte into k0 (the "current run" character).
     if consumed >= n {
-        unsafe { output.set_len(out_base + out_idx); }
+        // SAFETY: the output-cursor invariant above.
+        unsafe { output.set_len(out_base + out_idx) };
         crc.restore(crc_state);
         return Ok(());
     }
@@ -592,7 +604,8 @@ fn forward_inverse_bwt_rle1_crc(
         }
         // 4 in a row → next BWT byte is the run-length count.
         if consumed >= n {
-            unsafe { output.set_len(out_base + out_idx); }
+            // SAFETY: the output-cursor invariant above.
+        unsafe { output.set_len(out_base + out_idx) };
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "bzip2: RLE1 run with no count byte",
@@ -609,7 +622,8 @@ fn forward_inverse_bwt_rle1_crc(
     }
 
     // Commit the new length.
-    unsafe { output.set_len(out_base + out_idx); }
+    // SAFETY: the output-cursor invariant above.
+    unsafe { output.set_len(out_base + out_idx) };
     crc.restore(crc_state);
     Ok(())
 }

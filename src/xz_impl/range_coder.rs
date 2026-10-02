@@ -136,9 +136,7 @@ impl<'a> RangeDecoder<'a> {
         if self.range < RC_TOP_VALUE {
             debug_assert!(self.pos < self.input.len(), "decode_bit_fast called with empty input");
             self.range <<= RC_SHIFT_BITS;
-            // SAFETY: caller guarantees padding.
-            self.code = (self.code << RC_SHIFT_BITS)
-                | unsafe { *self.input.get_unchecked(self.pos) } as u32;
+            self.code = (self.code << RC_SHIFT_BITS) | self.input[self.pos] as u32;
             self.pos += 1;
         }
         let bound = (self.range >> RC_BIT_MODEL_TOTAL_BITS) * (*prob as u32);
@@ -186,8 +184,7 @@ impl<'a> RangeDecoder<'a> {
             if self.range < RC_TOP_VALUE {
                 debug_assert!(self.pos < self.input.len());
                 self.range <<= RC_SHIFT_BITS;
-                self.code = (self.code << RC_SHIFT_BITS)
-                    | unsafe { *self.input.get_unchecked(self.pos) } as u32;
+                self.code = (self.code << RC_SHIFT_BITS) | self.input[self.pos] as u32;
                 self.pos += 1;
             }
             self.range >>= 1;

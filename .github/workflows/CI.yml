@@ -194,6 +194,30 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test -p libcramjam --release --tests --target s390x-unknown-linux-gnu --features pure-rust --no-fail-fast -- --skip corpus_ --skip bcj_arm --skip bcj_ia64 --skip bcj_powerpc --skip bcj_encoders --skip x86_bcj_on_real
 
+  # Undefined-behaviour check for the pure-Rust codecs' remaining `unsafe`
+  # (unchecked reads, wildcopy overshoot, `set_len`). Fuzzing cannot see UB
+  # that happens to produce the right bytes; Miri can. The x86_64 `asm!`
+  # paths are compiled out under `cfg(miri)` and the Rust fallbacks run.
+  miri:
+    name: miri (pure-Rust unit tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - uses: Swatinem/rust-cache@v2
+        name: Rust Cache
+
+      # Only the codec modules' own unit tests: the crate-level `tests::`
+      # round-trips read a multi-MB corpus from disk, which Miri's isolation
+      # forbids and which would take hours at Miri speed.
+      - name: Unit tests under Miri
+        run: cargo miri test -p libcramjam --lib --no-default-features --features pure-rust -- zstd_impl lz4_impl xz_impl bzip2_impl deflate_impl cpu_features
+
   # build-wasm32:
   #   runs-on: ubuntu-latest
   #   steps:

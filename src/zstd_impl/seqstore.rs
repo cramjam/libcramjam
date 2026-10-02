@@ -1,5 +1,18 @@
 //! Sequence store + the small LZ helpers shared by the match finders
 //! (mirrors `SeqStore_t`, `ZSTD_storeSeq`, `ZSTD_count`, `ZSTD_hashPtr`).
+//!
+//! Every `unsafe` the match finders need is funnelled through the helpers in
+//! this file, so there are exactly three kinds to audit:
+//!
+//! 1. unchecked slice reads — [`byte`], [`read16`], [`read32`], [`read64`],
+//!    [`count`], [`hash_at`] (precondition: the bytes read are inside the
+//!    slice);
+//! 2. unchecked table indexing — [`tbl_get`], [`tbl_set`] (precondition:
+//!    `idx < tbl.len()`);
+//! 3. the literal wildcopy inside [`SeqStore::store_seq`], which is `unsafe`
+//!    only internally (its branches establish what the copy needs).
+//!
+//! Each helper states its precondition and checks it with `debug_assert!`.
 
 /// One parsed sequence. `off_base` is the decoder-facing offset value:
 /// `offset + 3` for a real offset, `1..=3` for a repeat code (as in C's
@@ -24,8 +37,7 @@ pub fn offset_to_offbase(offset: u32) -> u32 {
     offset + 3
 }
 
-/// Per-block sequence store. Literals go into `lit` (raw-pointer writes with
-/// slack for the wildcopy), sequences into `seqs`.
+/// Per-block sequence store. Literals go into `lit`, sequences into `seqs`.
 pub struct SeqStore {
     pub lit: Vec<u8>,
     pub seqs: Vec<SeqDef>,
@@ -40,7 +52,7 @@ impl SeqStore {
 
     /// Prepare for a block of `block_size` bytes: room for every literal plus
     /// the wildcopy slack, and one sequence per 4 bytes (min match is 4 for
-    /// every parser).
+    /// every parser). With this reserve neither `push` below ever grows.
     pub fn reset(&mut self, block_size: usize) {
         self.lit.clear();
         self.lit.reserve(block_size + WILDCOPY_OVERLENGTH);
@@ -49,36 +61,53 @@ impl SeqStore {
         self.long_lit = false;
     }
 
-    /// `ZSTD_storeSeq`: copy `lit_len` literals from `literals` and append the
-    /// sequence.
+    /// `ZSTD_storeSeq`: copy the literals `base[lit_start..lit_start +
+    /// lit_len]` and append the sequence.
     ///
     /// # Safety
-    /// `[literals, literals + lit_len)` must be readable and, when
-    /// `literals + lit_len + WILDCOPY_OVERLENGTH <= lit_limit`, the whole
-    /// wildcopy window must be readable too. `reset` must have been called
-    /// with a block size covering all literals stored since.
+    /// `lit_start + lit_len <= base.len()`, and `reset` was called with a
+    /// block size covering every literal and sequence stored since (so the
+    /// `lit` capacity has `WILDCOPY_OVERLENGTH` spare bytes and `seqs` has
+    /// a free slot). Checking the capacities at runtime instead measured
+    /// ~3% on zstd compress, so they are `debug_assert`s.
     #[inline(always)]
-    pub unsafe fn store_seq(&mut self, lit_len: usize, literals: *const u8, lit_limit: *const u8, off_base: u32, match_len: usize) {
+    pub unsafe fn store_seq(&mut self, lit_start: usize, lit_len: usize, base: &[u8], off_base: u32, match_len: usize) {
         let len = self.lit.len();
-        debug_assert!(len + lit_len + WILDCOPY_OVERLENGTH <= self.lit.capacity());
-        let dst = unsafe { self.lit.as_mut_ptr().add(len) };
-        let lit_end = unsafe { literals.add(lit_len) };
-        if unsafe { lit_end.add(WILDCOPY_OVERLENGTH) } <= lit_limit {
-            // Common case: literals are short, copy 16 first, then wildcopy.
+        let lit_end = lit_start + lit_len;
+        debug_assert!(lit_end <= base.len());
+        debug_assert!(len + lit_len + WILDCOPY_OVERLENGTH <= self.lit.capacity(), "SeqStore::reset undersized");
+        // Common case: the source has slack — copy 16 first, then 32 at a
+        // time, overshooting the real length (into `lit`'s spare capacity).
+        if lit_end + WILDCOPY_OVERLENGTH <= base.len() {
+            // SAFETY: the source has `WILDCOPY_OVERLENGTH` readable bytes
+            // past the literals (checked) and `lit` has as many spare bytes
+            // of capacity past `len` (contract), so every 16/32-byte block
+            // the copies touch is inside its allocation, the regions belong
+            // to different allocations, and `set_len` only exposes bytes the
+            // copy wrote.
             unsafe {
-                copy16(literals, dst);
+                let src = base.as_ptr().add(lit_start);
+                let dst = self.lit.as_mut_ptr().add(len);
+                copy16(src, dst);
                 if lit_len > 16 {
-                    wildcopy32(literals.add(16), dst.add(16), lit_len - 16);
+                    wildcopy32(src.add(16), dst.add(16), lit_len - 16);
                 }
+                self.lit.set_len(len + lit_len);
             }
         } else {
-            unsafe { core::ptr::copy_nonoverlapping(literals, dst, lit_len) };
+            // SAFETY: `lit_end <= base.len()` (contract) and `lit` has
+            // `lit_len` spare bytes (contract); distinct allocations.
+            unsafe {
+                core::ptr::copy_nonoverlapping(base.as_ptr().add(lit_start), self.lit.as_mut_ptr().add(len), lit_len);
+                self.lit.set_len(len + lit_len);
+            }
         }
-        unsafe { self.lit.set_len(len + lit_len) };
 
         debug_assert!(match_len >= MIN_MATCH);
-        debug_assert!(self.seqs.len() < self.seqs.capacity());
+        debug_assert!(self.seqs.len() < self.seqs.capacity(), "SeqStore::reset undersized");
         let n = self.seqs.len();
+        // SAFETY: `seqs` has a free slot (contract); the slot is written
+        // before `set_len` exposes it.
         unsafe {
             core::ptr::write(
                 self.seqs.as_mut_ptr().add(n),
@@ -95,24 +124,14 @@ impl SeqStore {
 }
 
 // ---------------------------------------------------------------------------
-// Memory helpers
+// Wildcopy (private; only `store_seq` uses it)
 // ---------------------------------------------------------------------------
 
+/// # Safety
+/// 16 bytes readable at `src` and writable at `dst`, no overlap.
 #[inline(always)]
-pub unsafe fn read16(p: *const u8) -> u16 {
-    unsafe { u16::from_le(core::ptr::read_unaligned(p as *const u16)) }
-}
-#[inline(always)]
-pub unsafe fn read32(p: *const u8) -> u32 {
-    unsafe { u32::from_le(core::ptr::read_unaligned(p as *const u32)) }
-}
-#[inline(always)]
-pub unsafe fn read64(p: *const u8) -> u64 {
-    unsafe { u64::from_le(core::ptr::read_unaligned(p as *const u64)) }
-}
-
-#[inline(always)]
-pub unsafe fn copy16(src: *const u8, dst: *mut u8) {
+unsafe fn copy16(src: *const u8, dst: *mut u8) {
+    // SAFETY: per the contract above.
     unsafe {
         let v = core::ptr::read_unaligned(src as *const [u8; 16]);
         core::ptr::write_unaligned(dst as *mut [u8; 16], v);
@@ -120,65 +139,123 @@ pub unsafe fn copy16(src: *const u8, dst: *mut u8) {
 }
 
 /// Copy in 32-byte steps, overshooting by up to 31 bytes.
+///
+/// # Safety
+/// `len.max(1).next_multiple_of(32)` bytes readable at `src` and writable
+/// at `dst`, no overlap.
 #[inline(always)]
-pub unsafe fn wildcopy32(mut src: *const u8, mut dst: *mut u8, len: usize) {
-    let end = unsafe { dst.add(len) };
-    loop {
-        unsafe {
+unsafe fn wildcopy32(mut src: *const u8, mut dst: *mut u8, len: usize) {
+    // SAFETY: per the contract above; every iteration copies one 32-byte
+    // step and stops once `dst` reaches or passes `end`.
+    unsafe {
+        let end = dst.add(len);
+        loop {
             copy16(src, dst);
             copy16(src.add(16), dst.add(16));
             src = src.add(32);
             dst = dst.add(32);
-        }
-        if dst >= end {
-            return;
+            if dst >= end {
+                return;
+            }
         }
     }
 }
 
-/// `ZSTD_count`: number of equal bytes at `p_in` / `p_match`, reading no
-/// further than `limit` (exclusive) on the `p_in` side.
+// ---------------------------------------------------------------------------
+// Unchecked slice reads
+// ---------------------------------------------------------------------------
+
+/// # Safety
+/// `pos < buf.len()`.
+#[inline(always)]
+pub unsafe fn byte(buf: &[u8], pos: usize) -> u8 {
+    debug_assert!(pos < buf.len());
+    // SAFETY: per the contract above.
+    unsafe { *buf.get_unchecked(pos) }
+}
+
+/// Little-endian `u16` at `pos`.
 ///
 /// # Safety
-/// `[p_in, limit)` and the matching range at `p_match` must be readable.
+/// `pos + 2 <= buf.len()`.
 #[inline(always)]
-pub unsafe fn count(p_in: *const u8, p_match: *const u8, limit: *const u8) -> usize {
+pub unsafe fn read16(buf: &[u8], pos: usize) -> u16 {
+    debug_assert!(pos + 2 <= buf.len());
+    // SAFETY: per the contract above; unaligned load.
+    unsafe { u16::from_le(core::ptr::read_unaligned(buf.as_ptr().add(pos) as *const u16)) }
+}
+
+/// Little-endian `u32` at `pos`.
+///
+/// # Safety
+/// `pos + 4 <= buf.len()`.
+#[inline(always)]
+pub unsafe fn read32(buf: &[u8], pos: usize) -> u32 {
+    debug_assert!(pos + 4 <= buf.len());
+    // SAFETY: per the contract above; unaligned load.
+    unsafe { u32::from_le(core::ptr::read_unaligned(buf.as_ptr().add(pos) as *const u32)) }
+}
+
+/// Little-endian `u64` at `pos`.
+///
+/// # Safety
+/// `pos + 8 <= buf.len()`.
+#[inline(always)]
+pub unsafe fn read64(buf: &[u8], pos: usize) -> u64 {
+    debug_assert!(pos + 8 <= buf.len());
+    // SAFETY: per the contract above; unaligned load.
+    unsafe { u64::from_le(core::ptr::read_unaligned(buf.as_ptr().add(pos) as *const u64)) }
+}
+
+/// `ZSTD_count`: number of equal bytes at `buf[p_in..]` / `buf[p_match..]`,
+/// reading no further than `limit` (exclusive) on the `p_in` side.
+///
+/// # Safety
+/// `p_match <= p_in <= limit <= buf.len()`.
+#[inline(always)]
+pub unsafe fn count(buf: &[u8], p_in: usize, p_match: usize, limit: usize) -> usize {
+    debug_assert!(p_match <= p_in && p_in <= limit && limit <= buf.len());
     let start = p_in;
     let mut p_in = p_in;
     let mut p_match = p_match;
-    let loop_limit = unsafe { limit.sub(7) };
-    if p_in < loop_limit {
-        let diff = unsafe { read64(p_match) ^ read64(p_in) };
-        if diff != 0 {
-            return (diff.trailing_zeros() >> 3) as usize;
-        }
-        p_in = unsafe { p_in.add(8) };
-        p_match = unsafe { p_match.add(8) };
-        while p_in < loop_limit {
-            let diff = unsafe { read64(p_match) ^ read64(p_in) };
-            if diff == 0 {
-                p_in = unsafe { p_in.add(8) };
-                p_match = unsafe { p_match.add(8) };
-                continue;
-            }
-            p_in = unsafe { p_in.add((diff.trailing_zeros() >> 3) as usize) };
-            return unsafe { p_in.offset_from(start) } as usize;
-        }
-    }
+    // Hoisted once, as C does (`pInLimit - 7`): the loop condition stays a
+    // single compare.
+    let loop_limit = limit.saturating_sub(7);
+    // SAFETY: every read below is guarded by `p_in + N <= limit` (as
+    // `p_in < limit - (N - 1)`), and `p_match <= p_in` keeps the match side
+    // in range too.
     unsafe {
-        if p_in < limit.sub(3) && read32(p_match) == read32(p_in) {
-            p_in = p_in.add(4);
-            p_match = p_match.add(4);
+        if p_in < loop_limit {
+            let diff = read64(buf, p_match) ^ read64(buf, p_in);
+            if diff != 0 {
+                return (diff.trailing_zeros() >> 3) as usize;
+            }
+            p_in += 8;
+            p_match += 8;
+            while p_in < loop_limit {
+                let diff = read64(buf, p_match) ^ read64(buf, p_in);
+                if diff == 0 {
+                    p_in += 8;
+                    p_match += 8;
+                    continue;
+                }
+                p_in += (diff.trailing_zeros() >> 3) as usize;
+                return p_in - start;
+            }
         }
-        if p_in < limit.sub(1) && read16(p_match) == read16(p_in) {
-            p_in = p_in.add(2);
-            p_match = p_match.add(2);
+        if p_in + 3 < limit && read32(buf, p_match) == read32(buf, p_in) {
+            p_in += 4;
+            p_match += 4;
         }
-        if p_in < limit && *p_match == *p_in {
-            p_in = p_in.add(1);
+        if p_in + 1 < limit && read16(buf, p_match) == read16(buf, p_in) {
+            p_in += 2;
+            p_match += 2;
         }
-        p_in.offset_from(start) as usize
+        if p_in < limit && byte(buf, p_match) == byte(buf, p_in) {
+            p_in += 1;
+        }
     }
+    p_in - start
 }
 
 // ---------------------------------------------------------------------------
@@ -191,19 +268,44 @@ const PRIME6: u64 = 227718039650203;
 const PRIME7: u64 = 58295818150454627;
 const PRIME8: u64 = 0xCF1BBCDCB7A56463;
 
-/// Hash `MLS` bytes at `p` to `h_bits` bits. `MLS` in 4..=8.
+/// Hash `MLS` bytes at `buf[pos..]` to `h_bits` bits. `MLS` in 4..=8.
 ///
 /// # Safety
-/// 8 bytes must be readable at `p` when `MLS > 4`, 4 otherwise.
+/// `pos + 8 <= buf.len()` when `MLS > 4`, `pos + 4 <= buf.len()` otherwise.
 #[inline(always)]
-pub unsafe fn hash_ptr<const MLS: u32>(p: *const u8, h_bits: u32) -> usize {
-    match MLS {
-        4 => ((unsafe { read32(p) }.wrapping_mul(PRIME4)) >> (32 - h_bits)) as usize,
-        5 => (((unsafe { read64(p) } << (64 - 40)).wrapping_mul(PRIME5)) >> (64 - h_bits)) as usize,
-        6 => (((unsafe { read64(p) } << (64 - 48)).wrapping_mul(PRIME6)) >> (64 - h_bits)) as usize,
-        7 => (((unsafe { read64(p) } << (64 - 56)).wrapping_mul(PRIME7)) >> (64 - h_bits)) as usize,
-        _ => ((unsafe { read64(p) }.wrapping_mul(PRIME8)) >> (64 - h_bits)) as usize,
+pub unsafe fn hash_at<const MLS: u32>(buf: &[u8], pos: usize, h_bits: u32) -> usize {
+    // SAFETY: per the contract above.
+    unsafe {
+        match MLS {
+            4 => ((read32(buf, pos).wrapping_mul(PRIME4)) >> (32 - h_bits)) as usize,
+            5 => (((read64(buf, pos) << (64 - 40)).wrapping_mul(PRIME5)) >> (64 - h_bits)) as usize,
+            6 => (((read64(buf, pos) << (64 - 48)).wrapping_mul(PRIME6)) >> (64 - h_bits)) as usize,
+            7 => (((read64(buf, pos) << (64 - 56)).wrapping_mul(PRIME7)) >> (64 - h_bits)) as usize,
+            _ => ((read64(buf, pos).wrapping_mul(PRIME8)) >> (64 - h_bits)) as usize,
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Unchecked table indexing
+// ---------------------------------------------------------------------------
+
+/// # Safety
+/// `idx < tbl.len()`.
+#[inline(always)]
+pub unsafe fn tbl_get<T: Copy>(tbl: &[T], idx: usize) -> T {
+    debug_assert!(idx < tbl.len());
+    // SAFETY: per the contract above.
+    unsafe { *tbl.get_unchecked(idx) }
+}
+
+/// # Safety
+/// `idx < tbl.len()`.
+#[inline(always)]
+pub unsafe fn tbl_set<T>(tbl: &mut [T], idx: usize, v: T) {
+    debug_assert!(idx < tbl.len());
+    // SAFETY: per the contract above.
+    unsafe { *tbl.get_unchecked_mut(idx) = v }
 }
 
 #[inline(always)]

@@ -3,6 +3,10 @@
 //! Decompression: our own decoder (`decode::decode_frame`).
 //! Compression: our own native encoder (`encode::encode_frame`) — raw blocks
 //! at level 0, LZ77 + predefined-FSE sequences at level >= 1.
+// Every `unsafe {}` block in the pure-Rust codecs carries a `// SAFETY:`
+// comment naming the invariant it relies on (checked by Miri in CI).
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 
 mod bitc;
 mod bits;

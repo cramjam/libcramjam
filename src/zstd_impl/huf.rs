@@ -159,7 +159,7 @@ impl HufTable {
     pub fn decode_symbol(&self, bits: &mut ReverseBitReader) -> u8 {
         bits.ensure_bits(self.max_bits);
         let idx = bits.peek_bits(self.max_bits);
-        let entry = unsafe { *self.table.get_unchecked(idx as usize) };
+        let entry = self.table[idx as usize];
         bits.consume(entry.num_bits as u32);
         entry.symbol
     }
@@ -175,8 +175,7 @@ impl HufTable {
         out: &mut [u8],
     ) {
         let max_bits = self.max_bits;
-        let table_ptr = self.table.as_ptr();
-        let out_ptr = out.as_mut_ptr();
+        let table = &self.table[..];
         let n = out.len();
         let mut i = 0usize;
 
@@ -186,32 +185,11 @@ impl HufTable {
             let batch_bits = max_bits * 5;
             while i + 5 <= n {
                 bits.ensure_bits(batch_bits);
-                unsafe {
-                    // Symbol 0
-                    let idx = bits.peek_bits(max_bits);
-                    let e = *table_ptr.add(idx as usize);
+                let chunk = &mut out[i..i + 5];
+                for slot in chunk {
+                    let e = table[bits.peek_bits(max_bits) as usize];
                     bits.consume(e.num_bits as u32);
-                    *out_ptr.add(i) = e.symbol;
-                    // Symbol 1
-                    let idx = bits.peek_bits(max_bits);
-                    let e = *table_ptr.add(idx as usize);
-                    bits.consume(e.num_bits as u32);
-                    *out_ptr.add(i + 1) = e.symbol;
-                    // Symbol 2
-                    let idx = bits.peek_bits(max_bits);
-                    let e = *table_ptr.add(idx as usize);
-                    bits.consume(e.num_bits as u32);
-                    *out_ptr.add(i + 2) = e.symbol;
-                    // Symbol 3
-                    let idx = bits.peek_bits(max_bits);
-                    let e = *table_ptr.add(idx as usize);
-                    bits.consume(e.num_bits as u32);
-                    *out_ptr.add(i + 3) = e.symbol;
-                    // Symbol 4
-                    let idx = bits.peek_bits(max_bits);
-                    let e = *table_ptr.add(idx as usize);
-                    bits.consume(e.num_bits as u32);
-                    *out_ptr.add(i + 4) = e.symbol;
+                    *slot = e.symbol;
                 }
                 i += 5;
             }
@@ -219,7 +197,7 @@ impl HufTable {
 
         // Tail: one symbol at a time.
         while i < n {
-            unsafe { *out_ptr.add(i) = self.decode_symbol(bits); }
+            out[i] = self.decode_symbol(bits);
             i += 1;
         }
     }
@@ -234,8 +212,10 @@ impl HufTable {
     /// Stops with every reader re-synced so the per-symbol tail finishes.
     ///
     /// # Safety
-    /// `out_ptr` must be valid for `end[i]` bytes; readers must have had their
-    /// padding skipped.
+    /// `out_ptr` must be valid for writes of `end[3]` bytes, with
+    /// `pos[i] <= end[i] <= pos[i + 1]`; readers must have had their padding
+    /// skipped. (Unchecked on purpose: this is the literal-decoding hot loop,
+    /// at 1.2 GB/s a per-symbol check is not free.)
     #[inline(never)]
     unsafe fn decode_4stream_fast(
         &self,
@@ -245,6 +225,8 @@ impl HufTable {
         end: &[usize; 4],
     ) {
         let shift = 64 - self.max_bits;
+        // `HufEntry` is `repr(C) { symbol: u8, num_bits: u8 }`, so each entry
+        // read as a little-endian u16 is `symbol | num_bits << 8`.
         let table = self.table.as_ptr() as *const u16;
         let mut acc = [0u64; 4];
         let mut cur = [core::ptr::null::<u8>(); 4];
@@ -255,6 +237,8 @@ impl HufTable {
             }
             let (index, consumed, container, src) = readers[i].raw_parts();
             acc[i] = (container | 1) << consumed;
+            // SAFETY: `index + 8 <= source.len()` (`fast_ok`), so `src + index`
+            // is inside the stream.
             cur[i] = unsafe { src.add(index) };
             lo[i] = src;
         }
@@ -272,6 +256,9 @@ impl HufTable {
                 let p = [p0, p1, p2, p3][i];
                 let c = [c0, c1, c2, c3][i];
                 iters = iters.min((end[i] - p) / 5);
+                // SAFETY: `c` only ever moves down from `src + index` and
+                // the iteration budget below keeps it `>= lo[i]`, so both
+                // pointers are in the same stream.
                 let ahead = unsafe { c.offset_from(lo[i]) } as usize;
                 iters = iters.min(ahead.saturating_sub(7) / 7);
             }
@@ -282,7 +269,11 @@ impl HufTable {
                 macro_rules! refill {
                     ($a:ident, $c:ident) => {{
                         let ctz = $a.trailing_zeros();
+                        // SAFETY: one iteration consumes < 64 bits per stream,
+                        // so `ctz >> 3 <= 7`; `iters` was bounded so the
+                        // cursor stays >= `lo` with 8 readable bytes above it.
                         $c = unsafe { $c.sub((ctz >> 3) as usize) };
+                        // SAFETY: `[c, c + 8)` is inside the stream (above).
                         let raw = unsafe { u64::from_le(core::ptr::read_unaligned($c as *const u64)) };
                         $a = (raw | 1) << (ctz & 7);
                     }};
@@ -293,8 +284,13 @@ impl HufTable {
                 refill!(a3, c3);
                 macro_rules! sym {
                     ($a:ident, $p:ident, $k:expr) => {{
+                        // SAFETY: `acc >> (64 - max_bits)` is < `1 << max_bits`
+                        // = `table.len()`.
                         let e = u16::from_le(unsafe { *table.add(($a >> shift) as usize) });
                         $a <<= e >> 8;
+                        // SAFETY: `iters` was bounded by `(end - p) / 5`, so
+                        // `p + k < end` for this stream (caller contract on
+                        // `out_ptr`).
                         unsafe { *out_ptr.add($p + $k) = e as u8 };
                     }};
                 }
@@ -316,9 +312,13 @@ impl HufTable {
         let curs = [c0, c1, c2, c3];
         for i in 0..4 {
             let ctz = accs[i].trailing_zeros();
+            // SAFETY: the extra 7 bytes budgeted in `iters` cover this final
+            // move, so `c >= lo[i]` and 8 bytes are readable at `c`.
             let c = unsafe { curs[i].sub((ctz >> 3) as usize) };
             debug_assert!(c >= lo[i], "huffman fast loop ran past the stream start");
+            // SAFETY: same stream, `c >= lo[i]`.
             let index = unsafe { c.offset_from(lo[i]) } as usize;
+            // SAFETY: `[c, c + 8)` is inside the stream.
             let raw = unsafe { u64::from_le(core::ptr::read_unaligned(c as *const u64)) };
             readers[i].set_raw_parts(index, ctz & 7, raw);
         }
@@ -439,20 +439,18 @@ pub fn decode_literals_4stream_into(
     r3.skip_padding_bits()?;
     r4.skip_padding_bits()?;
 
-    // SAFETY: output has exactly regen_size bytes and segment bounds are
-    // `seg_size * 3 + last_size = regen_size`.
-    unsafe {
-        let mut readers = [r1, r2, r3, r4];
-        let mut pos = [0, seg_size, seg_size * 2, seg_size * 3];
-        let end = [seg_size, seg_size * 2, seg_size * 3, seg_size * 3 + last_size];
-        table.decode_4stream_fast(&mut readers, output.as_mut_ptr(), &mut pos, &end);
-        // Tail: each stream to completion, one symbol at a time.
-        let out_ptr = output.as_mut_ptr();
-        for i in 0..4 {
-            while pos[i] < end[i] {
-                *out_ptr.add(pos[i]) = table.decode_symbol(&mut readers[i]);
-                pos[i] += 1;
-            }
+    let mut readers = [r1, r2, r3, r4];
+    let mut pos = [0, seg_size, seg_size * 2, seg_size * 3];
+    let end = [seg_size, seg_size * 2, seg_size * 3, seg_size * 3 + last_size];
+    // SAFETY: `output` has exactly `regen_size = seg_size * 3 + last_size =
+    // end[3]` bytes and the segments are contiguous and in order; the
+    // readers had their padding skipped above.
+    unsafe { table.decode_4stream_fast(&mut readers, output.as_mut_ptr(), &mut pos, &end) };
+    // Tail: each stream to completion, one symbol at a time.
+    for i in 0..4 {
+        while pos[i] < end[i] {
+            output[pos[i]] = table.decode_symbol(&mut readers[i]);
+            pos[i] += 1;
         }
     }
     Ok(())

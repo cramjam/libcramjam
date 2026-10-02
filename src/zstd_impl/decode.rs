@@ -308,20 +308,9 @@ fn decode_compressed_block(
     // Decode directly into the frame-lifetime scratch (reused across blocks)
     // so we avoid one Vec alloc per block. `decode_literals_section_into`
     // sets the length to the real literal count.
-    let (lit_ptr, lit_total) = decode_literals_section_into(&mut r, data, huf_table, literals_buf)?;
-    // SAFETY: `lit_ptr` points at `lit_total` literal bytes followed by at
-    // least 16 readable bytes (see `decode_literals_section_into`).
-    let literals: &[u8] = unsafe { core::slice::from_raw_parts(lit_ptr, lit_total) };
-
-    // Reserve the worst-case output for this block upfront so neither the
-    // literal copies nor the per-sequence match wildcopy need to re-check
-    // capacity. A valid block regenerates <= ZSTD_BLOCKSIZE_MAX; the extra
-    // `2 * ZSTD_BLOCKSIZE_MAX` is slack so the fused loop's last sequence
-    // before it bails on the block-output limit (a malformed block can push
-    // `dst` up to one ll+ml past the limit) still writes inside the buffer,
-    // after which the decoder errors out. The `+ 32` is dead-zone padding for
-    // the SIMD wildcopy overshoot in `cpu_features::copy_match_unchecked`.
-    output.reserve(3 * ZSTD_BLOCKSIZE_MAX + 32);
+    // `literals` is the `lit_total` literal bytes plus at least
+    // `LIT_PADDING` readable bytes of slack for the sequence loop's over-read.
+    let (literals, lit_total) = decode_literals_section_into(&mut r, data, huf_table, literals_buf)?;
 
     // --- Sequences Section ---
     let seq_data = &data[r.position()..];
@@ -367,19 +356,16 @@ fn decode_compressed_block(
     seq_tabs[..ll_t.table.len()].copy_from_slice(&ll_t.table);
     seq_tabs[SEQ_TAB_STRIDE..SEQ_TAB_STRIDE + of_t.table.len()].copy_from_slice(&of_t.table);
     seq_tabs[2 * SEQ_TAB_STRIDE..2 * SEQ_TAB_STRIDE + ml_t.table.len()].copy_from_slice(&ml_t.table);
-    // SAFETY: literals has 32 bytes of trailing padding beyond `lit_total`;
-    // output has `ZSTD_BLOCKSIZE_MAX + 32` bytes of headroom (reserved above).
-    let (dst_off, lit_pos) = unsafe {
-        decode_sequences(
-            bitstream, seq_tabs.as_ptr(),
-            [ll_t.accuracy_log, of_t.accuracy_log, ml_t.accuracy_log],
-            num_sequences,
-            literals.as_ptr(), lit_total,
-            output.as_mut_ptr(), output.len(),
-            rep_offsets,
-        )?
-    };
-    unsafe { output.set_len(dst_off); }
+    let lit_pos = decode_sequences(
+        bitstream,
+        seq_tabs,
+        [ll_t.accuracy_log, of_t.accuracy_log, ml_t.accuracy_log],
+        num_sequences,
+        literals,
+        lit_total,
+        output,
+        rep_offsets,
+    )?;
 
     // Append remaining literals after all sequences.
     if lit_pos < lit_total {
@@ -416,14 +402,14 @@ const SEQ_BATCH: usize = 64;
 /// extra bits read Offset→ML→LL, repeat-offset resolution via the `ll0`
 /// trick, one refill after the state advance.
 ///
-/// # Safety
-/// `tabs` must point at `3 * SEQ_TAB_STRIDE` entries holding the LL, OF,
-/// ML tables at strides 0, 1, 2; the states must be valid for them.
+/// `tabs` holds the LL, OF, ML tables at strides 0, 1, 2 of
+/// `SEQ_TAB_STRIDE` (see `decode_sequences`). This is the cold per-batch
+/// tail, so the three lookups are bounds-checked.
 #[inline(never)]
-unsafe fn decode_sequence_general(st: &mut FseState, tabs: *const SeqEntry) -> Seq {
-    let ll_e = unsafe { *tabs.add(st.ll_state as usize) };
-    let of_e = unsafe { *tabs.add(SEQ_TAB_STRIDE + st.of_state as usize) };
-    let ml_e = unsafe { *tabs.add(2 * SEQ_TAB_STRIDE + st.ml_state as usize) };
+fn decode_sequence_general(st: &mut FseState, tabs: &[SeqEntry]) -> Seq {
+    let ll_e = tabs[st.ll_state as usize];
+    let of_e = tabs[SEQ_TAB_STRIDE + st.of_state as usize];
+    let ml_e = tabs[2 * SEQ_TAB_STRIDE + st.ml_state as usize];
     let of_bits = of_e.nb_additional as u32;
     let ml_bits = ml_e.nb_additional as u32;
     let ll_bits = ll_e.nb_additional as u32;
@@ -481,10 +467,15 @@ unsafe fn decode_sequence_general(st: &mut FseState, tabs: *const SeqEntry) -> S
 /// FSE states every iteration).
 ///
 /// # Safety
-/// As for [`decode_sequence_general`].
+/// `tabs.len() == 3 * SEQ_TAB_STRIDE` (LL, OF, ML tables at strides 0, 1,
+/// 2) and the FSE states in `st` are valid for them (`< 1 <<
+/// accuracy_log <= SEQ_TAB_STRIDE`); `st.bits` must still be in its
+/// fast-path window (see `ReverseBitReader::raw_parts`). Table reads are
+/// unchecked on purpose: this is the portable sequence-decoding hot loop.
 #[inline(never)]
 #[allow(unused_assignments)]
-unsafe fn decode_sequence_batch_rust(st: &mut FseState, tabs: *const SeqEntry, out: &mut SeqBatch, n: usize) -> usize {
+unsafe fn decode_sequence_batch_rust(st: &mut FseState, tabs: &[SeqEntry], out: &mut SeqBatch, n: usize) -> usize {
+    debug_assert_eq!(tabs.len(), 3 * SEQ_TAB_STRIDE);
     let (mut index, consumed0, container0, src) = st.bits.raw_parts();
     let mut consumed = consumed0;
     let mut acc = container0 << consumed;
@@ -492,9 +483,11 @@ unsafe fn decode_sequence_batch_rust(st: &mut FseState, tabs: *const SeqEntry, o
     let mut of_state = st.of_state;
     let mut ml_state = st.ml_state;
     let [mut r0, mut r1, mut r2] = st.rep;
-    let ll_tab = tabs;
-    let of_tab = unsafe { tabs.add(SEQ_TAB_STRIDE) };
-    let ml_tab = unsafe { tabs.add(2 * SEQ_TAB_STRIDE) };
+    let ll_tab = tabs.as_ptr();
+    // SAFETY: `tabs` has `3 * SEQ_TAB_STRIDE` entries (caller contract).
+    let of_tab = unsafe { ll_tab.add(SEQ_TAB_STRIDE) };
+    // SAFETY: as above.
+    let ml_tab = unsafe { ll_tab.add(2 * SEQ_TAB_STRIDE) };
     // Not the last sequence, and enough bytes ahead for a fast refill.
     let limit = n.min(st.left - 1);
     let mut done = 0usize;
@@ -510,24 +503,35 @@ unsafe fn decode_sequence_batch_rust(st: &mut FseState, tabs: *const SeqEntry, o
     }
 
     while done < limit && index >= 8 {
-        // SAFETY: states are < table size by FSE construction.
+        // SAFETY: (this block and every `*ll_p` / `*ml_p` / `*of_p` read
+        // below) each state is `< 1 << accuracy_log <= SEQ_TAB_STRIDE` by
+        // FSE construction (initial states are `accuracy_log` bits; a state
+        // advance yields `next_state + nb_bits bits`, inside the table), so
+        // the pointers stay inside their table's stride of `tabs`.
         let ll_p = unsafe { ll_tab.add(ll_state as usize) };
+        // SAFETY: as above.
         let ml_p = unsafe { ml_tab.add(ml_state as usize) };
+        // SAFETY: as above.
         let of_p = unsafe { of_tab.add(of_state as usize) };
+        // SAFETY: as above.
         let of_bits = unsafe { (*of_p).nb_additional as u32 };
+        // SAFETY: as above.
         let ml_bits = unsafe { (*ml_p).nb_additional as u32 };
+        // SAFETY: as above.
         let ll_bits = unsafe { (*ll_p).nb_additional as u32 };
         if of_bits + ml_bits + ll_bits > 31 {
             break;
         }
 
         let offset = if of_bits > 1 {
+            // SAFETY: as above.
             let off = unsafe { (*of_p).base_value } + read!(of_bits);
             r2 = r1;
             r1 = r0;
             r0 = off;
             off
         } else {
+            // SAFETY: as above.
             let ll0 = unsafe { (*ll_p).base_value } == 0;
             if of_bits == 0 {
                 if ll0 {
@@ -549,17 +553,23 @@ unsafe fn decode_sequence_batch_rust(st: &mut FseState, tabs: *const SeqEntry, o
                 temp
             }
         };
+        // SAFETY: as above.
         let match_len = unsafe { (*ml_p).base_value } + read!(ml_bits);
+        // SAFETY: as above.
         let lit_len = unsafe { (*ll_p).base_value } + read!(ll_bits);
-        unsafe { *out.get_unchecked_mut(done) = Seq { lit_len, match_len, offset } };
+        out[done] = Seq { lit_len, match_len, offset };
         done += 1;
 
         // Advance states (LL, ML, OF: <= 26 bits). Low 4 bytes of an entry =
         // next_state (u16) | nb_additional (u8) | nb_bits (u8) in memory
         // order; volatile so the loads happen here rather than being hoisted
         // across the branches above.
+        // SAFETY: (three reads) `SeqEntry` is `repr(C)` and 8 bytes, so its
+        // first 4 bytes are a readable, aligned `u32` at each valid entry.
         let ll_w = unsafe { core::ptr::read_volatile(ll_p as *const u32) };
+        // SAFETY: as above.
         let ml_w = unsafe { core::ptr::read_volatile(ml_p as *const u32) };
+        // SAFETY: as above.
         let of_w = unsafe { core::ptr::read_volatile(of_p as *const u32) };
         // (next_state, nb_bits) of that word, per the target's byte order.
         let split = |w: u32| if cfg!(target_endian = "little") { (w & 0xFFFF, w >> 24) } else { (w >> 16, w & 0xFF) };
@@ -574,9 +584,10 @@ unsafe fn decode_sequence_batch_rust(st: &mut FseState, tabs: *const SeqEntry, o
         // the window stays inside the source.
         index -= (consumed >> 3) as usize;
         consumed &= 7;
-        // SAFETY: index + 8 <= source length (index only decreases from a
-        // valid window and index >= 8 was checked at loop entry... see
-        // `raw_parts`).
+        // SAFETY: the reader started in its fast window (`index + 8 <=
+        // source.len()`, see `raw_parts`), `index` only decreases, and
+        // `index >= 8` held at loop entry while at most 8 bytes were consumed
+        // since, so `[src + index, src + index + 8)` is inside the source.
         acc = unsafe { u64::from_le(core::ptr::read_unaligned(src.add(index) as *const u64)) } << consumed;
     }
 
@@ -602,13 +613,17 @@ unsafe fn decode_sequence_batch_rust(st: &mut FseState, tabs: *const SeqEntry, o
 ///
 /// # Safety
 /// As for [`decode_sequence_batch_rust`], plus BMI2 must be available.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(miri)))]
 #[inline(never)]
-unsafe fn decode_sequence_batch_bmi2(st: &mut FseState, tabs: *const SeqEntry, out: &mut SeqBatch, n: usize) -> usize {
+unsafe fn decode_sequence_batch_bmi2(st: &mut FseState, tabs: &[SeqEntry], out: &mut SeqBatch, n: usize) -> usize {
+    debug_assert_eq!(tabs.len(), 3 * SEQ_TAB_STRIDE);
+    let tabs = tabs.as_ptr();
     let (index, consumed0, container0, src) = st.bits.raw_parts();
     let mut consumed: u32 = consumed0;
     let mut acc: u64 = container0 << consumed;
+    // SAFETY: `index + 8 <= source.len()` (fast window, caller contract).
     let mut cursor: *const u8 = unsafe { src.add(index) };
+    // SAFETY: as above, so the source is at least 8 bytes long.
     let lo: *const u8 = unsafe { src.add(8) };
     let mut ll_state = st.ll_state;
     let mut ml_state = st.ml_state;
@@ -617,6 +632,7 @@ unsafe fn decode_sequence_batch_bmi2(st: &mut FseState, tabs: *const SeqEntry, o
     let limit = n.min(st.left - 1);
     let out_start = out.as_mut_ptr();
     let mut slot = out_start;
+    // SAFETY: `limit <= n <= SEQ_BATCH = out.len()`.
     let end = unsafe { out_start.add(limit) };
 
     // read!(n in r14d) -> value in r15d; consumes n bits.
@@ -629,6 +645,13 @@ unsafe fn decode_sequence_batch_bmi2(st: &mut FseState, tabs: *const SeqEntry, o
         "shrx r15, r15, r14\n",
     ) } }
 
+    // SAFETY: the loop re-checks `slot < end` and `cursor >= lo` before every
+    // sequence, so output writes stay inside `out` and the 8-byte refill
+    // load at `cursor - consumed/8` stays inside the source; table reads
+    // are `state * 8` into a `3 * SEQ_TAB_STRIDE`-entry buffer with states
+    // valid by FSE construction. All clobbered registers are declared; the
+    // stack is restored before exit. BMI2 (`shlx`/`shrx`) is available per
+    // the caller's dispatch.
     unsafe {
         core::arch::asm!(
             "push r14",                 // [rsp+8] = slot end
@@ -740,7 +763,9 @@ unsafe fn decode_sequence_batch_bmi2(st: &mut FseState, tabs: *const SeqEntry, o
             inout("r15") lo => _,
         );
     }
+    // SAFETY: `slot` only advanced within `out` (asm loop bound).
     let done = unsafe { slot.offset_from(out_start) } as usize;
+    // SAFETY: `cursor` only moved down within the source (asm loop bound).
     let index = unsafe { cursor.offset_from(src) } as usize;
     st.bits.set_raw_parts(index, consumed, acc >> consumed);
     st.ll_state = ll_state;
@@ -752,27 +777,33 @@ unsafe fn decode_sequence_batch_bmi2(st: &mut FseState, tabs: *const SeqEntry, o
 }
 
 /// Dispatch: BMI2 asm on x86_64 when available, portable Rust otherwise.
+/// (Miri cannot execute `asm!`, so the asm paths are compiled out there.)
+///
+/// # Safety
+/// As for [`decode_sequence_batch_rust`].
 #[inline(always)]
-unsafe fn decode_sequence_batch(st: &mut FseState, tabs: *const SeqEntry, out: &mut SeqBatch, n: usize) -> usize {
-    #[cfg(target_arch = "x86_64")]
+unsafe fn decode_sequence_batch(st: &mut FseState, tabs: &[SeqEntry], out: &mut SeqBatch, n: usize) -> usize {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
     {
         if crate::cpu_features::has_bmi2() {
+            // SAFETY: caller contract; BMI2 just detected.
             return unsafe { decode_sequence_batch_bmi2(st, tabs, out, n) };
         }
     }
+    // SAFETY: caller contract.
     unsafe { decode_sequence_batch_rust(st, tabs, out, n) }
 }
 
 /// Byte tables for the `offset < 8` overlapping match copy (lz4's
 /// `inc32table` / `dec64table`), referenced from the asm loop.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(miri)))]
 static OVL_INC32: [u8; 8] = [0, 1, 2, 1, 0, 4, 4, 4];
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(miri)))]
 static OVL_DEC64: [i8; 8] = [0, 0, 0, -1, -4, 1, 2, 3];
 
 /// In/out block for [`decode_exec_bmi2`] (everything that doesn't fit in
 /// the 13 nameable registers).
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(miri)))]
 #[repr(C)]
 struct ExecArgs {
     cursor_lo: *const u8,
@@ -813,15 +844,24 @@ struct ExecArgs {
 /// args pointer.
 ///
 /// # Safety
-/// Same requirements as `decode_sequences` (tables, literal padding of 32
-/// bytes, `ZSTD_BLOCKSIZE_MAX + 32` bytes of output headroom); BMI2.
-#[cfg(target_arch = "x86_64")]
+/// `tabs.len() == 3 * SEQ_TAB_STRIDE` with valid states in `st` (as for
+/// [`decode_sequence_batch_rust`]); `args.lit .. args.lit_end` are the
+/// remaining literals followed by `LIT_PADDING` readable bytes (the literal
+/// copy over-reads by up to 16); `args.dst` has `3 * ZSTD_BLOCKSIZE_MAX +
+/// 32` bytes of writable capacity from the block start (one sequence may
+/// run past `out_limit` by `ll + ml <= 2 * ZSTD_BLOCKSIZE_MAX`, and the
+/// match copy over-writes by up to 31 bytes); BMI2 is available.
+#[cfg(all(target_arch = "x86_64", not(miri)))]
 #[inline(never)]
-unsafe fn decode_exec_bmi2(st: &mut FseState, tabs: *const SeqEntry, args: &mut ExecArgs) {
+unsafe fn decode_exec_bmi2(st: &mut FseState, tabs: &[SeqEntry], args: &mut ExecArgs) {
+    debug_assert_eq!(tabs.len(), 3 * SEQ_TAB_STRIDE);
+    let tabs = tabs.as_ptr();
     let (index, consumed0, container0, src) = st.bits.raw_parts();
     let mut consumed: u32 = consumed0;
     let mut acc: u64 = container0 << consumed;
+    // SAFETY: `index + 8 <= source.len()` (fast window, caller contract).
     let mut cursor: *const u8 = unsafe { src.add(index) };
+    // SAFETY: as above, so the source is at least 8 bytes long.
     args.cursor_lo = unsafe { src.add(8) };
     args.left = st.left;
     args.status = 0;
@@ -840,6 +880,14 @@ unsafe fn decode_exec_bmi2(st: &mut FseState, tabs: *const SeqEntry, args: &mut 
         "shrx r15, r15, r14\n",
     ) } }
 
+    // SAFETY: before each sequence the loop checks `left > 1`, `cursor >=
+    // cursor_lo` (8-byte refill stays in the source) and `dst < out_limit`;
+    // each sequence validates `lit + ll <= lit_end` and `0 < off <=
+    // post_lit - out_base` before copying, so literal reads stay within the
+    // padded literals and match reads/writes within the reserved output
+    // (see the `# Safety` contract). Table reads are `state * 8` into the
+    // `3 * SEQ_TAB_STRIDE` buffer. rbx/rbp and the 80-byte frame are
+    // restored; every other clobbered register is declared.
     unsafe {
         core::arch::asm!(
             "push rbx",
@@ -1066,6 +1114,7 @@ unsafe fn decode_exec_bmi2(st: &mut FseState, tabs: *const SeqEntry, args: &mut 
             out("xmm1") _,
         );
     }
+    // SAFETY: `cursor` only moved down within the source (asm loop bound).
     let index = unsafe { cursor.offset_from(src) } as usize;
     st.bits.set_raw_parts(index, consumed, acc >> consumed);
     st.ll_state = ll_state;
@@ -1079,27 +1128,43 @@ unsafe fn decode_exec_bmi2(st: &mut FseState, tabs: *const SeqEntry, args: &mut 
 /// and execute each batch's literal + match copies with only the output /
 /// literal cursors live.
 ///
-/// Returns `(dst_off, lit_pos)`.
+/// Appends the regenerated bytes to `output` and returns how many literals
+/// were consumed (`lit_pos`); the caller appends the rest.
 ///
-/// # Safety
-/// * `tabs` must point at `3 * SEQ_TAB_STRIDE` entries holding the LL, OF,
-///   ML tables at strides 0, 1, 2 with the given accuracy logs.
-/// * `lit_ptr` must point to at least `lit_total + 32` readable bytes.
-/// * `out_base + out_off` must have `ZSTD_BLOCKSIZE_MAX + 32` bytes of
-///   writable headroom.
+/// `tabs` holds the LL, OF, ML tables at strides 0, 1, 2 of
+/// `SEQ_TAB_STRIDE` with the given accuracy logs. `literals[..lit_total]`
+/// are the block's literals, followed by at least `LIT_PADDING` bytes of
+/// readable slack (the literal copies over-read by up to 16 bytes). Both
+/// are checked on entry; everything the unsafe kernels below rely on
+/// follows from those two checks plus the per-sequence validation.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn decode_sequences(
+fn decode_sequences(
     bitstream: &[u8],
-    tabs: *const SeqEntry,
+    tabs: &[SeqEntry],
     acc_log: [u32; 3],
     num_sequences: usize,
-    lit_ptr: *const u8,
+    literals: &[u8],
     lit_total: usize,
-    out_base: *mut u8,
-    out_off: usize,
+    output: &mut Vec<u8>,
     rep_io: &mut [u32; 3],
-) -> io::Result<(usize, usize)> {
+) -> io::Result<usize> {
+    assert_eq!(tabs.len(), 3 * SEQ_TAB_STRIDE);
+    assert!(literals.len() >= lit_total + LIT_PADDING);
+    assert!(acc_log.iter().all(|&l| (1usize << l) <= SEQ_TAB_STRIDE));
+    // Reserve the worst-case output for this block upfront so neither the
+    // literal copies nor the per-sequence match wildcopy need to re-check
+    // capacity. A valid block regenerates <= ZSTD_BLOCKSIZE_MAX; the extra
+    // `2 * ZSTD_BLOCKSIZE_MAX` is slack so the fused loop's last sequence
+    // before it bails on the block-output limit (a malformed block can push
+    // `dst` up to one ll+ml past the limit) still writes inside the buffer,
+    // after which the decoder errors out. The `+ 32` is dead-zone padding for
+    // the SIMD wildcopy overshoot in `cpu_features::copy_match_unchecked_32`.
+    output.reserve(3 * ZSTD_BLOCKSIZE_MAX + 32);
+    let out_off = output.len();
+    let out_base = output.as_mut_ptr();
+    let lit_ptr = literals.as_ptr();
+
     let mut bits = ReverseBitReader::new(bitstream)?;
     bits.skip_padding_bits()?;
     // Initial states (order per RFC 8878 3.1.2.1.2.4), then establish the
@@ -1114,27 +1179,41 @@ unsafe fn decode_sequences(
     let mut lit_pos = 0usize;
     let mut dst = out_off;
     let mut seqs: SeqBatch = [Seq::default(); SEQ_BATCH];
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
     let fused = crate::cpu_features::has_bmi2();
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(all(target_arch = "x86_64", not(miri))))]
     let fused = false;
 
     while st.left != 0 {
-        let mut n;
-        #[cfg(target_arch = "x86_64")]
+        let mut n = 0usize;
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
         if fused {
-            let mut args = ExecArgs {
-                cursor_lo: core::ptr::null(),
-                lit_end: unsafe { lit_ptr.add(lit_total) },
-                out_base,
-                left: 0,
-                dst: unsafe { out_base.add(dst) },
-                lit: unsafe { lit_ptr.add(lit_pos) },
-                status: 0,
-                out_limit: unsafe { out_base.add(out_off + ZSTD_BLOCKSIZE_MAX) },
+            // SAFETY: `lit_total <= literals.len()` and `lit_pos <=
+            // lit_total` (validated per sequence); `dst` and `out_off +
+            // ZSTD_BLOCKSIZE_MAX` are within the capacity reserved above.
+            let mut args = unsafe {
+                ExecArgs {
+                    cursor_lo: core::ptr::null(),
+                    lit_end: lit_ptr.add(lit_total),
+                    out_base,
+                    left: 0,
+                    dst: out_base.add(dst),
+                    lit: lit_ptr.add(lit_pos),
+                    status: 0,
+                    out_limit: out_base.add(out_off + ZSTD_BLOCKSIZE_MAX),
+                }
             };
+            // SAFETY: `tabs`/states per the entry asserts and FSE
+            // construction; literals padded by `LIT_PADDING` (entry assert);
+            // output capacity reserved above; BMI2 detected (`fused`); the
+            // reader is in its fast window because the fused loop and
+            // `decode_sequence_general` both leave it there (the general
+            // path refills through the reader itself).
             unsafe { decode_exec_bmi2(&mut st, tabs, &mut args) };
+            // SAFETY: the asm only advances `dst`/`lit` within the buffers
+            // they started in.
             dst = unsafe { args.dst.offset_from(out_base) } as usize;
+            // SAFETY: as above.
             lit_pos = unsafe { args.lit.offset_from(lit_ptr) } as usize;
             if args.status != 0 {
                 return Err(seq_validation_error(lit_pos, 0, lit_total, 0, dst));
@@ -1144,20 +1223,16 @@ unsafe fn decode_sequences(
             }
             // One sequence the fast loop declined (last / stream start /
             // long extras): general decode, executed by the loop below.
-            seqs[0] = unsafe { decode_sequence_general(&mut st, tabs) };
+            seqs[0] = decode_sequence_general(&mut st, tabs);
             n = 1;
-        } else {
-            n = unsafe { decode_sequence_batch(&mut st, tabs, &mut seqs, SEQ_BATCH) };
-            if n < SEQ_BATCH && st.left != 0 {
-                seqs[n] = unsafe { decode_sequence_general(&mut st, tabs) };
-                n += 1;
-            }
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
+        if !fused {
+            // SAFETY: `tabs` has `3 * SEQ_TAB_STRIDE` entries and the states
+            // are valid for the given accuracy logs (entry asserts + FSE
+            // construction); the batch loop checks the reader window itself.
             n = unsafe { decode_sequence_batch(&mut st, tabs, &mut seqs, SEQ_BATCH) };
             if n < SEQ_BATCH && st.left != 0 {
-                seqs[n] = unsafe { decode_sequence_general(&mut st, tabs) };
+                seqs[n] = decode_sequence_general(&mut st, tabs);
                 n += 1;
             }
         }
@@ -1178,6 +1253,13 @@ unsafe fn decode_sequences(
                 }
                 return Err(seq_validation_error(lit_pos, lit_len, lit_total, offset, post_lit));
             }
+            // SAFETY: `lit_pos + lit_len <= lit_total` and `literals` has
+            // `LIT_PADDING >= 16` bytes past `lit_total`, covering the
+            // 16-byte wildcopy over-read. `0 < off <= post_lit`, so the match
+            // source is inside the bytes already written; `post_lit +
+            // match_len <= out_off + ZSTD_BLOCKSIZE_MAX`, and the output has
+            // `3 * ZSTD_BLOCKSIZE_MAX + 32` bytes of capacity past `out_off`,
+            // covering the 31-byte over-write of `copy_match_unchecked_32`.
             unsafe {
                 crate::cpu_features::wildcopy_chunks::<16>(lit_ptr.add(lit_pos), out_base.add(dst), lit_len);
                 crate::cpu_features::copy_match_unchecked_32(
@@ -1192,25 +1274,33 @@ unsafe fn decode_sequences(
         }
     }
     *rep_io = st.rep;
-    Ok((dst, lit_pos))
+    // SAFETY: every byte in `out_off..dst` was written by the copies above
+    // (each sequence writes `lit_len + match_len` contiguous bytes starting
+    // at its `dst`), and `dst` is within the reserved capacity.
+    unsafe { output.set_len(dst) };
+    Ok(lit_pos)
 }
 
 // ---------------------------------------------------------------------------
 // Literals section
 // ---------------------------------------------------------------------------
 
-/// Decode the literals section. Returns `(ptr, len)` of the literals; the
-/// pointer is followed by at least 16 readable bytes so the sequence loop's
-/// 16-byte wildcopy may over-read. Raw literals are referenced in place in
-/// the block (`block`) when enough input follows them — like C zstd, no
-/// copy; otherwise (and for RLE / Huffman literals) they go into `buf`.
+/// Readable slack required after the literals: the sequence loop copies
+/// literals in 16-byte steps and may over-read by up to 16 bytes.
+const LIT_PADDING: usize = 16;
+
+/// Decode the literals section. Returns `(literals, len)`: the first `len`
+/// bytes of the slice are the literals and at least `LIT_PADDING` readable
+/// bytes follow them. Raw literals are referenced in place in the block
+/// when enough input follows them — like C zstd, no copy; otherwise (and
+/// for RLE / Huffman literals) they go into `buf`.
 #[inline(never)]
-fn decode_literals_section_into(
-    r: &mut ForwardByteReader,
-    block: &[u8],
+fn decode_literals_section_into<'a>(
+    r: &mut ForwardByteReader<'a>,
+    block: &'a [u8],
     huf_table: &mut Option<HufTable>,
-    buf: &mut Vec<u8>,
-) -> io::Result<(*const u8, usize)> {
+    buf: &'a mut Vec<u8>,
+) -> io::Result<(&'a [u8], usize)> {
     let byte0 = r.read_u8()?;
     let lit_type = byte0 & 3;
     let size_format = (byte0 >> 2) & 3;
@@ -1219,14 +1309,14 @@ fn decode_literals_section_into(
         0 => {
             // Raw literals.
             let regen_size = decode_lit_size_raw(byte0, size_format, r)?;
+            let start = r.position();
             let raw = r.read_bytes(regen_size)?;
-            if r.position() + 16 <= block.len() {
-                return Ok((raw.as_ptr(), regen_size));
+            if r.position() + LIT_PADDING <= block.len() {
+                return Ok((&block[start..], regen_size));
             }
-            buf.clear();
-            buf.extend_from_slice(raw);
-            buf.resize(regen_size + 32, 0);
-            Ok((buf.as_ptr(), regen_size))
+            grow_literals_buf(buf, regen_size);
+            buf[..regen_size].copy_from_slice(raw);
+            Ok((&buf[..], regen_size))
         }
         1 => {
             // RLE literals.
@@ -1238,9 +1328,9 @@ fn decode_literals_section_into(
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "zstd: literals size exceeds block maximum"));
             }
             let byte = r.read_u8()?;
-            buf.clear();
-            buf.resize(regen_size + 32, byte);
-            Ok((buf.as_ptr(), regen_size))
+            grow_literals_buf(buf, regen_size);
+            buf[..regen_size].fill(byte);
+            Ok((&buf[..], regen_size))
         }
         2 | 3 => {
             // Compressed or Treeless literals.
@@ -1266,24 +1356,30 @@ fn decode_literals_section_into(
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "zstd: treeless literals without prior Huffman table"))?;
 
             let stream_data = &lit_data[pos..];
-            // The decoders write every one of the `regen_size` bytes, so
-            // skip the zero-fill: reserve + set_len, then append the
-            // 16+ byte dead zone the sequence loop over-reads.
-            buf.clear();
-            buf.reserve(regen_size + 32);
-            // SAFETY: capacity reserved; every byte is written by the
-            // decoder below before it is read (on error the buffer is
-            // never read).
-            unsafe { buf.set_len(regen_size) };
+            grow_literals_buf(buf, regen_size);
+            let out = &mut buf[..regen_size];
             if four_streams {
-                super::huf::decode_literals_4stream_into(table, stream_data, buf)?;
+                super::huf::decode_literals_4stream_into(table, stream_data, out)?;
             } else {
-                super::huf::decode_literals_1stream_into(table, stream_data, buf)?;
+                super::huf::decode_literals_1stream_into(table, stream_data, out)?;
             }
-            buf.resize(regen_size + 32, 0);
-            Ok((buf.as_ptr(), regen_size))
+            Ok((&buf[..], regen_size))
         }
         _ => unreachable!(),
+    }
+}
+
+/// Make the frame-lifetime literals scratch at least `regen_size + 32`
+/// bytes long. It is never shrunk, so the zero-fill happens once per frame
+/// (or when a block needs more), not per block: the literal decoders write
+/// every one of the `regen_size` bytes they are handed, and the trailing
+/// slack is only ever over-read by the sequence loop's 16-byte copies
+/// (those bytes are discarded), so stale contents are harmless.
+#[inline(always)]
+fn grow_literals_buf(buf: &mut Vec<u8>, regen_size: usize) {
+    let need = regen_size + 32;
+    if buf.len() < need {
+        buf.resize(need, 0);
     }
 }
 
