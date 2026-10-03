@@ -139,7 +139,7 @@ subdirectory = "cramjam"
 flate2 = "^1"
 zstd = "^0.13"
 lz4 = "^1"
-bzip2 = ">=0.4,<0.6"
+bzip2 = ">=0.4,<0.7"
 xz2 = "0.1.7"                                                # only for cross-impl testing + benches against the pure-Rust xz_impl
 lzma-sys = "0.1"                                             # xz2's own dep; used directly for liblzma's raw coder in tests/cross_impl_xz.rs
 criterion = { version = "0.5", features = ["html_reports"] }
