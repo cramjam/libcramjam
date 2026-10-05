@@ -5,8 +5,9 @@ A Rust library combining different compression algorithms/libraries in a common 
 
 
 [![CI](https://github.com/cramjam/libcramjam/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/cramjam/libcramjam/actions/workflows/CI.yml)
-[![Latest version](https://img.shields.io/crates/v/libcramjam.svg)](https://crates.io/crates/libcramjam)
+[![Fuzz](https://github.com/cramjam/libcramjam/actions/workflows/fuzz.yml/badge.svg?branch=main)](https://github.com/cramjam/libcramjam/actions/workflows/fuzz.yml)
 [![Documentation](https://docs.rs/libcramjam/badge.svg)](https://docs.rs/libcramjam)
+[![Latest version](https://img.shields.io/crates/v/libcramjam.svg)](https://crates.io/crates/libcramjam)
 ![License](https://img.shields.io/crates/l/libcramjam.svg)
 
 ---
