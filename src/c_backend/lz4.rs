@@ -232,9 +232,21 @@ pub mod block {
         Ok(nbytes)
     }
 
+    /// Choose the lz4 block mode for `level` and `acceleration`; see
+    /// [`compress_vec`].
+    fn compression_mode(level: Option<u32>, acceleration: Option<i32>) -> CompressionMode {
+        match (level, acceleration) {
+            (Some(level), _) if level >= 2 => CompressionMode::HIGHCOMPRESSION(level.min(i32::MAX as u32) as i32),
+            (_, Some(acceleration)) => CompressionMode::FAST(acceleration),
+            _ => CompressionMode::DEFAULT,
+        }
+    }
+
     /// Compress into a fresh Vec, optionally prepending the 4-byte length.
-    /// `level` and `acceleration` are accepted for API compatibility; blocks
-    /// are always compressed in lz4's default mode.
+    /// `level` of 2 and above uses the HC compressor at that level, as in the
+    /// frame API. Otherwise `acceleration` selects lz4's fast mode with that
+    /// acceleration, and with neither the block is compressed in lz4's
+    /// default mode.
     #[inline(always)]
     pub fn compress_vec(
         input: &[u8],
@@ -249,17 +261,26 @@ pub mod block {
         Ok(buffer)
     }
 
-    /// Compress into a pre-allocated buffer.
+    /// Compress into a pre-allocated buffer. `level` and `acceleration` work
+    /// as in [`compress_vec`].
     #[inline(always)]
     pub fn compress_into(
         input: &[u8],
         output: &mut [u8],
-        _level: Option<u32>,
-        _acceleration: Option<i32>,
+        level: Option<u32>,
+        acceleration: Option<i32>,
         prepend_size: Option<bool>,
     ) -> Result<usize, Error> {
         let prepend_size = prepend_size.unwrap_or(PREPEND_SIZE);
-        let nbytes = lz4::block::compress_to_buffer(input, Some(CompressionMode::DEFAULT), prepend_size, output)?;
+        // lz4's HC levels 10-12 read from `input`'s pointer even when it is
+        // empty, which crashes on the dangling pointer of an empty slice. An
+        // empty block is a single zero token in every mode, so skip HC.
+        let mode = if input.is_empty() {
+            CompressionMode::DEFAULT
+        } else {
+            compression_mode(level, acceleration)
+        };
+        let nbytes = lz4::block::compress_to_buffer(input, Some(mode), prepend_size, output)?;
         Ok(nbytes)
     }
 

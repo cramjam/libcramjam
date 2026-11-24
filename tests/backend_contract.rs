@@ -367,6 +367,28 @@ mod lz4_contract {
             }
         }
     }
+
+    #[test]
+    fn block_api_levels() {
+        for (name, data) in inputs() {
+            for (level, acceleration) in [(Some(0), None), (Some(1), None), (Some(2), None), (Some(4), None), (Some(9), None), (Some(12), None), (None, Some(8))] {
+                let tag = format!("lz4 block level={level:?} acceleration={acceleration:?} {name}");
+                let c = ours::block::compress_vec(&data, level, acceleration, Some(true)).unwrap();
+                assert!(c.len() <= ours::block::compress_bound(data.len(), Some(true)), "{tag} bound");
+                assert_eq!(lz4::block::decompress(&c, None).unwrap(), data, "{tag} ours→ref");
+                let mut buf = vec![0u8; ours::block::compress_bound(data.len(), Some(true))];
+                let n = ours::block::compress_into(&data, &mut buf, level, acceleration, Some(true)).unwrap();
+                assert_eq!(&buf[..n], &c[..], "{tag} compress_into == compress_vec");
+            }
+        }
+        // The level must take effect: HC levels compress compressible data
+        // better than the fast compressor, and more with a higher level.
+        let data = text(500_000);
+        let size = |level| ours::block::compress_vec(&data, level, None, Some(false)).unwrap().len();
+        let (fast, hc4, hc9) = (size(None), size(Some(4)), size(Some(9)));
+        assert!(hc4 < fast, "lz4 block level 4 ({hc4}) not smaller than default ({fast})");
+        assert!(hc9 < hc4, "lz4 block level 9 ({hc9}) not smaller than level 4 ({hc4})");
+    }
 }
 
 // ---------------------------------------------------------------------------
