@@ -392,14 +392,20 @@ mod lz4_contract {
 
     /// The fast compressor is a port of `LZ4_compress_fast`, so for every
     /// acceleration (including the out-of-range ones C clamps) the block is
-    /// byte-identical to the reference's.
+    /// byte-identical to the reference's — on little-endian. C lz4 hashes
+    /// native-endian loads (and uses another `LZ4_hash5` multiplier) on
+    /// big-endian, so it picks different matches there; ours hashes
+    /// little-endian loads everywhere, so only validity is checked.
     #[test]
     fn block_api_acceleration() {
         for (name, data) in inputs() {
             for acceleration in [i32::MIN, -1, 0, 1, 2, 8, 64, 65_537, i32::MAX] {
                 let ours = ours::block::compress_vec(&data, None, Some(acceleration), Some(true)).unwrap();
                 let theirs = lz4::block::compress(&data, Some(lz4::block::CompressionMode::FAST(acceleration)), true).unwrap();
-                assert!(ours == theirs, "lz4 block acceleration={acceleration} {name}: differs from reference");
+                if cfg!(target_endian = "little") {
+                    assert!(ours == theirs, "lz4 block acceleration={acceleration} {name}: differs from reference");
+                }
+                assert_eq!(lz4::block::decompress(&ours, None).unwrap(), data, "lz4 block acceleration={acceleration} {name} ours→ref");
             }
         }
         // The acceleration must take effect: a higher one compresses worse.
