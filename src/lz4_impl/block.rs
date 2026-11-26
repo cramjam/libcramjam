@@ -308,7 +308,7 @@ pub fn compress_bound(n: usize) -> usize {
 //   * `byU16` (8192 x u16, `LZ4_hash4`): the block API (`LZ4_compress_default`)
 //     for inputs < 65547 bytes; it also skips the distance check.
 // Table entries are absolute input positions (C's `base + index`), an empty
-// slot is 0 — a real candidate, as in C. `acceleration` is 1.
+// slot is 0 — a real candidate, as in C.
 
 /// `LZ4_HASHLOG` for `LZ4_MEMORY_USAGE = 14`.
 const HASHLOG: u32 = 12;
@@ -419,25 +419,38 @@ pub fn compress_block_fast_continue(
         ctx.base += delta;
     }
     let base = ctx.base;
-    compress_generic(&mut ctx.table, &input[base..], start - base, end - base, 0, output)
+    compress_generic(&mut ctx.table, &input[base..], start - base, end - base, 0, 1, output)
 }
 
 /// Compress one independent block (`LZ4_compress_default`): fresh table,
 /// u16 flavour below `LZ4_64K_LIMIT` bytes. Returns bytes written.
 pub fn compress_block(input: &[u8], output: &mut Vec<u8>) -> usize {
+    compress_block_fast(input, output, 1)
+}
+
+/// `LZ4_ACCELERATION_MAX`.
+const ACCELERATION_MAX: i32 = 65_537;
+
+/// [`compress_block`] with an acceleration factor (`LZ4_compress_fast`):
+/// each step up makes the match search skip ahead sooner, trading ratio for
+/// speed. As in C, values below 1 mean the default of 1 and values above
+/// `LZ4_ACCELERATION_MAX` are clamped to it.
+pub fn compress_block_fast(input: &[u8], output: &mut Vec<u8>, acceleration: i32) -> usize {
+    let acceleration = acceleration.clamp(1, ACCELERATION_MAX) as u32;
     if input.len() < LZ4_64K_LIMIT {
         let mut t = TableU16(vec![0; TABLE_U16]);
-        compress_generic(&mut t, input, 0, input.len(), 0, output)
+        compress_generic(&mut t, input, 0, input.len(), 0, acceleration, output)
     } else {
         let mut t = TableU32(vec![0; TABLE_U32]);
-        compress_generic(&mut t, input, 0, input.len(), 0, output)
+        compress_generic(&mut t, input, 0, input.len(), 0, acceleration, output)
     }
 }
 
 /// `LZ4_compress_generic_validated` with `notLimited` output. `low_limit`
 /// is the lowest position the backward match extension may reach
 /// (`lowLimit`: the dictionary start, i.e. 0 for a linked stream or the
-/// block start for an independent block).
+/// block start for an independent block). `acceleration` is in
+/// `1..=ACCELERATION_MAX`.
 #[inline(always)]
 fn compress_generic<T: FastTable>(
     t: &mut T,
@@ -445,6 +458,7 @@ fn compress_generic<T: FastTable>(
     start: usize,
     end: usize,
     low_limit: usize,
+    acceleration: u32,
     output: &mut Vec<u8>,
 ) -> usize {
     let out_start = output.len();
@@ -471,7 +485,7 @@ fn compress_generic<T: FastTable>(
                 {
                     let mut forward_ip = ip;
                     let mut step = 1usize;
-                    let mut search_match_nb: u32 = 1 << SKIP_TRIGGER;
+                    let mut search_match_nb: u32 = acceleration << SKIP_TRIGGER;
                     loop {
                         let h = forward_h;
                         let current = forward_ip;
