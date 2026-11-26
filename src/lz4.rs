@@ -122,11 +122,28 @@ pub mod block {
         Ok(tmp.len())
     }
 
+    /// Compress one block, appending to `out`. `level` of `None`, 0 or 1 uses
+    /// the fast compressor (`LZ4_compress_default`); 2 and above use the HC
+    /// compressor at that level, as in the frame API.
+    fn compress_block_at(input: &[u8], out: &mut Vec<u8>, level: Option<u32>) {
+        match level {
+            Some(level) if crate::lz4_impl::frame::use_hc_for(Some(level)) => {
+                crate::lz4_impl::block::compress_block_hc(input, out, level);
+            }
+            _ => {
+                crate::lz4_impl::block::compress_block(input, out);
+            }
+        }
+    }
+
     /// Compress into a fresh Vec.  Optionally prepends the 4-byte
     /// uncompressed length so `decompress_vec` can recover it.
+    /// `level` of `None`, 0 or 1 uses the fast compressor, and 2 and above
+    /// use the HC compressor at that level. `acceleration` is ignored by this
+    /// backend.
     pub fn compress_vec(
         input: &[u8],
-        _level: Option<u32>,
+        level: Option<u32>,
         _acceleration: Option<i32>,
         prepend_size: Option<bool>,
     ) -> Result<Vec<u8>, Error> {
@@ -135,15 +152,16 @@ pub mod block {
         if prepend_size {
             out.extend_from_slice(&(input.len() as u32).to_le_bytes());
         }
-        crate::lz4_impl::block::compress_block(input, &mut out);
+        compress_block_at(input, &mut out, level);
         Ok(out)
     }
 
-    /// Compress into a pre-allocated buffer.
+    /// Compress into a pre-allocated buffer. `level` and `acceleration` work
+    /// as in [`compress_vec`].
     pub fn compress_into(
         input: &[u8],
         output: &mut [u8],
-        _level: Option<u32>,
+        level: Option<u32>,
         _acceleration: Option<i32>,
         prepend_size: Option<bool>,
     ) -> Result<usize, Error> {
@@ -159,7 +177,7 @@ pub mod block {
         if prepend_size {
             out.extend_from_slice(&(input.len() as u32).to_le_bytes());
         }
-        crate::lz4_impl::block::compress_block(input, &mut out);
+        compress_block_at(input, &mut out, level);
         output[..out.len()].copy_from_slice(&out);
         Ok(out.len())
     }
