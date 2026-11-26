@@ -122,29 +122,29 @@ pub mod block {
         Ok(tmp.len())
     }
 
-    /// Compress one block, appending to `out`. `level` of `None`, 0 or 1 uses
-    /// the fast compressor (`LZ4_compress_default`); 2 and above use the HC
-    /// compressor at that level, as in the frame API.
-    fn compress_block_at(input: &[u8], out: &mut Vec<u8>, level: Option<u32>) {
+    /// Compress one block, appending to `out`. `level` of 2 and above uses
+    /// the HC compressor at that level, as in the frame API; otherwise the
+    /// fast compressor (`LZ4_compress_fast`) with `acceleration`.
+    fn compress_block_at(input: &[u8], out: &mut Vec<u8>, level: Option<u32>, acceleration: Option<i32>) {
         match level {
             Some(level) if crate::lz4_impl::frame::use_hc_for(Some(level)) => {
                 crate::lz4_impl::block::compress_block_hc(input, out, level);
             }
             _ => {
-                crate::lz4_impl::block::compress_block(input, out);
+                crate::lz4_impl::block::compress_block_fast(input, out, acceleration.unwrap_or(1));
             }
         }
     }
 
     /// Compress into a fresh Vec.  Optionally prepends the 4-byte
     /// uncompressed length so `decompress_vec` can recover it.
-    /// `level` of `None`, 0 or 1 uses the fast compressor, and 2 and above
-    /// use the HC compressor at that level. `acceleration` is ignored by this
-    /// backend.
+    /// `level` of 2 and above uses the HC compressor at that level, as in the
+    /// frame API. Otherwise `acceleration` selects lz4's fast mode with that
+    /// acceleration (below 1 or `None` = the default of 1).
     pub fn compress_vec(
         input: &[u8],
         level: Option<u32>,
-        _acceleration: Option<i32>,
+        acceleration: Option<i32>,
         prepend_size: Option<bool>,
     ) -> Result<Vec<u8>, Error> {
         let prepend_size = prepend_size.unwrap_or(true);
@@ -152,7 +152,7 @@ pub mod block {
         if prepend_size {
             out.extend_from_slice(&(input.len() as u32).to_le_bytes());
         }
-        compress_block_at(input, &mut out, level);
+        compress_block_at(input, &mut out, level, acceleration);
         Ok(out)
     }
 
@@ -162,7 +162,7 @@ pub mod block {
         input: &[u8],
         output: &mut [u8],
         level: Option<u32>,
-        _acceleration: Option<i32>,
+        acceleration: Option<i32>,
         prepend_size: Option<bool>,
     ) -> Result<usize, Error> {
         let prepend_size = prepend_size.unwrap_or(true);
@@ -177,7 +177,7 @@ pub mod block {
         if prepend_size {
             out.extend_from_slice(&(input.len() as u32).to_le_bytes());
         }
-        compress_block_at(input, &mut out, level);
+        compress_block_at(input, &mut out, level, acceleration);
         output[..out.len()].copy_from_slice(&out);
         Ok(out.len())
     }

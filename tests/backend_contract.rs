@@ -389,6 +389,26 @@ mod lz4_contract {
         assert!(hc4 < fast, "lz4 block level 4 ({hc4}) not smaller than default ({fast})");
         assert!(hc9 < hc4, "lz4 block level 9 ({hc9}) not smaller than level 4 ({hc4})");
     }
+
+    /// The fast compressor is a port of `LZ4_compress_fast`, so for every
+    /// acceleration (including the out-of-range ones C clamps) the block is
+    /// byte-identical to the reference's.
+    #[test]
+    fn block_api_acceleration() {
+        for (name, data) in inputs() {
+            for acceleration in [i32::MIN, -1, 0, 1, 2, 8, 64, 65_537, i32::MAX] {
+                let ours = ours::block::compress_vec(&data, None, Some(acceleration), Some(true)).unwrap();
+                let theirs = lz4::block::compress(&data, Some(lz4::block::CompressionMode::FAST(acceleration)), true).unwrap();
+                assert!(ours == theirs, "lz4 block acceleration={acceleration} {name}: differs from reference");
+            }
+        }
+        // The acceleration must take effect: a higher one compresses worse.
+        let data = text(500_000);
+        let size = |a| ours::block::compress_vec(&data, None, a, Some(false)).unwrap().len();
+        let (default, a1, a64) = (size(None), size(Some(1)), size(Some(64)));
+        assert_eq!(default, a1, "lz4 block default acceleration is 1");
+        assert!(a64 > a1, "lz4 block acceleration 64 ({a64}) not larger than 1 ({a1})");
+    }
 }
 
 // ---------------------------------------------------------------------------
